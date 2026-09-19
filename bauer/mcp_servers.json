@@ -1,0 +1,54 @@
+{
+  "_comment": "Bauer MCP gateway config. TEMPLATE ONLY — copy to /data/company/mcp_servers.json on the volume and fill real values there. Never commit secrets to this file. Decisions: bauer-automate/claude-skills#903 and #933.",
+
+  "_secrets_note": "The gateway forwards only the env vars named in orchestrator/mcp_gateway.py::_FORWARDED_ENV_VARS to the extensible-mcp child. MS365_*, ZOHO_* and GITHUB_* are NOT in that list, so $VAR interpolation will NOT resolve for them. Put literal values in the copy on /data (which is never committed) rather than editing _FORWARDED_ENV_VARS — that is an upstream file and editing it is a permanent merge tax.",
+
+  "mcpServers": {
+    "m365_graph": {
+      "_status": "VERIFIED — flags read from 3P-ms-365-mcp-server@70a54bc README and src/cli.ts",
+      "_note": "--org-mode is required for Teams and SharePoint tools. Narrow with --preset / --allowed-scopes once --list-permissions output has been through admin consent. Pin a version rather than floating on latest for a production service; the fork exists so we control when upstream lands.",
+      "command": "npx",
+      "args": ["-y", "@softeria/ms-365-mcp-server@PIN_ME", "--org-mode"],
+      "env": {
+        "MS365_MCP_CLIENT_ID": "REPLACE_ON_VOLUME",
+        "MS365_MCP_CLIENT_SECRET": "REPLACE_ON_VOLUME",
+        "MS365_MCP_TENANT_ID": "REPLACE_ON_VOLUME"
+      }
+    },
+
+    "zoho": {
+      "_status": "UNVERIFIED — do not enable until confirmed",
+      "_confirm": "Zoho's MCP is a hosted remote endpoint (mcp.zoho.com). Unknown whether extensible-mcp (git+https://github.com/SenteLabsAI/extensible-mcp) accepts remote URL servers or stdio only — the shipped example shows stdio only, and that package was not inspected. If stdio only, a stdio-to-HTTP bridge is needed and the exact command must be confirmed before use rather than guessed.",
+      "_covers": "Zoho CRM, Books, Desk. Float Financial spend arrives already inside Books via zoho-float-sync, so Float needs no entry of its own.",
+      "command": "CONFIRM_BEFORE_USE",
+      "args": []
+    },
+
+    "github": {
+      "_status": "UNVERIFIED — do not enable until confirmed",
+      "_confirm": "Needed so the Executive can see open work; claude-skills CLAUDE.md makes labelled issues the tracker of record. Confirm the current official server invocation and transport before filling this in.",
+      "_scope": "Read-only to start, matching the propose-only posture in #933. Scope any token to issues on bauer-automate repos.",
+      "command": "CONFIRM_BEFORE_USE",
+      "args": []
+    }
+  },
+
+  "filters": {
+    "_comment": "Upstream's deny patterns, kept verbatim. Do not narrow this list. The propose-only posture (#933) relies on the identity lacking write scopes, not on these patterns alone — but these are a useful second layer.",
+    "access_control": {
+      "deny_patterns": [
+        "*__delete_*", "*__drop_*", "*__destroy_*", "*__remove_*",
+        "*delete_email*", "*delete_message*", "*trash*",
+        "*delete_file*", "*delete_document*",
+        "*__send_*", "*send_mail*", "*send_message*", "*send_chat*"
+      ],
+      "deny": [],
+      "allow_servers": []
+    },
+    "load_control": {
+      "deny_url_patterns": ["http://*"],
+      "allow_url_patterns": []
+    },
+    "similarity_threshold": 0.3
+  }
+}
