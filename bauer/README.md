@@ -22,10 +22,10 @@ replica, the propose-only posture is set, and the health-check grace is at least
 300s. Verified to fail (exit 1) when `!reset []` is removed from the UI's port
 override, which is the regression it exists for.
 
-**It does not run yet.** GitHub disables Actions on forks by default, and this
-one is still off. Enable it at Settings -> Actions -> General -> "Allow all
-actions and reusable workflows". Until then the overlay is unvalidated in CI and
-the command below is the only check.
+Actions is enabled on this fork, so the gate runs. It first ran green on
+`bauer-automate/3P-OpenExecutive#2`. That resolves the "nothing validates
+`bauer/`" gap: upstream's `ci.yml` does not look at this directory and is not
+edited to, so this workflow is the only thing that does.
 
 ## Running it
 

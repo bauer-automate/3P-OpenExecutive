@@ -4,10 +4,9 @@ name: Bauer overlay
 # on purpose: ci.yml is an upstream file, and editing it is a merge cost paid on
 # every sync. This workflow is additive and upstream never sees it.
 #
-# NOTE: GitHub disables Actions on forks by default. Until Actions is enabled on
-# this repository (Settings -> Actions -> General -> Allow all actions), nothing
-# here runs and the overlay is unvalidated. That toggle is the whole reason this
-# file existed as a flagged gap rather than a gate.
+# Upstream's ci.yml runs Python lint, Python tests and a UI type check. None of
+# them look at bauer/, which is why the overlay sat unvalidated: the gap was
+# never that CI was missing, only that nothing in it covered this directory.
 
 on:
   push:
