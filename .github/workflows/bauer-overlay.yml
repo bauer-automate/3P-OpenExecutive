@@ -1,0 +1,63 @@
+name: Bauer overlay
+
+# Validates bauer/ — the Bauer Automate deployment overlay. Separate from ci.yml
+# on purpose: ci.yml is an upstream file, and editing it is a merge cost paid on
+# every sync. This workflow is additive and upstream never sees it.
+#
+# NOTE: GitHub disables Actions on forks by default. Until Actions is enabled on
+# this repository (Settings -> Actions -> General -> Allow all actions), nothing
+# here runs and the overlay is unvalidated. That toggle is the whole reason this
+# file existed as a flagged gap rather than a gate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bauer/**'
+      - 'docker/**'
+      - '.github/workflows/bauer-overlay.yml'
+  pull_request:
+    paths:
+      - 'bauer/**'
+      - 'docker/**'
+      - '.github/workflows/bauer-overlay.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-config:
+    name: Overlay merges to the intended topology
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # setup-python gives a clean interpreter, so the assertion script's only
+      # third-party import has to be installed explicitly.
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      # `docker compose config` alone only proves the files parse. The failure
+      # this overlay actually hit was semantic: Compose MERGES list fields across
+      # files, so the UI's `ports` override appended to upstream's rather than
+      # replacing it, and 0.0.0.0:3000 survived. `!reset []` fixes that, and the
+      # assertions below are what stop it coming back.
+      - name: Render and assert the merged topology
+        run: |
+          set -euo pipefail
+          docker compose \
+            -f docker/docker-compose.yml \
+            -f bauer/docker-compose.bauer.yml \
+            config > merged.yml
+          python3 .github/scripts/assert_bauer_overlay.py merged.yml
+
+      - name: Validate the MCP gateway config is well-formed JSON
+        run: python3 -c "import json; json.load(open('bauer/mcp_servers.json'))"

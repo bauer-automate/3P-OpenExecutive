@@ -5,10 +5,20 @@
 
   "mcpServers": {
     "m365_graph": {
-      "_status": "VERIFIED — flags read from 3P-ms-365-mcp-server@70a54bc README and src/cli.ts",
-      "_note": "--org-mode is required for Teams and SharePoint tools. Narrow with --preset / --allowed-scopes once --list-permissions output has been through admin consent. Pin a version rather than floating on latest for a production service; the fork exists so we control when upstream lands.",
+      "_status": "VERIFIED — flags, presets and counts read from 3P-ms-365-mcp-server@70a54bc src/cli.ts, src/tool-categories.ts, src/auth.ts and src/endpoints.json",
+      "_note": "--org-mode is required for Teams tools. Pin a version rather than floating on latest for a production service; the fork exists so we control when upstream lands.",
+      "_read_only": "--read-only is a TOOL-SURFACE filter, not a runtime guard: dropped tools never appear in tools/list. It removes every non-GET endpoint, keeping 7 POST-shaped reads (get-schedule, find-meeting-times, search-query, copilot-retrieve, get-presences-by-user-id, get-mail-tips, get-onenote-notebook-from-web-url) plus the 4 utility tools. This is the belt under the read-scopes-first posture in claude-skills#933; the service account's scopes remain the actual boundary. COST: graph-batch is a POST carrying no readOnly flag, so this drops it too, and no flag keeps batching while dropping the other writes. Accepted for the engine. An interactive consumer that needs graph-batch runs without --read-only and relies on its own scopes.",
+      "_sharepoint_exclusion": "SharePoint routes to bauer-sharepoint's own MCP server, not here (operator ruling 2026-09-19, claude-skills#903). There is NO sharepoint preset to switch off: those 34 tools sit inside the work preset alongside Teams. --enabled-tools compiles as new RegExp(pattern, 'i') against toolName, so negative lookahead works. Verified: keeps 298 of 332 endpoint tools, zero SharePoint leaking. Not shell-quoted because args are exec'd directly, not through a shell.",
+      "_pin_me": "PIN_ME cannot be resolved by reading the fork: its package.json says version 0.0.0-development because semantic-release stamps the real version at publish time. Resolve with `npm view @softeria/ms-365-mcp-server versions` and pin explicitly.",
       "command": "npx",
-      "args": ["-y", "@softeria/ms-365-mcp-server@PIN_ME", "--org-mode"],
+      "args": [
+        "-y",
+        "@softeria/ms-365-mcp-server@PIN_ME",
+        "--org-mode",
+        "--read-only",
+        "--enabled-tools",
+        "^(?!.*sharepoint)"
+      ],
       "env": {
         "MS365_MCP_CLIENT_ID": "REPLACE_ON_VOLUME",
         "MS365_MCP_CLIENT_SECRET": "REPLACE_ON_VOLUME",
