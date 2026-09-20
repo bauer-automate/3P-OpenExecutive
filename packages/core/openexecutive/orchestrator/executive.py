@@ -12,6 +12,7 @@ from typing import Any
 from openexecutive.audit import bind_turn, clear_turn, set_turn
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit.redaction import (
+    ERROR_DETAIL_LEN,
     audit_tool_input,
     audit_tool_input_full,
     audit_tool_result,
@@ -49,10 +50,6 @@ from openexecutive.orchestrator.form_tools import (
     build_form_patch_event,
 )
 from openexecutive.orchestrator.mcp_gateway import MCP_TOOL_NAMES, MCP_TOOLS, MCPGateway
-from openexecutive.orchestrator.onboarding_tools import (
-    ONBOARDING_TOOL_HANDLERS,
-    ONBOARDING_TOOLS,
-)
 from openexecutive.orchestrator.people_tools import (
     PEOPLE_TOOL_HANDLERS,
     PEOPLE_TOOLS,
@@ -73,10 +70,6 @@ from openexecutive.orchestrator.schedule_tools import (
 )
 from openexecutive.orchestrator.session import Session
 from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS, SKILL_TOOLS
-from openexecutive.orchestrator.talent_tools import (
-    TALENT_TOOL_HANDLERS,
-    TALENT_TOOLS,
-)
 from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,
@@ -111,6 +104,32 @@ def _trunc(value: Any, limit: int = 200) -> str:
     if len(s) <= limit:
         return s
     return f"{s[:limit]}…[truncated {len(s) - limit} chars]"
+
+
+def _tool_error_result(tool_name: str, exc: BaseException) -> str:
+    """Render a crashed tool handler as a JSON tool_result the model can read.
+
+    Tool handlers are *supposed* to return a JSON error string rather than
+    raise (see the `_err` helpers in the orchestrator tool modules), but a bug
+    in one of them — or in a library it calls — used to abort the entire turn,
+    because `asyncio.gather` propagates the first exception. The adapter then
+    showed the user a generic apology with no way to tell which tool failed.
+    Converting the exception into a normal error tool_result keeps the turn
+    alive and lets the model recover on the next iteration.
+
+    Only the exception's TYPE goes to the model. Its message can carry
+    filesystem paths, a validation error echoing the input, or a third-party
+    HTTP body — and anything in model context can end up quoted back to the
+    user. The full repr stays in the server log and the audit row.
+    """
+    return json.dumps(
+        {
+            "error": (
+                f"{tool_name} failed with {type(exc).__name__}. The failure is "
+                "recorded; do not retry the same call unchanged."
+            )
+        }
+    )
 
 
 def _build_current_speaker_block(person_id: int | None) -> str | None:
@@ -163,8 +182,6 @@ _ALL_SKILL_TOOLS = [
     *RESEARCH_TOOLS,
     *WORKFLOW_AUTHORING_TOOLS,
     *WORKFLOW_RUN_TOOLS,
-    *TALENT_TOOLS,
-    *ONBOARDING_TOOLS,
     *FORM_TOOLS,
 ]
 _ALL_SKILL_HANDLERS = {
@@ -180,8 +197,6 @@ _ALL_SKILL_HANDLERS = {
     **RESEARCH_TOOL_HANDLERS,
     **WORKFLOW_AUTHORING_TOOL_HANDLERS,
     **WORKFLOW_RUN_TOOL_HANDLERS,
-    **TALENT_TOOL_HANDLERS,
-    **ONBOARDING_TOOL_HANDLERS,
     **FORM_TOOL_HANDLERS,
 }
 
@@ -360,6 +375,7 @@ class Executive:
         peer_memory_context: str = "",
         person_id: int | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
         page_context_block: str = "",
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -405,6 +421,18 @@ class Executive:
         if briefing_context:
             user_content_parts.append(
                 {"type": "text", "text": f"<briefing>\n{briefing_context}\n</briefing>"}
+            )
+        # Which surface the principal is talking to us on, and what can and
+        # cannot be completed there. Chat adapters (Slack, Discord, Telegram)
+        # set this; the web app leaves it empty because the model is already
+        # in the app. User turn, never a cached system block — it varies per
+        # request and would otherwise invalidate the prompt cache.
+        if channel_context_block:
+            user_content_parts.append(
+                {
+                    "type": "text",
+                    "text": f"<channel>\n{channel_context_block}\n</channel>",
+                }
             )
         # Per-person memory from Honcho (when HONCHO_ENABLED + person_id
         # available). Goes in the user turn alongside episodic / retrieved
@@ -459,6 +487,7 @@ class Executive:
         peer_memory_reasoning_level: HonchoReasoningLevel = "minimal",
         peer_memory_context: str | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
         page_context_block: str = "",
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Stream a response from the Executive, routing to specialists as needed.
@@ -558,6 +587,7 @@ class Executive:
                 peer_memory_context=peer_memory_context,
                 person_id=person_id,
                 briefing_context=briefing_context,
+                channel_context_block=channel_context_block,
                 page_context_block=page_context_block,
             )
 
@@ -678,6 +708,7 @@ class Executive:
         peer_memory_reasoning_level: HonchoReasoningLevel = "medium",
         peer_memory_context: str | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
         page_context_block: str = "",
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Committee-reviewed variant of stream_chat.
@@ -772,6 +803,7 @@ class Executive:
             peer_memory_context=peer_memory_context,
             person_id=person_id,
             briefing_context=briefing_context,
+            channel_context_block=channel_context_block,
             page_context_block=page_context_block,
         )
 
@@ -1344,10 +1376,46 @@ class Executive:
             if skill_tool_uses:
                 for tu in skill_tool_uses:
                     logger.info("→ skill:%s  input=%s", tu["name"], _trunc(tu["input"]))
+                # return_exceptions=True: one crashing handler must not abort
+                # the whole turn. See `_tool_error_result`.
                 skill_results = await asyncio.gather(
-                    *(_ALL_SKILL_HANDLERS[tu["name"]](tu["input"]) for tu in skill_tool_uses)
+                    *(_ALL_SKILL_HANDLERS[tu["name"]](tu["input"]) for tu in skill_tool_uses),
+                    return_exceptions=True,
                 )
-                for tu, result in zip(skill_tool_uses, skill_results, strict=True):
+                # `raw` rather than `result` so the narrowed value keeps the
+                # plain `str` type the rest of this function's loops use.
+                for tu, raw in zip(skill_tool_uses, skill_results, strict=True):
+                    if isinstance(raw, BaseException):
+                        # Cancellation is not a tool failure — `gather` captures
+                        # it like any other exception, so re-raise it or the
+                        # turn-timeout / client-disconnect paths in
+                        # api/routes/chat.py silently stop working.
+                        if isinstance(raw, asyncio.CancelledError):
+                            raise raw
+                        logger.exception(
+                            "skill:%s raised — session=%s turn=%s iteration=%d",
+                            tu["name"], session_id, turn_id, iteration,
+                            exc_info=raw,
+                        )
+                        audit_log(
+                            "tool_invocation",
+                            f"skill:{tu['name']} FAILED: {type(raw).__name__}",
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            actor="executive",
+                            details={
+                                "tool": tu["name"],
+                                "kind": "skill",
+                                "iteration": iteration,
+                                "ok": False,
+                                "error": repr(raw)[:ERROR_DETAIL_LEN],
+                            },
+                        )
+                        # Hand the model an error tool_result and move on. No
+                        # chip: summarize_action must never see an exception.
+                        results_by_id[tu["id"]] = _tool_error_result(tu["name"], raw)
+                        continue
+                    result = raw
                     logger.info("← skill:%s  result=%s", tu["name"], _trunc(result))
                     results_by_id[tu["id"]] = result
                     # Inline action chip for side-effecting tools. None
@@ -1414,11 +1482,39 @@ class Executive:
                         )
                     else:
                         logger.info("→ %s  input=%s", tu["name"], _trunc(tu["input"]))
+                # Same isolation as the skill gather above: a gateway crash on
+                # one tool must not take the turn down with it.
                 mcp_results = await asyncio.gather(
-                    *(_mcp_dispatch[tu["name"]](tu["input"]) for tu in mcp_tool_uses)
+                    *(_mcp_dispatch[tu["name"]](tu["input"]) for tu in mcp_tool_uses),
+                    return_exceptions=True,
                 )
-                for tu, result in zip(mcp_tool_uses, mcp_results, strict=True):
+                for tu, raw in zip(mcp_tool_uses, mcp_results, strict=True):
                     tool_label = tu["input"].get("name", tu["name"]) if tu["name"] == "call_tool" else tu["name"]
+                    if isinstance(raw, BaseException):
+                        if isinstance(raw, asyncio.CancelledError):
+                            raise raw
+                        logger.exception(
+                            "mcp:%s raised — session=%s turn=%s iteration=%d",
+                            tool_label, session_id, turn_id, iteration,
+                            exc_info=raw,
+                        )
+                        audit_log(
+                            "tool_invocation",
+                            f"mcp:{tool_label} FAILED: {type(raw).__name__}",
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            actor="executive",
+                            details={
+                                "tool": tool_label,
+                                "kind": "mcp",
+                                "iteration": iteration,
+                                "ok": False,
+                                "error": repr(raw)[:ERROR_DETAIL_LEN],
+                            },
+                        )
+                        results_by_id[tu["id"]] = _tool_error_result(tool_label, raw)
+                        continue
+                    result = raw
                     logger.info("← %s  result=%s", tool_label, _trunc(result))
                     results_by_id[tu["id"]] = result
                     # MCP chip emission. search_tools is read-only (gets
@@ -1486,14 +1582,15 @@ class Executive:
         peer_memory_reasoning_level: HonchoReasoningLevel | None = None,
         peer_memory_context: str | None = None,
         briefing_context: str = "",
+        channel_context_block: str = "",
     ) -> str:
         """Non-streaming chat — collects and returns the full response.
 
         When ``committee_review=True`` the call routes through
         ``stream_chat_with_committee`` so the answer is the revised
-        response, not the raw draft. Used by non-HTTP callers (e.g.
-        the email poller) that want committee output without holding
-        an SSE stream open.
+        response, not the raw draft. Lets non-HTTP callers get
+        committee output without holding an SSE stream open; the
+        channel adapters (Slack, Discord, email) all use the default.
 
         ``attachment_blocks`` is a list of Anthropic content blocks (image
         type) assembled by the caller from inbound file attachments.  Text
@@ -1503,8 +1600,8 @@ class Executive:
         ``person_id`` / ``co_present_person_ids`` / ``peer_memory_reasoning_level``
         thread through to the Honcho memory layer — see ``stream_chat``
         for details. ``peer_memory_reasoning_level=None`` (default)
-        keeps each underlying entry point's own default (``"low"`` for
-        the streaming path, ``"medium"`` for the committee path).
+        keeps each underlying entry point's own default (``"minimal"``
+        for the streaming path, ``"medium"`` for the committee path).
         """
         # Build the kwargs dict so we can conditionally include the
         # reasoning_level only when caller specified one — otherwise
@@ -1520,6 +1617,7 @@ class Executive:
             "person_id": person_id,
             "co_present_person_ids": co_present_person_ids,
             "briefing_context": briefing_context,
+            "channel_context_block": channel_context_block,
         }
         if peer_memory_reasoning_level is not None:
             common_kwargs["peer_memory_reasoning_level"] = peer_memory_reasoning_level
