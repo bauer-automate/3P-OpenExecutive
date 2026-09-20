@@ -29,7 +29,25 @@ _BODY_SNIPPET_CHARS = 200
 _MAX_ALERTS = 30
 
 
-def format_open_alerts_for_prompt(db_path: Path | None = None, limit: int = _MAX_ALERTS) -> str:
+def _one_line(value: str | None) -> str:
+    """Collapse a field to a single line of single-spaced text.
+
+    EVERY interpolated field must go through this. Alert headlines, suggested
+    actions, tags and review notes all originate in inbound email and chat, so
+    they are attacker-controlled; a newline in any of them lets the sender
+    forge an extra line in this block. That matters because a line starting
+    `[N]` is one of only two sources `ack_alert` is told to trust, so a forged
+    line is a forged instruction to clear somebody else's alert. Only `body`
+    was being stripped.
+    """
+    return " ".join((value or "").split())
+
+
+def format_open_alerts_for_prompt(
+    db_path: Path | None = None,
+    limit: int = _MAX_ALERTS,
+    rendered_ids: list[int] | None = None,
+) -> str:
     """Render current open (unread) alerts as a compact digest, or ``""`` when none.
 
     One line per alert::
@@ -41,6 +59,11 @@ def format_open_alerts_for_prompt(db_path: Path | None = None, limit: int = _MAX
     :func:`openexecutive.briefing.ranking.score_and_categorize` so the Executive
     can tell an item awaiting a decision from a passive monitoring signal.
 
+    ``rendered_ids``, when given, is filled with the alert ids this block
+    actually names — the caller records them on the session so ``ack_alert``
+    can refuse an id the model did not get from here. Prompt wording alone is
+    not a control.
+
     Pure synchronous SQLite read — wrap in ``asyncio.to_thread`` at the call
     site. Never raises: any failure logs and returns ``""`` so a chat turn is
     never blocked by an alerts-store hiccup.
@@ -49,34 +72,45 @@ def format_open_alerts_for_prompt(db_path: Path | None = None, limit: int = _MAX
     from openexecutive.briefing.ranking import score_and_categorize
 
     try:
-        alerts = list_live_alerts(limit=limit, db_path=db_path)
+        # Fetch one more than we render so we can tell a full board from a
+        # truncated one. Without this the header below claims the list is the
+        # whole board even when it is the most recent `limit` of many more —
+        # the Executive then tells the principal a partial set is everything
+        # (#136, second symptom).
+        alerts = list_live_alerts(limit=limit + 1, db_path=db_path)
     except Exception:
         logger.exception("briefing_context.list_alerts_failed")
         return ""
 
+    truncated = len(alerts) > limit
+    alerts = alerts[:limit]
+
     lines: list[str] = []
     for alert in alerts:
         _score, category, _reason = score_and_categorize(alert)
-        body = (alert.body or "").strip().replace("\n", " ")
+        body = _one_line(alert.body)
         if len(body) > _BODY_SNIPPET_CHARS:
             body = body[:_BODY_SNIPPET_CHARS].rstrip() + "…"
-        line = f"[{alert.id}] ({category}) {alert.headline}"
+        line = f"[{alert.id}] ({category}) {_one_line(alert.headline)}"
         if body:
             line += f" — {body}"
         if alert.suggested_action:
-            line += f" | suggested: {alert.suggested_action.strip()}"
+            line += f" | suggested: {_one_line(alert.suggested_action)}"
         if alert.topic_tags:
-            line += f" | tags: {', '.join(alert.topic_tags)}"
+            tags = ", ".join(_one_line(t) for t in alert.topic_tags)
+            line += f" | tags: {tags}"
         if alert.review_verdict:
-            review = f" | review: {alert.review_verdict}"
+            review = f" | review: {_one_line(alert.review_verdict)}"
             if alert.review_note:
-                review += f" — {alert.review_note.strip()}"
+                review += f" — {_one_line(alert.review_note)}"
             if alert.recommended_move and alert.recommended_move != "none":
-                review += f" | next move: {alert.recommended_move}"
+                review += f" | next move: {_one_line(alert.recommended_move)}"
             line += review
         if alert.occurrence_count > 1:
             line += f" | seen x{alert.occurrence_count}"
         lines.append(line)
+        if rendered_ids is not None and alert.id is not None:
+            rendered_ids.append(alert.id)
 
     if not lines:
         return ""
@@ -87,6 +121,13 @@ def format_open_alerts_for_prompt(db_path: Path | None = None, limit: int = _MAX
         "[alert_id] (category) headline — details. When the user asks about one "
         "of these by name, this is what they mean."
     )
+    if truncated:
+        header += (
+            f" NOTE: this is only the {len(lines)} most recent open items, not "
+            "the complete board — there are more. Do not describe this list as "
+            "everything that is open; say it is the most recent slice and point "
+            "the principal at the briefing page for the rest."
+        )
     return header + "\n" + "\n".join(lines)
 
 

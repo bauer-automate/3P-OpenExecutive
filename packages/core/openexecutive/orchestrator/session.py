@@ -18,6 +18,25 @@ class Session:
     # Used by schedule_followup to refuse scheduling sends to refs the user
     # never actually used — anti-spam guard.
     seen_channel_refs: set[tuple[str, str]] = field(default_factory=set)
+    # Which inbound chat channel this session arrived on ("slack", "discord",
+    # "telegram", "google_chat"), and the address on it. Empty for web/CLI
+    # turns. Used when a workflow raises an approval gate mid-conversation:
+    # the gate records where to look for the answer, so a reply on this
+    # channel can resolve it. Inbound vocabulary — see `normalize_channel`.
+    origin_channel: str = ""
+    origin_channel_ref: str = ""
+    # The rostered Person behind this conversation, when one is resolved. The
+    # adapters already pass this to `Executive.chat(person_id=...)`; holding it
+    # on the session too lets tool handlers running mid-turn tell "the approver
+    # is the person I'm already talking to" from "the approver is someone else".
+    caller_person_id: int | None = None
+    # Alert ids the server itself put in front of the model this turn (the
+    # `<briefing>` block). `ack_alert` refuses anything else on a chat channel,
+    # so an id quoted inside an alert's own body — alerts are minted from
+    # inbound mail and chat, so that text is attacker-controlled — cannot be
+    # acted on even if the model is talked into believing it. Empty on the web
+    # path, where the briefing page's Discuss handoff supplies the id instead.
+    trusted_alert_ids: set[int] = field(default_factory=set)
 
     def add_user_message(self, content: str) -> None:
         self.conversation_history.append({"role": "user", "content": content})

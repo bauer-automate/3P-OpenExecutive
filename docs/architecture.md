@@ -494,7 +494,7 @@ data: {"type": "error", "message": "..."}
 ### Slack Bot
 `integrations/slack_bot.py`
 
-Slack Bolt app in socket mode. Listens for `@OpenExecutive` mentions and direct messages. Calls `Executive.chat()` synchronously via `asyncio.run()`. Runs as a separate process alongside FastAPI.
+Async Bolt app in socket mode, embedded in the FastAPI lifespan (no separate process). Listens for `@OpenExecutive` mentions and direct messages, and awaits `Executive.chat()` on the application event loop. Started when both tokens are set: the lifespan connects the Socket Mode handler as a background task and closes it on shutdown.
 
 Required env vars: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
 
