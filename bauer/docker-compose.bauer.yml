@@ -1,20 +1,17 @@
-# Bauer overlay for the split topology (bauer-automate/claude-skills#933).
+# Bauer Automate compose overlay.
 #
 #   docker compose -f docker/docker-compose.yml -f bauer/docker-compose.bauer.yml up -d
 #
-# Box holds the data, a cloud edge fronts it, and the link is outbound-initiated
-# from the box. Nothing here opens an inbound port to the operator's network.
+# Rationale is recorded in Bauer's internal tracker, not in this public repo.
 #
 # Three deliberate changes to upstream's compose, all as overrides so the
 # upstream file is never edited:
 #   1. UI moves from the dev container (node:22-alpine running `npm install &&
 #      npm run dev`) to the production image in docker/Dockerfile.ui. Upstream's
 #      compose is a dev setup; shipping it would run a dev server in production.
-#   2. UI publishes NO host port. Upstream publishes 3000 on every interface;
-#      here it is only `expose`d on the compose network, so the edge connector
-#      reaches ui:3000 directly and the host opens nothing. Compose MERGES port
-#      lists across files, so the override must `!reset []` first or upstream's
-#      0.0.0.0 binding survives alongside it.
+#   2. UI publishes NO host port, only `expose` on the compose network. Compose
+#      MERGES port lists across files, so the override must `!reset []` first or
+#      upstream's 0.0.0.0 binding survives alongside it.
 #   3. Single API replica made explicit. The scheduler claims rows with
 #      UPDATE...RETURNING, which is not safe across processes: a second replica
 #      fires every scheduled action twice. There is no leader election.
@@ -27,8 +24,7 @@ services:
     environment:
       # Gateway config lives on the volume, not in the image.
       - MCP_SERVERS_CONFIG_PATH=/data/company/mcp_servers.json
-      # Propose-only posture: alert review annotates, never routes or DMs,
-      # until the approval cards have been watched for a while (#933).
+      # Alert review annotates only.
       - ALERT_REVIEW_MAX_MOVES_PER_SCAN=0
     healthcheck:
       # Cold start builds the MCP tool-discovery index and loads Chroma before
@@ -46,21 +42,14 @@ services:
     volumes: !reset []
     restart: unless-stopped
     # !reset is load-bearing: Compose MERGES port lists across files, so without
-    # it upstream's 0.0.0.0:3000 binding survives alongside this one and the UI
-    # still answers on every interface. Verified with `docker compose config`.
+    # it upstream's 0.0.0.0:3000 binding survives alongside this one. Verified
+    # with `docker compose config`.
     ports: !reset []
     expose:
       - "3000"
 
-  # The cloud edge terminates TLS and proxies back over an outbound-initiated
-  # link. Left commented until the edge is chosen: Cloudflare Tunnel is the
-  # obvious fit, but the Cloudflare account was never inspected (its MCP is
-  # configured but unauthenticated), so this stays unwritten rather than guessed.
-  #
-  # Whatever is used must satisfy three things:
-  #   - outbound-initiated only, no inbound port to this network
-  #   - terminates TLS at the edge, holds the public DNS name
-  #   - holds no data; it is a proxy
+  # The edge / reverse-proxy service is left commented out until it is chosen.
+  # Requirements for whatever fills it are recorded in the internal tracker.
   #
   # tunnel:
   #   image: <edge connector image>

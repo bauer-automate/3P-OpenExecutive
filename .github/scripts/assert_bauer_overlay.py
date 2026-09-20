@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Assert the Bauer overlay merged to the topology it claims.
+"""Assert the Bauer overlay merged to the intended shape.
 
 `docker compose config` on its own only proves the files parse. The failure this
-overlay actually hit was semantic, not syntactic: Compose MERGES list fields
-across files rather than replacing them, so the UI's `ports` override appended
-to upstream's and the 0.0.0.0:3000 binding survived alongside the intended one.
-The UI answered on every interface while the override looked correct.
+overlay hit was semantic, not syntactic: Compose MERGES list fields across files
+rather than replacing them, so the UI's `ports` override appended to upstream's
+and the 0.0.0.0:3000 binding survived alongside the intended one. The override
+looked correct and the UI still answered on every interface.
 
-Each check below is one of those semantic claims, taken from bauer/README.md.
-Run against the rendered output:
+Each check below pins one property of the rendered result. Run it against the
+rendered output:
 
     docker compose -f docker/docker-compose.yml \\
                    -f bauer/docker-compose.bauer.yml config > merged.yml
@@ -22,15 +22,12 @@ import sys
 
 try:
     import yaml
-except ImportError:  # pragma: no cover - CI installs it via setup-python's stdlib pip
+except ImportError:  # pragma: no cover - CI installs it explicitly
     sys.exit("PyYAML is required: pip install pyyaml")
 
 FAILURES: list[str] = []
 CHECKS = 0
 
-# Loopback only. A published port on any other interface is reachable from the
-# operator's network, which the split topology exists to prevent: the box is
-# reached through an outbound-initiated link to the cloud edge, never inbound.
 LOOPBACK = {"127.0.0.1", "::1"}
 
 
@@ -65,8 +62,7 @@ def main(path: str) -> int:
     services = merged.get("services") or {}
     print(f"services rendered: {', '.join(sorted(services)) or '(none)'}\n")
 
-    # 1. The UI publishes no host port. `expose` only, so the edge connector
-    #    reaches ui:3000 over the compose network and the host opens nothing.
+    # 1. The UI publishes no host port; `expose` only.
     ui = services.get("ui") or {}
     check(
         "ui publishes no host port",
@@ -75,14 +71,14 @@ def main(path: str) -> int:
     )
     check("ui exposes 3000 on the compose network", "3000" in [str(p) for p in ui.get("expose") or []])
 
-    # 2. Nothing binds a non-loopback interface.
+    # 2. Published ports bind loopback only.
     for name, service in sorted(services.items()):
         for port in service.get("ports") or []:
             host_ip = port.get("host_ip") if isinstance(port, dict) else None
             check(
                 f"{name} publishes {port.get('published') if isinstance(port, dict) else port} on loopback only",
                 host_ip in LOOPBACK,
-                f"host_ip={host_ip!r} — reachable from the operator's network",
+                f"host_ip={host_ip!r}",
             )
 
     # 3. Exactly one API replica. The scheduler claims rows with
@@ -93,11 +89,11 @@ def main(path: str) -> int:
     check("api is pinned to exactly one replica", (api.get("deploy") or {}).get("replicas") == 1,
           f"got {(api.get('deploy') or {}).get('replicas')!r}")
 
-    # 4. Propose-only posture: alert review annotates, never routes or DMs.
+    # 4. Alert review annotates only.
     env = api.get("environment") or {}
     if isinstance(env, list):  # compose can render either shape
         env = dict(item.split("=", 1) for item in env if "=" in item)
-    check("propose-only posture is set (ALERT_REVIEW_MAX_MOVES_PER_SCAN=0)",
+    check("ALERT_REVIEW_MAX_MOVES_PER_SCAN is 0",
           str(env.get("ALERT_REVIEW_MAX_MOVES_PER_SCAN")) == "0",
           f"got {env.get('ALERT_REVIEW_MAX_MOVES_PER_SCAN')!r}")
 
