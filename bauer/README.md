@@ -1,8 +1,13 @@
 # `bauer/` — Bauer Automate deployment overlay
 
 Everything here is **additive**. No file upstream owns is edited, because upstream
-is active (PR #126 at the time of writing) and every in-place edit is a merge cost
-we pay forever. Decisions: `bauer-automate/claude-skills` #886, #897, #903, #933.
+is active and every in-place edit is a merge cost we pay forever.
+
+> **Design rationale, topology and data-handling rules are recorded in Bauer's
+> internal tracker, not here.** This repository is public. Keep it to mechanics:
+> what the files do and how to run them. Anything explaining *why* a control
+> exists, what it protects, or what the deployment holds belongs in the internal
+> record.
 
 ## Files
 
@@ -10,22 +15,7 @@ we pay forever. Decisions: `bauer-automate/claude-skills` #886, #897, #903, #933
 |---|---|
 | `mcp_servers.json` | Template for `/data/company/mcp_servers.json`. Placeholders only. |
 | `env.bauer.example` | Values to merge into the gitignored repo-root `.env`. |
-| `docker-compose.bauer.yml` | Overlay for the split topology. |
-
-## Validation
-
-`.github/workflows/bauer-overlay.yml` renders the merged compose file and runs
-`.github/scripts/assert_bauer_overlay.py` over it on any change to `bauer/` or
-`docker/`. Six assertions, each one a claim this README makes: the UI publishes
-no host port, nothing binds a non-loopback interface, the API is pinned to one
-replica, the propose-only posture is set, and the health-check grace is at least
-300s. Verified to fail (exit 1) when `!reset []` is removed from the UI's port
-override, which is the regression it exists for.
-
-Actions is enabled on this fork, so the gate runs. It first ran green on
-`bauer-automate/3P-OpenExecutive#2`. That resolves the "nothing validates
-`bauer/`" gap: upstream's `ci.yml` does not look at this directory and is not
-edited to, so this workflow is the only thing that does.
+| `docker-compose.bauer.yml` | Compose overlay. |
 
 ## Running it
 
@@ -45,43 +35,56 @@ merged, so upstream's `0.0.0.0:3000` binding survived alongside the intended one
 and the UI still answered on every interface. `!reset []` fixes it, and `config`
 is how you see that it worked. `!reset` needs Compose v2.24 or newer.
 
-## What the overlay changes, and why
+## Validation
+
+`.github/workflows/bauer-overlay.yml` renders the merged compose file and runs
+`.github/scripts/assert_bauer_overlay.py` over it on any change to `bauer/` or
+`docker/`. Six assertions over the rendered result. Verified to fail (exit 1)
+when `!reset []` is removed from the UI's port override, which is the regression
+it exists for.
+
+Note the `paths:` filter. An upstream sync that touches neither `bauer/` nor
+`docker/` will not run the gate, which is correct but means a green PR is not by
+itself evidence the overlay was re-checked. Run it by hand after a sync.
+
+Upstream's `ci.yml` does not look at this directory and is not edited to, so this
+workflow is the only thing that does.
+
+## What the overlay changes
 
 1. **UI runs the production image** (`docker/Dockerfile.ui`) instead of upstream's
    dev container, which runs `npm install && npm run dev` on boot.
-2. **UI publishes no host port** — only `expose: 3000` on the compose network, so
-   the edge connector reaches `ui:3000` and the host opens nothing.
+2. **UI publishes no host port** — `expose: 3000` on the compose network only.
 3. **API pinned to one replica.** The scheduler claims rows with
    `UPDATE … RETURNING`, safe within a process but not across them. A second
    replica fires every scheduled action twice. There is no leader election.
 4. **Health-check grace of 5 minutes.** Cold start builds the MCP tool-discovery
    index and loads Chroma before serving; a short grace kills it mid-boot.
-5. **`ALERT_REVIEW_MAX_MOVES_PER_SCAN=0`** — propose-only posture.
+5. **`ALERT_REVIEW_MAX_MOVES_PER_SCAN=0`**.
 
-## How the `m365-graph` surface is narrowed
+The edge service is left commented out rather than guessed.
 
-The engine runs with `--org-mode --read-only --enabled-tools '^(?!.*sharepoint)'`.
-Three deliberate choices, all verified against `3P-ms-365-mcp-server@70a54bc`
-rather than taken from the README.
+## `m365-graph` flags
+
+The engine runs `--org-mode --read-only --enabled-tools '^(?!.*sharepoint)'`.
+All three verified against `3P-ms-365-mcp-server@70a54bc` rather than taken from
+its README.
 
 **`--read-only` is a tool-surface filter, not a runtime guard.** Tools it drops
 never appear in `tools/list` at all. It removes every non-GET endpoint, keeping
-7 POST-shaped reads and the 4 utility tools. That is the belt under the
-read-scopes-first posture in `claude-skills#933`; the service account's scopes
-are still the actual boundary.
+7 POST-shaped reads and the 4 utility tools.
 
-It costs `graph-batch`, which is a POST carrying no `readOnly` flag. No flag
-keeps batching while dropping the other writes. Accepted here, because the
-engine does not need it; an interactive consumer that does runs without
-`--read-only`.
+It costs `graph-batch`, which is a POST carrying no `readOnly` flag, and no flag
+keeps batching while dropping the other writes. A consumer that needs batching
+runs without `--read-only`.
 
-**SharePoint is excluded by regex, because no preset can do it.** SharePoint
-routes to `bauer-sharepoint`'s own MCP server (operator ruling 2026-09-19).
-There is no `sharepoint` preset to switch off: those 34 tools sit inside the
-`work` preset alongside Teams. `--enabled-tools` compiles as
-`new RegExp(pattern, 'i')` against `toolName`, so negative lookahead works.
+**SharePoint is excluded by regex, because no preset can do it.** There is no
+`sharepoint` preset: those 34 tools sit inside the `work` preset alongside Teams.
+`--enabled-tools` compiles as `new RegExp(pattern, 'i')` against `toolName`, so
+negative lookahead works. SharePoint is served by different tooling.
 
-Surface sizes, counted from `src/endpoints.json` plus the 4 utility tools:
+Surface sizes, counted from that commit's `src/endpoints.json` plus the 4 utility
+tools:
 
 | Flags | Endpoint tools | With utilities |
 |---|---|---|
@@ -90,20 +93,11 @@ Surface sizes, counted from `src/endpoints.json` plus the 4 utility tools:
 | `--enabled-tools '^(?!.*sharepoint)'` | 298 | 302 |
 | both, as configured here | 141 | 145 |
 
-**Before write scopes are ever granted**, set `--message-signoff-prefix` (or
-`MS365_MCP_MESSAGE_SIGNOFF_PREFIX`) so recipients can tell an agent sent the
-message. The server refuses to start with a marker that renders as empty text.
+`--message-signoff-prefix` (or `MS365_MCP_MESSAGE_SIGNOFF_PREFIX`) prepends a
+marker to outgoing messages so recipients can tell an agent sent them. The server
+refuses to start with a marker that renders as empty text.
 
-## Topology
-
-Box holds the data, a cloud edge fronts it, and **the link is outbound-initiated
-from the box**. No inbound port to the operator's network, ever. The edge
-terminates TLS, holds the public DNS name, and holds no data.
-
-The edge service is left commented out in the overlay rather than guessed.
-Cloudflare Tunnel is the obvious fit, but that account was never inspected.
-
-## Secrets
+## Gateway environment variables
 
 The gateway forwards only the variables named in
 `orchestrator/mcp_gateway.py::_FORWARDED_ENV_VARS` to the `extensible-mcp` child.
@@ -124,6 +118,5 @@ an upstream file, and the merge cost outlives the convenience.
   **cannot be resolved by reading the fork**: its `package.json` says
   `"version": "0.0.0-development"` because semantic-release stamps the real
   version at publish time. Use `npm view @softeria/ms-365-mcp-server versions`.
-- `claude-skills#886`'s customer-data ruling still gates anything beyond Bauer's
-  own content. Bauer SOPs are cleared; customer SOWs and Zoho customer records
-  are not.
+- Content-ingest scope is governed by the internal tracker. Check it before
+  loading anything into the corpus.
