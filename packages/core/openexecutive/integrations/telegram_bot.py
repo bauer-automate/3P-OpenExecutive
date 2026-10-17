@@ -10,6 +10,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
 from openexecutive.config import get_settings
+from openexecutive.orchestrator.people_tools import audit_rows_on_senders_turn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -79,15 +80,34 @@ async def send_message(token: str, chat_id: int, text: str) -> str | None:
     Returns the Telegram message_id of the last chunk sent (best-effort —
     ``None`` if no chunk delivered or the response lacks one), so callers can
     link an outbound DM to a later reply. Existing callers ignore the return."""
+    from openexecutive.utils.markdown_telegram import markdown_to_telegram_html
+
     client = _get_http_client()
     last_message_id: str | None = None
     for chunk in _split_message(text):
         if not chunk:
             continue
+        # No link previews: Telegram's server would fetch a link in the
+        # text on its own, and a reply can quote mail a sender wrote to
+        # carry data out in one.
+        base: dict[str, Any] = {"chat_id": chat_id, "link_preview_options": {"is_disabled": True}}
+        # The reply is Markdown, which Telegram shows as typed: send it as
+        # Telegram's HTML instead. Should Telegram refuse that (an entity it
+        # can't parse, or escaping that pushed it over the length cap), the
+        # chunk goes again as the plain text it was before. Only a 400 is a
+        # refusal of the message itself: a 429 or 5xx would fail again (or,
+        # after a 5xx that was delivered anyway, send the reply twice).
         resp = await client.post(
             _tg_url(token, "sendMessage"),
-            json={"chat_id": chat_id, "text": chunk},
+            json={**base, "text": markdown_to_telegram_html(chunk), "parse_mode": "HTML"},
         )
+        if resp.status_code == 400:
+            logger.warning(
+                "Telegram sendMessage (HTML) failed, sending as plain text: %s %s",
+                resp.status_code,
+                resp.text,
+            )
+            resp = await client.post(_tg_url(token, "sendMessage"), json={**base, "text": chunk})
         if resp.is_error:
             logger.error(
                 "Telegram sendMessage failed: %s %s", resp.status_code, resp.text
@@ -123,6 +143,20 @@ async def _get_telegram_file_bytes(token: str, file_id: str) -> tuple[str, bytes
     return file_path, data
 
 
+def _find_telegram_sender(chat_id: str) -> object:
+    from openexecutive.people.store import find_person_by_telegram_chat_id
+
+    return find_person_by_telegram_chat_id(chat_id)
+
+
+# The rows this handler writes before the turn binds its session (the inbound
+# row, the knowledge retrieval, alert triage) are private when the principal
+# sent the message from a verified chat and they name one of their contacts.
+@audit_rows_on_senders_turn(
+    "telegram",
+    sender_ref=lambda args: str(args["chat_id"]),
+    find_sender=_find_telegram_sender,
+)
 async def _process_and_reply(
     message_text: str,
     sender_name: str,
@@ -136,11 +170,14 @@ async def _process_and_reply(
     ``attachment_file_ids`` is a list of ``(file_id, filename, content_type)``
     tuples for any files or photos attached to the message.
     """
-    # Deterministic per-chat session id — stamped on every audit row (inbound,
+    # Per-conversation session id — stamped on every audit row (inbound,
     # chat_turn, specialist_consult, tool_invocation) so a single request can
     # be followed end-to-end in /audit. Must match the value used when the
-    # Session is constructed below.
-    session_id = f"telegram:{chat_id}"
+    # Session is constructed below. The chat is one stream, `telegram:{chat_id}`,
+    # cut into conversations after a quiet gap or a /new (memory.conversations).
+    from openexecutive.integrations.conversations import conversation_for
+
+    session_id = await asyncio.to_thread(conversation_for, f"telegram:{chat_id}")
 
     from openexecutive.audit import log_event as audit_log
     audit_log(
@@ -182,16 +219,14 @@ async def _process_and_reply(
 
     # Fork into alert triage pipeline (fire-and-forget, same pattern as other integrations).
     try:
-        from openexecutive.alerts.models import AlertEvent
-        from openexecutive.alerts.pipeline import schedule_evaluation
+        from openexecutive.alerts.pipeline import schedule_chat_message_evaluation
 
-        schedule_evaluation(
-            AlertEvent(
-                source="telegram",
-                external_id=str(message_id),
-                body=message_text,
-                user=sender_name,
-            )
+        schedule_chat_message_evaluation(
+            source="telegram",
+            external_id=str(message_id),
+            body=message_text,
+            sender=_tg_person,
+            fallback_name=sender_name,
         )
     except Exception:
         logger.exception("Telegram: failed to schedule alert evaluation")
@@ -210,7 +245,9 @@ async def _process_and_reply(
                     # don't need AttachmentItem/process_attachments here since
                     # Telegram requires a separate getFile API call rather than
                     # a direct URL download.
-                    att_text, img_blocks = build_attachment_output(filename, data, content_type)
+                    att_text, img_blocks = await build_attachment_output(
+                        filename, data, content_type
+                    )
                     if att_text:
                         message_text = (
                             f"{att_text}\n\n{message_text}" if message_text else att_text
@@ -242,6 +279,9 @@ async def _process_and_reply(
 
     response: str | None = None
     async with _chat_lock(chat_id):
+        # Again under the lock: a /new queued behind an earlier turn may have
+        # started the next conversation since this message was picked up.
+        session_id = await asyncio.to_thread(conversation_for, f"telegram:{chat_id}")
         try:
             profile = load_or_create_profile()
             # See the note in slack_bot: lets an approval gate raised in
@@ -258,7 +298,7 @@ async def _process_and_reply(
             # Record this channel_ref as user-initiated so the Executive may
             # schedule follow-ups back to this chat.
             session.seen_channel_refs.add(("telegram", str(chat_id)))
-            retrieved_context = retrieve(query=message_text)
+            retrieved_context = retrieve(query=message_text, max_chars=get_settings().knowledge_chat_max_chars)
             episodic_context = format_for_prompt(session_id=session_id)
 
             # Look up the OE Person record so Honcho can key per-person
@@ -311,7 +351,9 @@ async def _process_and_reply(
                 channel_context_block=build_channel_context_block("telegram"),
                 person_id=person_id,
             )
-            await send_message(token, chat_id, response)
+            from openexecutive.orchestrator.disclosure import with_chat_line
+
+            await send_message(token, chat_id, with_chat_line(response, f"telegram:{session_id}"))
         except Exception:
             logger.exception("Telegram: handler error for message %s", message_id)
             try:
@@ -343,17 +385,138 @@ async def _process_and_reply(
                 session.created_at.isoformat(),
                 caller_person_id=session_owner_id,
             )
-            save_message(session_id, "user", message_text)
+            save_message(session_id, "user", message_text, sender_person_id=person_id)
             save_message(session_id, "assistant", response)
             update_session_timestamp(session_id)
         except Exception:
             logger.exception(
                 "Telegram: failed to persist turn for session %s", session_id
             )
+        else:
+            from openexecutive.integrations.conversations import title_after_turn
+
+            title_after_turn(session_id, message_text, response)
+
+
+async def _start_fresh_and_reply(chat_id: int, token: str) -> None:
+    """Answer /new: start a new conversation in this chat and say so."""
+    from openexecutive.integrations.conversations import start_fresh
+    from openexecutive.people.store import find_person_by_telegram_chat_id
+
+    async with _chat_lock(chat_id):
+        person = await asyncio.to_thread(find_person_by_telegram_chat_id, str(chat_id))
+        reply = await asyncio.to_thread(
+            start_fresh, f"telegram:{chat_id}", person.id if person is not None else None
+        )
+    try:
+        await send_message(token, chat_id, reply)
+    except Exception:
+        logger.exception("Telegram: failed to confirm /new for chat %s", chat_id)
 
 
 # Known bot commands that should be stripped before passing to the Executive.
 _COMMAND_RE = re.compile(r"^/(start|help|ask)(?:@\w+)?\s*", re.IGNORECASE)
+
+
+def _message_content(message: dict[str, Any]) -> tuple[str, list[tuple[str, str, str]]]:
+    """A Telegram message's text (known bot commands stripped) and its
+    attachments as ``(file_id, filename, content_type)``. Downloads happen
+    later, in ``_process_and_reply``, so the webhook stays fast."""
+    text: str = message.get("text", "") or message.get("caption", "")
+    text = text.strip()
+    # Only strip known bot commands (/start, /help, /ask), not arbitrary slash-prefixed content.
+    text = _COMMAND_RE.sub("", text).strip()
+
+    attachment_file_ids: list[tuple[str, str, str]] = []
+
+    # Single document (any file type).
+    doc = message.get("document")
+    if doc:
+        file_id = doc.get("file_id", "")
+        filename = doc.get("file_name") or f"file_{file_id}"
+        content_type = doc.get("mime_type") or ""
+        if file_id:
+            attachment_file_ids.append((file_id, filename, content_type))
+
+    # Photos — Telegram sends an array of sizes; pick the largest.
+    photos = message.get("photo")
+    if photos and isinstance(photos, list) and photos:
+        largest = max(photos, key=lambda p: p.get("file_size", 0))
+        file_id = largest.get("file_id", "")
+        if file_id:
+            attachment_file_ids.append((file_id, f"photo_{file_id}.jpg", "image/jpeg"))
+    return text, attachment_file_ids
+
+
+async def _hold_unknown_sender(
+    *,
+    message_text: str,
+    sender_name: str,
+    chat_id: int,
+    message_id: int,
+    token: str,
+    attachment_file_ids: list[tuple[str, str, str]],
+) -> None:
+    """Hold a private-chat message from someone off the roster for the
+    principal to confirm (``integrations.roster_intake``) and tell them it
+    arrived. One of the principal's contacts gets nothing: contacts have no
+    chat access."""
+    from openexecutive.integrations import roster_intake
+    from openexecutive.people.store import find_person_by_telegram_chat_id
+
+    if await asyncio.to_thread(
+        find_person_by_telegram_chat_id, str(chat_id), include_contacts=True
+    ):
+        return
+
+    async def _ack(text: str) -> None:
+        await send_message(token, chat_id, text)
+
+    await roster_intake.intake(
+        "telegram", str(chat_id),
+        external_id=str(message_id),
+        payload={
+            "message_text": message_text,
+            "sender_name": sender_name,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "attachment_file_ids": [list(a) for a in attachment_file_ids],
+        },
+        preview=message_text,
+        display_name=sender_name if not sender_name.startswith("chat:") else "",
+        send_ack=_ack,
+    )
+
+
+async def _replay_held(message: Any, _request: Any) -> bool:
+    """Replay a message held while its chat was off the roster."""
+    token = get_settings().telegram_bot_token
+    payload = message.payload
+    if not token or not payload.get("chat_id"):
+        return False
+    attachments = [
+        (str(a[0]), str(a[1]), str(a[2]))
+        for a in payload.get("attachment_file_ids") or []
+        if isinstance(a, (list, tuple)) and len(a) == 3
+    ]
+    await _process_and_reply(
+        message_text=str(payload.get("message_text") or ""),
+        sender_name=str(payload.get("sender_name") or ""),
+        chat_id=int(payload["chat_id"]),
+        message_id=int(payload.get("message_id") or 0),
+        token=token,
+        attachment_file_ids=attachments or None,
+    )
+    return True
+
+
+def _register_replayer() -> None:
+    from openexecutive.integrations.roster_intake import register_replayer
+
+    register_replayer("telegram", _replay_held)
+
+
+_register_replayer()
 
 
 @router.post("/webhook/telegram", status_code=200)
@@ -365,6 +528,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks) 
 
     # Verify the secret token Telegram sends in the header (set when registering the webhook).
     if settings.telegram_webhook_secret:
+        if not settings.telegram_webhook_secret_valid:
+            # Telegram can never send such a value (setWebhook refuses it), so
+            # the only request that could match it is a forged one.
+            logger.warning(
+                "Telegram: TELEGRAM_WEBHOOK_SECRET is not a value Telegram can send "
+                "(1-256 of A-Z a-z 0-9 _ -); refusing every update until it is fixed"
+            )
+            raise HTTPException(status_code=401, detail="Invalid webhook secret")
         sent = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not hmac.compare_digest(sent, settings.telegram_webhook_secret):
             logger.warning("Telegram: webhook secret mismatch")
@@ -416,36 +587,41 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks) 
                 "outcome": "rejected_unknown_sender",
             },
         )
+        # A private chat, on a webhook only Telegram can call: hold the
+        # message for the principal to confirm and tell the sender it
+        # arrived. A group (everyone in it) or an unverified webhook (anyone
+        # could forge the update) stays silent, as before.
+        chat = message.get("chat") or {}
+        if (
+            chat.get("type") == "private"
+            and settings.telegram_webhook_secret
+            and settings.telegram_webhook_secret_valid
+        ):
+            text, attachment_file_ids = _message_content(message)
+            if text or attachment_file_ids:
+                background_tasks.add_task(
+                    _hold_unknown_sender,
+                    message_text=text,
+                    sender_name=sender_name,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    token=settings.telegram_bot_token,
+                    attachment_file_ids=attachment_file_ids,
+                )
         return {}
 
-    text: str = message.get("text", "") or message.get("caption", "")
-    text = text.strip()
-    # Only strip known bot commands (/start, /help, /ask), not arbitrary slash-prefixed content.
-    text = _COMMAND_RE.sub("", text).strip()
-
-    # Collect attachment metadata (file_id, filename, content_type).
-    # Downloads happen inside _process_and_reply so this handler stays fast.
-    attachment_file_ids: list[tuple[str, str, str]] = []
-
-    # Single document (any file type).
-    doc = message.get("document")
-    if doc:
-        file_id = doc.get("file_id", "")
-        filename = doc.get("file_name") or f"file_{file_id}"
-        content_type = doc.get("mime_type") or ""
-        if file_id:
-            attachment_file_ids.append((file_id, filename, content_type))
-
-    # Photos — Telegram sends an array of sizes; pick the largest.
-    photos = message.get("photo")
-    if photos and isinstance(photos, list) and photos:
-        largest = max(photos, key=lambda p: p.get("file_size", 0))
-        file_id = largest.get("file_id", "")
-        if file_id:
-            attachment_file_ids.append((file_id, f"photo_{file_id}.jpg", "image/jpeg"))
+    text, attachment_file_ids = _message_content(message)
 
     # Require either text or at least one attachment to proceed.
     if not text and not attachment_file_ids:
+        return {}
+
+    from openexecutive.integrations.conversations import is_new_conversation_command
+
+    if not attachment_file_ids and is_new_conversation_command(text):
+        background_tasks.add_task(
+            _start_fresh_and_reply, chat_id=chat_id, token=settings.telegram_bot_token
+        )
         return {}
 
     background_tasks.add_task(

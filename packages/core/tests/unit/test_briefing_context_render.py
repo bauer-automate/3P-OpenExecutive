@@ -53,7 +53,7 @@ def test_render_context_splits_new_vs_carried_and_lists_handled() -> None:
     assert "PROPOSALS AWAITING DECISION:" not in text
     # Sections that are unchanged by the window still render.
     assert "DEPARTMENTS WITH RISK:" in text
-    assert "PEOPLE WAITING ON YOU:" in text
+    assert "PEOPLE YOU ARE WAITING ON (a workflow is paused for their reply):" in text
 
 
 def test_render_context_with_since_and_nothing_new_still_reports_carried() -> None:
@@ -125,3 +125,24 @@ def test_eod_context_lists_rewritten_open_items() -> None:
     text = _render_eod_context(period_label="p", today_data=today, activity=[], since=since)
     assert "REWRITTEN BY THE EXECUTIVE TODAY" in text
     assert "- item 4 — two offers now expiring Friday" in text
+
+
+def test_activity_label_claims_a_delta_only_when_bounded() -> None:
+    """Only the standalone briefs pass `since`, and only they bound activity to
+    it. The /today header gets the unbounded history rail, so calling that
+    block "since last brief" made the header report old rows as overnight news.
+    """
+    activity = [{"at": "2026-09-20", "kind": "alert_raised", "summary": "old news"}]
+
+    bounded = render_briefing_context(
+        period_label="p", today_data=_today(), activity=activity,
+        since=datetime.now(UTC) - timedelta(hours=24),
+    )
+    assert "OE ACTIVITY SINCE LAST BRIEF" in bounded
+
+    unbounded = render_briefing_context(
+        period_label="p", today_data=_today(), activity=activity, since=None,
+    )
+    assert "OE ACTIVITY SINCE LAST BRIEF" not in unbounded
+    assert "RECENT OE ACTIVITY" in unbounded
+    assert "NOT a delta" in unbounded

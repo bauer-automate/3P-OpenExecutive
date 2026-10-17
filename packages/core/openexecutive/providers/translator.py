@@ -12,7 +12,8 @@ testable in isolation without an HTTP client or an event loop.
 What we DO NOT translate:
 
 * ``cache_control`` blocks pass through unchanged when present. We
-  preserve them on system content, user-turn content, and tool entries
+  preserve them on system content, user-turn content, tool entries, and
+  tool-result content (the agent loop's intra-turn breakpoint)
   so OpenRouter can forward the Anthropic cache hints to the upstream
   Anthropic call (see OpenRouter prompt-caching docs:
   https://openrouter.ai/docs/guides/best-practices/prompt-caching).
@@ -66,23 +67,66 @@ def _any_block_has_cache_control(blocks: Any) -> bool:
     )
 
 
+def _typed_text_with_cc(text: str, cc: Any) -> dict[str, Any] | None:
+    """Build one typed text block, carrying ``cache_control`` when it is real.
+
+    The single place that decides how a cache marker is projected onto the
+    wire, shared by the system/user text path (`_typed_text_block`) and the
+    tool-result path. Pass the full ``cache_control`` dict through —
+    ``ttl: "1h"`` and any future extension fields ride along untouched.
+    OpenRouter forwards this to Anthropic verbatim.
+
+    Returns ``None`` for empty text: an empty typed block carries no content
+    to cache and risks an upstream 400.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    out: dict[str, Any] = {"type": "text", "text": text}
+    if isinstance(cc, dict):
+        out["cache_control"] = cc
+    return out
+
+
 def _typed_text_block(block: dict[str, Any]) -> dict[str, Any] | None:
     """Project an Anthropic text block down to the typed-block shape OpenRouter
     forwards to Anthropic. Preserves ``cache_control`` (including the optional
     ``ttl`` extension); drops anything else to keep the wire payload minimal."""
     if block.get("type") != "text":
         return None
-    txt = block.get("text", "")
-    if not isinstance(txt, str) or not txt:
+    return _typed_text_with_cc(block.get("text", ""), block.get("cache_control"))
+
+
+def _pdf_filename(title: Any) -> str:
+    """A document's ``title`` as a safe wire filename: last path segment,
+    printable, at most 100 characters, ending in ``.pdf`` (OpenRouter's
+    parser keys on the extension). ``document.pdf`` when there is none."""
+    if not isinstance(title, str):
+        return "document.pdf"
+    name = "".join(c for c in title.replace("\\", "/").rsplit("/", 1)[-1] if c.isprintable())
+    name = name.strip()[:96]
+    if not name:
+        return "document.pdf"
+    return name if name.lower().endswith(".pdf") else f"{name}.pdf"
+
+
+def _file_part(block: dict[str, Any]) -> dict[str, Any] | None:
+    """An Anthropic base64 PDF ``document`` block as the OpenAI chat
+    ``file`` content part, which OpenAI and OpenRouter both accept. Anything
+    else (a URL or text source, another media type) is ``None``: there is no
+    faithful OpenAI shape for it, and the caller drops it as before."""
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
         return None
-    out: dict[str, Any] = {"type": "text", "text": txt}
-    cc = block.get("cache_control")
-    if isinstance(cc, dict):
-        # Pass the full cache_control dict through — ``ttl: "1h"`` and any
-        # future extension fields ride along untouched. OpenRouter forwards
-        # this to Anthropic verbatim.
-        out["cache_control"] = cc
-    return out
+    if source.get("media_type") != "application/pdf":
+        return None
+    data = source.get("data")
+    if not isinstance(data, str) or not data:
+        return None
+    filename = _pdf_filename(block.get("title"))
+    return {
+        "type": "file",
+        "file": {"filename": filename, "file_data": f"data:application/pdf;base64,{data}"},
+    }
 
 
 def _translate_system(system: Any) -> str | list[dict[str, Any]] | None:
@@ -118,6 +162,76 @@ def _translate_system(system: Any) -> str | list[dict[str, Any]] | None:
     return str(system) or None
 
 
+def _request_caches_tool_results(messages: list[Any]) -> bool:
+    """True iff any ``tool_result`` block in the request carries a marker.
+
+    Drives a UNIFORM tool-message shape for the whole request, which the
+    prompt cache depends on. The agent loop's marker moves each iteration,
+    so a given tool result is marked on the iteration it is newest and
+    unmarked on every later one. If the shape followed the marker, that
+    result would serialize as a typed array once and as a flat string
+    afterwards — the cached prefix bytes would change under the very
+    breakpoint that was supposed to read them, and every iteration would
+    miss. (The ``cache_control`` key itself is not an invalidator; a
+    content-shape change is.) So the decision is made per request, not per
+    block: if anything in this request is cached, every tool message uses
+    the typed form.
+    """
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and isinstance(block.get("cache_control"), dict)
+            ):
+                return True
+    return False
+
+
+def _request_caches_assistant_text(messages: list[Any]) -> bool:
+    """True iff an assistant text block in the request carries a marker.
+
+    That is the history breakpoint (``executive._apply_history_cache_marker``),
+    normally on the previous reply. Like ``_request_caches_tool_results`` it
+    sets one shape for every assistant turn in the request: the marker moves
+    to the newest reply each message, so a reply typed while marked and
+    flattened afterwards would change the cached prefix under the breakpoint
+    meant to read it.
+    """
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        content = m.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("cache_control"), dict)
+            for b in content
+        ):
+            return True
+    return False
+
+
+def _request_caches_messages(messages: list[Any]) -> bool:
+    """True iff any block of any message in the request carries a marker.
+
+    Sets one shape for the text of every user turn sent as blocks, as the two
+    checks above do for tool results and replies. The Executive caches the
+    question being answered on the loop's first call
+    (``executive._mark_turn_message``) and takes that marker off once the
+    loop marker moves to the first tool result. If the shape followed the
+    marker, the question would go out typed on the first call and flattened
+    on the second, and the second call could not read what the first wrote.
+    """
+    for m in messages:
+        if isinstance(m, dict) and _any_block_has_cache_control(m.get("content")):
+            return True
+    return False
+
+
 def _anthropic_messages_to_openai(messages: list[Any]) -> list[dict[str, Any]]:
     """Convert Anthropic ``messages`` to OpenAI chat-completions ``messages``.
 
@@ -127,13 +241,16 @@ def _anthropic_messages_to_openai(messages: list[Any]) -> list[dict[str, Any]]:
     tool results.
     """
     out: list[dict[str, Any]] = []
+    typed_tool_results = _request_caches_tool_results(messages)
+    typed_assistant_text = _request_caches_assistant_text(messages)
+    typed_user_text = _request_caches_messages(messages)
     for m in messages:
         role = m.get("role")
         content = m.get("content")
         if role == "user":
-            out.extend(_user_content_to_openai(content))
+            out.extend(_user_content_to_openai(content, typed_tool_results, typed_user_text))
         elif role == "assistant":
-            out.append(_assistant_content_to_openai(content))
+            out.append(_assistant_content_to_openai(content, typed_assistant_text))
         else:
             # Unknown role — preserve as best-effort.
             out.append({"role": role, "content": _content_to_text(content)})
@@ -154,7 +271,9 @@ def _content_to_text(content: Any) -> str:
     return ""
 
 
-def _user_content_to_openai(content: Any) -> list[dict[str, Any]]:
+def _user_content_to_openai(
+    content: Any, typed_tool_results: bool = False, typed_text: bool = False
+) -> list[dict[str, Any]]:
     """User-turn content: emit one user message, plus one ``tool`` role message
     per Anthropic ``tool_result`` block so the OpenAI chat history threads
     correctly through tool-use turns.
@@ -162,8 +281,16 @@ def _user_content_to_openai(content: Any) -> list[dict[str, Any]]:
     When any text block in ``content`` carries ``cache_control`` (used for
     Anthropic's rolling user-turn cache), the user message's ``content``
     stays as a typed-block array so the cache hint survives translation to
-    OpenRouter. Otherwise we flatten to a plain string — broader upstream
+    OpenRouter. So does ``typed_text`` (a marker anywhere in the request, see
+    ``_request_caches_messages``), so the text keeps one shape while the
+    markers move. Otherwise we flatten to a plain string — broader upstream
     compatibility for non-Anthropic routing and slightly smaller wire bytes.
+    A turn sent as a plain string stays one either way.
+
+    A base64 PDF ``document`` block becomes an OpenAI ``file`` part (see
+    ``_file_part``) and forces the typed-array form, text and files in their
+    original order. Whether the model may receive one at all is decided
+    earlier, by ``feature_gate`` (``supports_pdf_input``).
     """
     if isinstance(content, str):
         return [{"role": "user", "content": content}]
@@ -173,7 +300,11 @@ def _user_content_to_openai(content: Any) -> list[dict[str, Any]]:
     text_blocks: list[dict[str, Any]] = []  # populated when cache_control present
     text_chunks: list[str] = []  # populated for the flat-string fallback
     tool_messages: list[dict[str, Any]] = []
-    preserve_typed = _any_block_has_cache_control(content)
+    preserve_typed = typed_text or _any_block_has_cache_control(content)
+    # Text and PDF parts in their original order, used only when a PDF is
+    # present: a file part cannot ride in the flat-string form.
+    ordered_parts: list[dict[str, Any]] = []
+    has_file = False
 
     for block in content:
         if not isinstance(block, dict):
@@ -183,44 +314,80 @@ def _user_content_to_openai(content: Any) -> list[dict[str, Any]]:
             txt = block.get("text", "")
             if isinstance(txt, str) and txt:
                 text_chunks.append(txt)
-                if preserve_typed:
-                    typed = _typed_text_block(block)
-                    if typed is not None:
-                        text_blocks.append(typed)
+                typed = _typed_text_block(block)
+                if preserve_typed and typed is not None:
+                    text_blocks.append(typed)
+                if typed is not None:
+                    ordered_parts.append(typed if preserve_typed else {"type": "text", "text": txt})
+        elif btype == "document":
+            part = _file_part(block)
+            if part is not None:
+                ordered_parts.append(part)
+                has_file = True
         elif btype == "tool_result":
             tool_use_id = block.get("tool_use_id")
             inner = block.get("content")
             tool_text = _content_to_text(inner)
+            # A cache_control marker on a tool_result is the agent loop's
+            # intra-turn breakpoint (executive._apply_loop_cache_marker). It
+            # must survive translation or the loop re-pays full input price
+            # for its own transcript on every iteration. Carrying it on the
+            # tool message keeps it AFTER the tool results in wire order —
+            # a marker text block in the user message would be emitted
+            # before them (tool messages are appended last, below).
+            typed = _typed_text_with_cc(tool_text, block.get("cache_control"))
+            # Shape is decided per REQUEST, not per block — see
+            # _request_caches_tool_results. Following the marker would flip
+            # this result between array and string as the marker moves,
+            # changing the cached prefix out from under the breakpoint.
+            # Uncached requests keep the flat string they have always sent.
+            tool_content: Any = tool_text
+            if typed_tool_results and typed is not None:
+                tool_content = [typed]
             tool_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_use_id,
-                    "content": tool_text,
+                    "content": tool_content,
                 }
             )
 
     msgs: list[dict[str, Any]] = []
-    if preserve_typed and text_blocks:
+    if has_file:
+        # A PDF forces the typed-array form. Text keeps its cache marker when
+        # the request carries one (the same projection as below).
+        msgs.append({"role": "user", "content": ordered_parts})
+    elif preserve_typed and text_blocks:
         msgs.append({"role": "user", "content": text_blocks})
     elif text_chunks:
         # Fall back to the flat-string form even when ``preserve_typed`` is
         # True but ``text_blocks`` is empty — that happens when the only
-        # cache_control marker rides on a non-text block (e.g. tool_result).
-        # We don't want to drop the user's actual text just because we
-        # couldn't represent the marker.
+        # cache_control marker rides on a non-text block. A tool_result
+        # marker is carried on its own tool message above, so this is not
+        # a dropped marker; it just means this user message has no text
+        # block of its own to mark. We don't want to drop the user's
+        # actual text just because the marker lives elsewhere.
         msgs.append({"role": "user", "content": "\n\n".join(text_chunks)})
     msgs.extend(tool_messages)
     return msgs
 
 
-def _assistant_content_to_openai(content: Any) -> dict[str, Any]:
+def _assistant_content_to_openai(content: Any, typed_text: bool = False) -> dict[str, Any]:
     """Assistant-turn content: collapse text blocks; lift tool_use blocks to
-    OpenAI ``tool_calls``."""
+    OpenAI ``tool_calls``.
+
+    ``typed_text`` (the request carries the history breakpoint, see
+    ``_request_caches_assistant_text``) keeps the text as typed parts, each
+    with its own ``cache_control``, so the marker reaches Anthropic through
+    OpenRouter instead of being collapsed away."""
     if isinstance(content, str):
+        if typed_text and content:
+            return {"role": "assistant", "content": [{"type": "text", "text": content}]}
         return {"role": "assistant", "content": content}
     if not isinstance(content, list):
         return {"role": "assistant", "content": str(content)}
 
+    typed_parts: list[dict[str, Any]] = []
     text_chunks: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     reasoning_details: list[Any] = []
@@ -232,6 +399,9 @@ def _assistant_content_to_openai(content: Any) -> dict[str, Any]:
             txt = block.get("text", "")
             if isinstance(txt, str) and txt:
                 text_chunks.append(txt)
+                part = _typed_text_with_cc(txt, block.get("cache_control"))
+                if part is not None:
+                    typed_parts.append(part)
         elif btype == OPENROUTER_REASONING_BLOCK:
             details = block.get("reasoning_details")
             if isinstance(details, list):
@@ -249,7 +419,10 @@ def _assistant_content_to_openai(content: Any) -> dict[str, Any]:
             )
 
     out: dict[str, Any] = {"role": "assistant"}
-    out["content"] = "\n\n".join(text_chunks) if text_chunks else None
+    if typed_text and typed_parts:
+        out["content"] = typed_parts
+    else:
+        out["content"] = "\n\n".join(text_chunks) if text_chunks else None
     if reasoning_details:
         out["reasoning_details"] = reasoning_details
     if tool_calls:
@@ -365,19 +538,26 @@ _OPENROUTER_EFFORT_LEVELS = frozenset(
 _DEFAULT_REASONING_EFFORT = "low"
 
 
-def _translate_reasoning(anthropic_kwargs: dict[str, Any]) -> dict[str, Any] | None:
+def _translate_reasoning(
+    anthropic_kwargs: dict[str, Any], *, claude: bool = False
+) -> dict[str, Any] | None:
     """Anthropic ``thinking`` + ``output_config.effort`` → OpenRouter ``reasoning``.
 
     * ``{"type": "adaptive"}`` (current models) → ``{"effort": <level>}`` where
       the level comes from ``output_config.effort``, defaulting to "low".
     * ``{"type": "enabled", "budget_tokens": N}`` (pre-4.6 models) →
       ``{"max_tokens": N}``.
-    * ``{"type": "disabled"}``, absent, or malformed → ``None`` (no field).
+    * ``{"type": "disabled"}`` on a Claude slug → ``{"enabled": False}``, so
+      a model that thinks by default (Haiku 5.5) is told not to, as on the
+      Anthropic path. Anywhere else → ``None``, as before.
+    * Absent or malformed → ``None`` (no field).
     """
     thinking = anthropic_kwargs.get("thinking")
     if not isinstance(thinking, dict):
         return None
     kind = thinking.get("type")
+    if kind == "disabled":
+        return {"enabled": False} if claude else None
     if kind == "enabled":
         budget = thinking.get("budget_tokens")
         if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
@@ -438,7 +618,9 @@ def to_openai_request(
     # Deep reasoning: the Council checkbox sets Anthropic-native ``thinking``
     # + ``output_config.effort``; feature_gate leaves them in place only for
     # models that can reason, and here they become OpenRouter's ``reasoning``.
-    reasoning = _translate_reasoning(anthropic_kwargs)
+    reasoning = _translate_reasoning(
+        anthropic_kwargs, claude=model_slug.lower().startswith(("anthropic/claude-", "claude-"))
+    )
     if reasoning is not None:
         body["reasoning"] = reasoning
 
@@ -463,11 +645,12 @@ def to_openai_request(
 
 def _translate_tool_choice(tc: Any) -> Any:
     """``{"type":"tool","name":"X"}`` → ``{"type":"function","function":{"name":"X"}}``.
-    Pass-through for ``{"type":"any"}`` and ``{"type":"auto"}``."""
+    Pass-through for ``{"type":"any"}``, ``{"type":"auto"}`` and
+    ``{"type":"none"}`` (a workflow action step's final, tools-off turn)."""
     if isinstance(tc, dict):
         if tc.get("type") == "tool" and "name" in tc:
             return {"type": "function", "function": {"name": tc["name"]}}
-        if tc.get("type") in ("any", "auto"):
+        if tc.get("type") in ("any", "auto", "none"):
             return tc.get("type")
     return tc
 
