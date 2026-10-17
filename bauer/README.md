@@ -13,7 +13,7 @@ is active and every in-place edit is a merge cost we pay forever.
 
 | File | Purpose |
 |---|---|
-| `mcp_servers.json` | Template for `/data/company/mcp_servers.json`. Placeholders only. |
+| `mcp_servers.json` | Template for `/data/company/mcp_servers.json`. No secrets. |
 | `env.bauer.example` | Values to merge into the gitignored repo-root `.env`. |
 | `docker-compose.bauer.yml` | Compose overlay. |
 
@@ -64,59 +64,71 @@ workflow is the only thing that does.
 
 The edge service is left commented out rather than guessed.
 
-## `m365-graph` flags
+## Microsoft 365 (`microsoft_365`)
 
-The engine runs `--org-mode --read-only --enabled-tools '^(?!.*sharepoint)'`.
-All three verified against `3P-ms-365-mcp-server@70a54bc` rather than taken from
-its README.
+Uses upstream's co-located server: `@softeria/ms-365-mcp-server@0.154.2`, baked
+into the API image and started by `docker/ms365-mcp-launch.sh`. Nothing here
+installs or pins it; upstream's `docker/Dockerfile` does.
 
-**`--read-only` is a tool-surface filter, not a runtime guard.** Tools it drops
-never appear in `tools/list` at all. It removes every non-GET endpoint, keeping
-7 POST-shaped reads and the 4 utility tools.
+The entry adds two flags and one tool list to upstream's block:
 
-It costs `graph-batch`, which is a POST carrying no `readOnly` flag, and no flag
-keeps batching while dropping the other writes. A consumer that needs batching
-runs without `--read-only`.
+| Setting | Effect |
+|---|---|
+| `--read-only` | Drops every non-GET tool before registration. Also narrows the scopes `--login` asks for. |
+| `--org-mode` | Turns on the Teams tools. |
+| `MS365_MCP_ENABLED_TOOLS` | Mail, calendar and Teams **reads** only. Replaces the launcher's default list, which includes send and calendar writes. |
 
-**SharePoint is excluded by regex, because no preset can do it.** There is no
-`sharepoint` preset: those 34 tools sit inside the `work` preset alongside Teams.
-`--enabled-tools` compiles as `new RegExp(pattern, 'i')` against `toolName`, so
-negative lookahead works. SharePoint is served by different tooling.
+Verified against 0.154.2 through the real launcher: 31 tools register (24
+reads, `download-bytes`, 6 account tools) and `--list-permissions` asks for
+`Mail.Read`, `Calendars.Read`, `Chat.Read`, `ChatMember.Read`,
+`ChatMessage.Read`, `Team.ReadBasic.All`, `Channel.ReadBasic.All`,
+`ChannelMessage.Read.All` and `TeamMember.Read.All`. No OneDrive, no SharePoint.
 
-Surface sizes, counted from that commit's `src/endpoints.json` plus the 4 utility
-tools:
+Keep the server name `microsoft_365`. The gateway's mail and calendar checks,
+and its block on the `login`, `logout`, `select-account` and `remove-account`
+tools, key on the `microsoft_365__` prefix. Any other name skips them.
 
-| Flags | Endpoint tools | With utilities |
-|---|---|---|
-| none | 332 | 336 |
-| `--read-only` | 162 | 166 |
-| `--enabled-tools '^(?!.*sharepoint)'` | 298 | 302 |
-| both, as configured here | 141 | 145 |
+The gateway has **no checks for Teams tools**. That is safe here only because
+every Teams tool in the list is a read. Adding a Teams write (send, reply,
+react) needs a matching check in `orchestrator/mcp_gateway.py` first.
 
-`--message-signoff-prefix` (or `MS365_MCP_MESSAGE_SIGNOFF_PREFIX`) prepends a
-marker to outgoing messages so recipients can tell an agent sent them. The server
-refuses to start with a marker that renders as empty text.
+Leave `EMAIL_PROVIDER` and `CALENDAR_PROVIDER` unset while read-only. Setting
+either to `microsoft` makes the inbox poller and the booking tools call
+Outlook write tools that this list does not register.
+
+### Sign in
+
+`--login` must run with the same flags and tool list as the gateway, or it
+asks for the wrong scopes. This reads the list from the config on the volume:
+
+```bash
+docker compose exec api sh -c 'MS365_MCP_ENABLED_TOOLS="$(python -c "import json; print(json.load(open(\"/data/company/mcp_servers.json\"))[\"mcpServers\"][\"microsoft_365\"][\"env\"][\"MS365_MCP_ENABLED_TOOLS\"])")" exec /usr/local/bin/ms365-mcp-launch.sh --read-only --org-mode "$0"' --list-permissions
+```
+
+1. Run the command above with `--list-permissions`. Check the scopes match the list above.
+2. Grant those delegated scopes, plus `User.Read` and `offline_access`, with admin consent.
+3. Run the same command with `--login`. Sign in as the service account.
+4. Run it with `--verify-login`.
+5. Restart the API: `docker compose restart api`.
+
+The app registration needs *Allow public client flows: Yes* (device-code
+sign-in). Run `--login` again whenever the tool list changes.
 
 ## Gateway environment variables
 
-The gateway forwards only the variables named in
-`orchestrator/mcp_gateway.py::_FORWARDED_ENV_VARS` to the `extensible-mcp` child.
-`MS365_*`, `ZOHO_*` and `GITHUB_*` are **not** on that list, so `$VAR`
-interpolation in `mcp_servers.json` will not resolve for them.
-
-Put literal values in the copy on `/data/company/mcp_servers.json`, which is on
-the volume and never committed. Do **not** extend `_FORWARDED_ENV_VARS` — that is
-an upstream file, and the merge cost outlives the convenience.
+Upstream's gateway forwards the `MS365_MCP_*` names the `microsoft_365` entry
+uses (`orchestrator/mcp_gateway.py::_FORWARDED_ENV_VARS`), so its `$VAR`
+values resolve from the API's environment. `ZOHO_*` and `GITHUB_*` are **not**
+forwarded: put literal values for those in the copy on
+`/data/company/mcp_servers.json`. Do **not** extend `_FORWARDED_ENV_VARS`. It
+is an upstream file.
 
 ## Open before first run
 
-- `zoho` and `github` entries in `mcp_servers.json` are marked
-  `CONFIRM_BEFORE_USE`. Zoho's MCP is a hosted remote endpoint and it is not
-  known whether `extensible-mcp` accepts remote URL servers or stdio only — that
-  package is external and was not inspected. Confirm rather than guess.
-- Pin the `@softeria/ms-365-mcp-server` version. `PIN_ME` is deliberate, and it
-  **cannot be resolved by reading the fork**: its `package.json` says
-  `"version": "0.0.0-development"` because semantic-release stamps the real
-  version at publish time. Use `npm view @softeria/ms-365-mcp-server versions`.
+- `zoho` and `github` are placeholders (`CONFIRM_BEFORE_USE`). `extensible-mcp`
+  accepts a remote server as `{"url": "https://..."}`, but it cannot send auth
+  headers. Zoho works that way only if its endpoint carries the key in the URL.
+  GitHub's remote server needs a bearer header, so it needs a local (stdio)
+  server in the image instead.
 - Content-ingest scope is governed by the internal tracker. Check it before
   loading anything into the corpus.
