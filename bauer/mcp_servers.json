@@ -77,8 +77,9 @@
       "allow_servers": []
     },
     "load_control": {
+      "_comment": "Refuses every runtime load_mcp_server call. extensible-mcp checks deny patterns first and allows everything when allow_url_patterns is empty, so upstream's \"http://*\" alone still lets any https:// server load. Configured servers above are not affected. To allow one remote server, keep \"*\" out of this list and name it in allow_url_patterns instead.",
       "deny_url_patterns": [
-        "http://*"
+        "*"
       ],
       "allow_url_patterns": []
     },
