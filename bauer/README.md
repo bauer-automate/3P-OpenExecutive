@@ -114,6 +114,14 @@ docker compose exec api sh -c 'MS365_MCP_ENABLED_TOOLS="$(python -c "import json
 The app registration needs *Allow public client flows: Yes* (device-code
 sign-in). Run `--login` again whenever the tool list changes.
 
+## Runtime server loading is off
+
+`filters.load_control.deny_url_patterns` is `["*"]`, so the model cannot load an
+MCP server by URL at runtime (`load_mcp_server`). Upstream's `["http://*"]`
+alone does not do this: `extensible-mcp` allows every URL the deny list misses
+when `allow_url_patterns` is empty, so any `https://` server could load. The
+servers listed in `mcpServers` are not affected.
+
 ## Gateway environment variables
 
 Upstream's gateway forwards the `MS365_MCP_*` names the `microsoft_365` entry
