@@ -1,31 +1,32 @@
 {
   "_comment": "Bauer MCP gateway config. TEMPLATE ONLY — copy to /data/company/mcp_servers.json on the volume and fill real values there. Never commit secrets to this file. Rationale is recorded in Bauer's internal tracker, not in this public repo.",
-  "_secrets_note": "The gateway forwards only the env vars named in orchestrator/mcp_gateway.py::_FORWARDED_ENV_VARS to the extensible-mcp child. MS365_*, ZOHO_* and GITHUB_* are NOT in that list, so $VAR interpolation will NOT resolve for them. Put literal values in the copy on /data (never committed) rather than editing _FORWARDED_ENV_VARS — that is an upstream file and editing it is a permanent merge tax.",
+  "_secrets_note": "The $VAR values in microsoft_365.env are resolved by extensible-mcp from the API's environment; upstream's gateway forwards the MS365_MCP_* names used here (_FORWARDED_ENV_VARS). ZOHO_* and GITHUB_* are not forwarded, so put literal values for those in the copy on /data (never committed).",
   "mcpServers": {
-    "m365_graph": {
-      "_status": "VERIFIED — flags, presets and counts read from 3P-ms-365-mcp-server@70a54bc",
-      "_note": "--org-mode is required for Teams tools. Pin a version rather than floating on latest for a production service; the fork exists so we control when upstream lands.",
-      "_read_only": "--read-only is a TOOL-SURFACE filter, not a runtime guard: dropped tools never appear in tools/list. It removes every non-GET endpoint, keeping 7 POST-shaped reads plus the 4 utility tools. It also drops graph-batch (a POST with no readOnly flag); no flag keeps batching while dropping the other writes. A consumer that needs batching runs without it.",
-      "_sharepoint_exclusion": "SharePoint is served by different tooling, so it is excluded here. No preset can express that: there is no sharepoint preset, and those 34 tools sit inside the work preset alongside Teams. --enabled-tools compiles as new RegExp(pattern, 'i') against toolName, so negative lookahead works. Verified: keeps 298 of 332 endpoint tools, zero SharePoint leaking. Not shell-quoted because args are exec'd directly.",
-      "_pin_me": "PIN_ME cannot be resolved by reading the fork: its package.json says version 0.0.0-development because semantic-release stamps the real version at publish time. Resolve with `npm view @softeria/ms-365-mcp-server versions` and pin explicitly.",
-      "command": "npx",
+    "microsoft_365": {
+      "_status": "VERIFIED against @softeria/ms-365-mcp-server@0.154.2, the version upstream's image pins.",
+      "_name": "Must stay microsoft_365: the gateway's checks and blocked login tools key on the microsoft_365__ prefix.",
+      "_read_only": "--read-only drops every non-GET tool before registration, and also narrows the scopes --login asks for. MS365_MCP_ENABLED_TOOLS names only read tools, so nothing writes even if the flag is dropped.",
+      "_teams": "--org-mode turns on the Teams tools. The gateway has no checks for Teams tools; that is acceptable only because every Teams tool here is a read. Adding a Teams write needs a matching check in orchestrator/mcp_gateway.py first.",
+      "_scope": "Mail, calendar and Teams reads only. No OneDrive (MS365_MCP_ONEDRIVE unset) and no SharePoint.",
+      "_login": "--login must run with the same flags and tool list, or it asks for the wrong scopes. Use the command in bauer/README.md.",
+      "command": "/usr/local/bin/ms365-mcp-launch.sh",
       "args": [
-        "-y",
-        "@softeria/ms-365-mcp-server@PIN_ME",
-        "--org-mode",
         "--read-only",
-        "--enabled-tools",
-        "^(?!.*sharepoint)"
+        "--org-mode"
       ],
       "env": {
-        "MS365_MCP_CLIENT_ID": "REPLACE_ON_VOLUME",
-        "MS365_MCP_CLIENT_SECRET": "REPLACE_ON_VOLUME",
-        "MS365_MCP_TENANT_ID": "REPLACE_ON_VOLUME"
+        "MS365_MCP_CLIENT_ID": "$MS365_MCP_CLIENT_ID",
+        "MS365_MCP_TENANT_ID": "$MS365_MCP_TENANT_ID",
+        "MS365_MCP_CLIENT_SECRET": "$MS365_MCP_CLIENT_SECRET",
+        "MS365_MCP_EXPECTED_USERNAME": "$MS365_MCP_EXPECTED_USERNAME",
+        "MS365_MCP_CREDENTIALS_DIR": "$MS365_MCP_CREDENTIALS_DIR",
+        "MS365_MCP_USE_KEYTAR": "$MS365_MCP_USE_KEYTAR",
+        "MS365_MCP_ENABLED_TOOLS": "^(list-mail-folders|list-mail-folder-messages|list-mail-messages|get-mail-message|list-mail-attachments|download-bytes|list-calendars|list-calendar-events|get-calendar-event|get-calendar-view|list-chats|get-chat|list-chat-members|list-chat-messages|get-chat-message|list-chat-message-replies|list-pinned-chat-messages|list-joined-teams|get-team|list-team-channels|get-team-channel|list-team-members|list-channel-messages|get-channel-message|list-channel-message-replies)$"
       }
     },
     "zoho": {
       "_status": "UNVERIFIED — do not enable until confirmed",
-      "_confirm": "Zoho's MCP is a hosted remote endpoint (mcp.zoho.com). Unknown whether extensible-mcp (git+https://github.com/SenteLabsAI/extensible-mcp) accepts remote URL servers or stdio only — the shipped example shows stdio only, and that package was not inspected. If stdio only, a stdio-to-HTTP bridge is needed and the exact command must be confirmed before use rather than guessed.",
+      "_confirm": "extensible-mcp accepts a remote server as {\"url\": \"https://...\"} but cannot send auth headers. This works only if Zoho's endpoint carries the key in the URL; confirm the URL format before filling it in. The URL is a secret: put it only in the copy on /data.",
       "_covers": "Zoho CRM, Books, Desk. Float Financial spend arrives already inside Books via zoho-float-sync, so Float needs no entry.",
       "command": "CONFIRM_BEFORE_USE",
       "args": []
@@ -39,7 +40,7 @@
     }
   },
   "filters": {
-    "_comment": "Upstream's deny patterns, kept verbatim. Do not narrow this list. These are a second layer; the identity's granted scopes are the first.",
+    "_comment": "Upstream's deny patterns (packages/core/mcp_servers.json.example) plus the fork's send patterns, in both underscore and hyphen forms (Microsoft tool names are hyphenated). Do not narrow this list. These are a second layer; read-only and the identity's granted scopes are the first. Switching to gated read/write means removing the send, reply and forward patterns on purpose.",
     "access_control": {
       "deny_patterns": [
         "*__delete_*",
@@ -51,10 +52,26 @@
         "*trash*",
         "*delete_file*",
         "*delete_document*",
+        "*delete-mail*",
+        "*delete-calendar",
+        "*__remove-*",
+        "*__drop-*",
+        "*__destroy-*",
+        "*__login",
+        "*__logout",
+        "*__select-account",
+        "*__remove-account",
+        "*download-bytes-to-file*",
+        "*-mail-rule*",
+        "*update-mailbox-settings*",
+        "*calendar-permission*",
         "*__send_*",
         "*send_mail*",
         "*send_message*",
-        "*send_chat*"
+        "*send_chat*",
+        "*__send-*",
+        "*__reply-*",
+        "*__forward-*"
       ],
       "deny": [],
       "allow_servers": []
