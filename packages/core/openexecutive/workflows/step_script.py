@@ -224,10 +224,13 @@ CHAT_OWN_TOOLS: tuple[str, ...] = (
     "add_watchlist_entry",
     "assign_open_loop",
     "close_open_loop",
+    "reopen_open_loop",
+    "update_open_loop",
     "create_alert",
     "create_goal",
     "find_alerts",
     "list_department_goals",
+    "list_my_activity",
     "list_open_loops",
     "list_people",
     "list_watchlist",
@@ -241,12 +244,11 @@ CHAT_OWN_TOOLS: tuple[str, ...] = (
     "upsert_person",
 )
 
-# Per-turn caps on own tools a chat script could otherwise call in bulk:
-# messaging everyone on the roster is a broadcast, which scripts don't get.
+# Messaging ten or more people from one script is a company-wide post, which
+# is administration: on anyone's turn but the principal's, a chat script may
+# message at most nine. Nothing else is capped beyond the turn's budget.
 CHAT_OWN_TOOL_CAPS: dict[str, int] = {
-    "create_alert": 50,
-    "message_person": 10,
-    "upsert_person": 25,
+    "message_person": 9,
 }
 
 # Added to a chat round's results (the user turn, never a cached block) when
@@ -285,22 +287,18 @@ def lists_many(text: str, threshold: int = FANOUT_THRESHOLD) -> bool:
 CHAT_TOOL_DEFINITION: dict[str, Any] = {
     "name": RUN_SCRIPT_TOOL,
     "description": (
-        "Run a short Python script that calls tools. Use it instead of a round "
-        "of per-item calls whenever a job looks something up and then checks or "
-        "acts on each result (list people, look each one up, raise one alert; "
-        "list a folder, move each file), when results come in pages, or when it "
-        "covers more than about ten items: every round of separate calls "
-        "re-reads the whole conversation, and one script does the lookup, the "
-        "per-item calls and the final action in one step. Only a handful of "
-        "items already named in the request go as direct calls.\n\n"
-        "Call a tool as a function named exactly like it, with its arguments as "
-        "keywords (google_workspace__list_drive_items(folder_id=...)), or "
-        "call_tool(name, arguments) by exact name (needed for a name with a "
-        "hyphen). Only tools the gateway would let call_tool reach (ones "
-        "search_tools has returned) can be called, and every call is checked and "
-        "recorded exactly as a call_tool would be. These of your own tools are "
-        "functions too, with the same arguments and checks as calling them "
-        f"directly: {', '.join(CHAT_OWN_TOOLS)}. {_CALL_TEXT}\n\n"
+        "Run a short Python script that calls tools. Use it instead of per-item "
+        "calls when a job looks something up and then checks or acts on each "
+        "result (list a folder, move each file), when results come in pages, or "
+        "for more than about ten items: each round of separate calls re-reads the "
+        "whole conversation. A handful of items named in the request go as direct "
+        "calls.\n\n"
+        "Call a tool as a function named exactly like it, arguments as keywords "
+        "(google_workspace__list_drive_items(folder_id=...)), or "
+        "call_tool(name, arguments) (needed for a name with a hyphen). Only tools "
+        "search_tools has returned can be called, each checked and recorded as a "
+        "call_tool would be. These of your own tools are functions too, with the "
+        f"same checks: {', '.join(CHAT_OWN_TOOLS)}. {_CALL_TEXT}\n\n"
         f"{_SANDBOX_TEXT}\n\n{_SAVED_TEXT} list_saved_tools shows the saved tools."
     ),
     "input_schema": _INPUT_SCHEMA,
@@ -419,7 +417,7 @@ async def run_script(
 
     def payload(**fields: Any) -> str:
         # The record of calls first: a long result is cut from the end
-        # (TOOL_RESULT_MAX_CHARS), and the list of writes that already ran
+        # (orchestrator.reading), and the list of writes that already ran
         # must survive the cut.
         head: dict[str, Any] = {}
         if "error" in fields:
@@ -652,7 +650,7 @@ async def run_script_tool(
             yield _done({"error": "save_as goes with a new script, not a saved tool"}, True)
             return
         if not may_run_saved:
-            yield _done({"error": "saved tools run only on the principal's own turns"}, True)
+            yield _done({"error": "saved tools run only on a turn someone on the team is in"}, True)
             return
         try:
             saved = (
@@ -667,7 +665,7 @@ async def run_script_tool(
         if saved is None and tools is not None:
             yield _done({
                 "error": f"{str(tool_name)[:60]!r} is not turned on for workflows; the owner "
-                "turns it on in Settings → Advanced → Custom tools",
+                "turns it on in Settings → Advanced → Tools I built",
             }, True)
             return
         if saved is None or not saved.enabled:
@@ -748,10 +746,10 @@ async def run_script_tool(
                     # Workflows run only a version the owner turned on.
                     "workflows": (
                         f"version {kept.workflow_version} is on for workflows; this one runs there "
-                        "once the owner turns it on in Settings → Advanced → Custom tools"
+                        "once the owner turns it on in Settings → Advanced → Tools I built"
                         if kept.workflow_version not in (None, kept.version)
                         else "on" if kept.workflow_version == kept.version
-                        else "off until the owner turns it on in Settings → Advanced → Custom tools"
+                        else "off until the owner turns it on in Settings → Advanced → Tools I built"
                     ),
                 }
                 if not kept.enabled:

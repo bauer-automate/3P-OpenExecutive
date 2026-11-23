@@ -11,11 +11,9 @@ for that sent message (``inbox._claim``) records it.
 
 The ghostwriter writes a short nudge in their voice, from the thread; as for
 replies it has no tools, so the thread's text can at most change the words.
-Whether it goes on its own is ``handle_it.follow_up_refusal``, plain code, by
-the setting: never on Careful, to their team and contacts on Balanced, to
-anyone they wrote to on Bold (with Follow-ups in training, only to people
-they allowed with Send + allow); only to exactly the people their email went to,
-and never on a sensitive topic or with a link or an amount. It goes through
+Whether it goes on its own is ``handle_it.follow_up_refusal``, plain code:
+Handle it for me on and Approvals above Careful, and only to exactly the
+people their email went to. It goes through
 the one send path (``reply_send.send_on_its_own``) on an ordinary
 ``delegation_reply`` card marked ``source: follow_up``; anything refused
 waits on Today, where they send, edit or dismiss it. When anyone answers in
@@ -94,7 +92,7 @@ async def look(person: Any, client: Any, *, own: set[str], exec_address: str, no
     if last is not None and now - last < LOOK_EVERY:
         return
     _LAST_LOOK[person.id] = now
-    carded = {str(inbox.card_payload(c).get("thread_id") or "") for c in inbox.open_cards(person.id)}
+    carded = inbox.card_threads(inbox.open_cards(person.id))
     picked = 0
     seen: set[str] = set()
     for sent in await client.list_sent(limit=SENT_LOOKED_AT):
@@ -170,17 +168,26 @@ async def _follow_up(
                 signature=stored.profile.signature,
                 exec_name=settings.exec_display_name,
                 model=composer_model(),
+                writer_person_id=person.id,
+                # The intent is a fixed instruction: it says nothing about this email.
+                recall_from_intent=False,
                 now=now,
                 writer_example=example_for(person.id, to[0]) if len(going) == 1 else None,
             )
         except ComposeError:
             inbox._retry_later(person.id, sent.id, "compose_failed")
             return False
+        from openexecutive.delegation.answers import suggest
+
         reply = inbox.Reply(
             to=to, cc=cc, subject=composed.subject, body=composed.body,
             open_questions=list(composed.open_questions), flags=list(composed.flags),
+            question_choices=await suggest(
+                person, list(composed.open_questions), composed.question_choices, mailbox=client, now=now,
+            ),
             in_reply_to=sent.message_id_header or None,
             references=references_header(sent.references, sent.message_id_header),
+            gist=composed.gist,
         )
         held = handle_it.follow_up_refusal(
             person.id, sent, reply, relation=relation, own=own, exec_address=exec_address, now=now,

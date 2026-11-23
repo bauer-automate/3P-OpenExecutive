@@ -1,16 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  cardGist,
+  toDecideLabel,
+  highlightPieces,
+  questionsLeft,
   isMailboxLink,
   mailboxName,
   relationLabel,
   replyFlagLines,
+  replyToChoice,
   safeGmailLink,
+  sendButtonLabel,
   sendLeftNothing,
   sendQuestion,
   senderLine,
   senderShort,
   draftIsLong,
+  namesFromLine,
+  recipientNames,
+  firstNames,
+  firstNamesFromLine,
 } from "../src/lib/replyCards.ts";
 
 test("relationLabel names who the sender is, and nothing for an unknown relation", () => {
@@ -24,7 +34,7 @@ test("replyFlagLines puts the pressing warnings first, once each, and drops unkn
   const lines = replyFlagLines(["others_on_thread", "sender_unverified", "made_up", "others_on_thread"]);
   assert.equal(lines.length, 2);
   assert.match(lines[0], /couldn't confirm/);
-  assert.match(lines[1], /sender only/);
+  assert.match(lines[1], /Others were on this email/);
   // The open questions already carry this one.
   assert.deepEqual(replyFlagLines(["asks_if_ai"]), []);
   assert.deepEqual(replyFlagLines([]), []);
@@ -92,4 +102,95 @@ test("a failed send says whether the card is gone", () => {
   assert.equal(sendLeftNothing("caller_signing_required"), false);
   // A failed send is the first warning on the card.
   assert.match(replyFlagLines(["others_on_thread", "send_failed"])[0], /didn't go through/);
+});
+
+test("questionsLeft counts only open questions with answers to tap, and none once edited by hand", () => {
+  const questions = [
+    { text: "When?", choices: ["Mon 10:00", "Tue 09:00"], answer: "" },
+    { text: "Which?", choices: ["A", "B"], answer: "A" },
+    { text: "Are you an AI?", choices: [], answer: "" },
+  ];
+  assert.equal(questionsLeft({ questions }), 1);
+  assert.equal(questionsLeft({ questions, questions_settled: true }), 0);
+  // An older backend or card: nothing holds Send back.
+  assert.equal(questionsLeft({}), 0);
+});
+
+test("highlightPieces marks the new sentences and keeps every character in order", () => {
+  const body = "Hi Dana,\n\nThanks. Friday at 10 works for me. See you then.";
+  const pieces = highlightPieces(body, ["Friday at 10 works for me.", "Not in the body."]);
+  assert.equal(pieces.map((p) => p.text).join(""), body);
+  assert.deepEqual(pieces.filter((p) => p.changed).map((p) => p.text), ["Friday at 10 works for me."]);
+  assert.deepEqual(highlightPieces(body, []), [{ text: body, changed: false }]);
+});
+
+test("replyToChoice offers the sender alone or everyone, and nothing without others", () => {
+  const card = { from_name: "Dana Park", from_email: "dana@x.example", draft_to: ["dana@x.example"] };
+  assert.equal(replyToChoice(card), null);
+  assert.equal(replyToChoice({ ...card, reply_others: ["sam@x.example"], source: "follow_up" }), null);
+  const choice = replyToChoice({ ...card, reply_others: ["sam@x.example", "lee@x.example"] });
+  assert.deepEqual(choice, { sender: "Dana only", everyone: "Everyone (3)", toEveryone: false });
+  const all = replyToChoice({
+    ...card, from_name: "", reply_others: ["sam@x.example"], draft_to: ["dana@x.example", "sam@x.example"],
+  });
+  assert.equal(all.sender, "dana@x.example only");
+  assert.equal(all.toEveryone, true);
+});
+
+test("cardGist shows the summary, or the start of what they wrote on an older card", () => {
+  assert.equal(cardGist({ gist: " Dana asks when to talk. ", they_wrote: "Hi" }), "Dana asks when to talk.");
+  assert.equal(cardGist({ they_wrote: "Hi Olivia,\n\n  Can we talk Thursday?" }), "Hi Olivia, Can we talk Thursday?");
+  const long = cardGist({ gist: "", they_wrote: "word ".repeat(60) });
+  assert.ok(long.endsWith("word…") && long.length <= 161);
+  assert.equal(cardGist({ they_wrote: "" }), "");
+});
+
+test("toDecideLabel counts what's left, and is empty when nothing is", () => {
+  assert.equal(toDecideLabel(1), "1 to decide");
+  assert.equal(toDecideLabel(3), "3 to decide");
+  assert.equal(toDecideLabel(0), "");
+});
+
+test("recipientNames gives names only, joined in plain words", () => {
+  assert.equal(recipientNames(["Brennan Monaco <brennan@example.com>"]), "Brennan Monaco");
+  assert.equal(recipientNames(["Ann Lee (ann@example.com)", "bo@example.com"]), "Ann Lee and bo@example.com");
+  assert.equal(recipientNames(["A <a@x.co>", "B <b@x.co>", "C <c@x.co>"]), "A, B and C");
+  assert.equal(recipientNames(["A <a@x.co>", "B <b@x.co>", "C <c@x.co>", "D <d@x.co>"]), "A, B and 2 more");
+  assert.equal(recipientNames([]), "");
+});
+
+test("namesFromLine reads a draft row's line, even one cut short", () => {
+  assert.equal(
+    namesFromLine("Brennan Monaco (brennan.monaco@example.com), Annamarie Braden (annamarie@…"),
+    "Brennan Monaco and Annamarie Braden",
+  );
+  assert.equal(namesFromLine("dana@example.com"), "dana@example.com");
+});
+
+test("firstNames names each person by first name for a button, or by address", () => {
+  assert.equal(firstNamesFromLine("Kyle Harrelson (kharrelson@example.com)"), "Kyle");
+  assert.equal(
+    firstNamesFromLine("Brennan Monaco (brennan.monaco@example.com), Annamarie Braden (annamarie@…"),
+    "Brennan and Annamarie",
+  );
+  assert.equal(firstNames(["Annamarie Braden"]), "Annamarie Braden");
+  assert.equal(firstNames(["dana@example.com"]), "dana@example.com");
+  assert.equal(firstNames(["A One <a@x.example>", "B Two <b@x.example>", "C <c@x.example>", "D <d@x.example>"]), "A, B and 2 more");
+  // Who it goes to, not who wrote: a reply to everyone names everyone.
+  assert.equal(firstNames(["Brennan Monaco <b@example.com>", "Annamarie Braden <a@example.com>"]), "Brennan and Annamarie");
+  // Bare words stay whole, so a placeholder never reads as half a name.
+  assert.equal(firstNamesFromLine("No one yet"), "No one yet");
+  assert.equal(firstNamesFromLine(""), "");
+  assert.equal(firstNames(['"Monaco, Brennan" <b@example.com>']), "Monaco, Brennan");
+  assert.equal(firstNames(["Dr. Kyle Harrelson <k@example.com>"]), "Dr. Kyle Harrelson");
+});
+
+test("a reply sent from the Executive says so on Send", () => {
+  assert.equal(sendButtonLabel({}), "Send");
+  assert.equal(sendButtonLabel({ from_executive: true, executive_name: "Ava" }), "Send from Ava");
+  assert.equal(sendButtonLabel({ from_executive: true }, "Send both"), "Send both from Executive");
+  assert.equal(
+    sendQuestion(["dana@x.example"], "Gmail", false, "Ava"),
+    "Send this to dana@x.example from Ava, with you on cc, as shown above?",
+  );
 });

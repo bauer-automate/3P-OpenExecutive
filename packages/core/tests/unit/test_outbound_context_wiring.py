@@ -31,6 +31,7 @@ def settings_with_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
         discord_bot_token = "discord-test"
         telegram_bot_token = "tg-test"
         knowledge_chat_max_chars = 6000
+        knowledge_chat_builtin = False
 
     monkeypatch.setattr("openexecutive.config.get_settings", lambda: _S())
 
@@ -135,7 +136,7 @@ async def test_discord_dm_inbound_hydrates_from_linkage() -> None:
     """A DM reply is passed to Executive.chat with the hydration helper's
     output, while the pristine text is persisted."""
     send_fn = AsyncMock()
-    session_mock = MagicMock(seen_channel_refs=set())
+    session_mock = MagicMock()
 
     def _fake_hydrate(*, channel: str, channel_ref: str, user_message: str) -> str:
         assert channel == "discord_dm"

@@ -46,12 +46,17 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 TABLE = "person_notification_settings"
 
 QuietDays = Literal["every_day", "weekdays"]
 Delivery = Literal["instant", "digest"]
+# When Right now changes: a short chat message for a new point that needs
+# them, for any new point, or never (``briefing.right_now_ping``).
+RightNowPings = Literal["off", "important", "everything"]
 
 _HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
 
@@ -81,6 +86,7 @@ class NotificationSettings(BaseModel):
     quiet_hours: QuietHours = Field(default_factory=QuietHours)
     delivery: Delivery = "instant"
     urgent_through: bool = True
+    right_now: RightNowPings = "important"
     # IANA zone the quiet hours are read in; "" means the workspace's zone.
     timezone: str = Field(default="", max_length=64)
     updated_at: str = ""
@@ -100,12 +106,7 @@ class NotificationSettings(BaseModel):
 # Storage
 # --------------------------------------------------------------------------- #
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:

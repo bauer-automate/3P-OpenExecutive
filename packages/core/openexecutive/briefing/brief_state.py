@@ -80,6 +80,8 @@ HANDLED_EVENT_KINDS: dict[str, str] = {
     },
     "watchlist_research_added": "watching",
     "watchlist_auto_disabled": "stopped_watching",
+    # What a watch set to Watch quietly found: told here, never on a card.
+    "watch_found_quietly": "quiet_watch_found",
 }
 
 # The nudge audit summary opens with "[alert N] " so `alerts.review` can count
@@ -365,13 +367,88 @@ def rewritten_lines(
     proposal): ``- <headline> — <review note>``. Shared by the morning brief
     and the end-of-day digest so the two never drift."""
     return [
-        f"- {str(p.get('headline', ''))[:160]} — {str(p.get('review_note', ''))[:120]}"
+        f"- {quoted(p.get('headline'), 160)} — {quoted(p.get('review_note'), 120)}"
+        + card_link(p)
         for p in rewritten_since(proposals, since)[:limit]
     ]
 
 
+# A link or a "link:" marker in quoted card text, which comes from inbound
+# mail and chat: the briefs' LINK_RULE trusts only the addresses this module
+# writes after "link:", so quoted text must not be able to write one.
+_QUOTED_LINK = re.compile(r"(?:[a-z][a-z0-9+.-]*://|www\.)\S*", re.IGNORECASE)
+_QUOTED_MARKER = re.compile(r"\blink\s*:", re.IGNORECASE)
+
+
+def quoted(text: object, limit: int) -> str:
+    """Card text (a headline, a suggested action) made safe to quote in a
+    brief's context: one line, no address of its own, no "link:" marker."""
+    line = " ".join(str(text or "").split())
+    line = _QUOTED_LINK.sub("(link removed)", line)
+    return _QUOTED_MARKER.sub("link -", line)[:limit]
+
+
+# The most older open items a brief names one by one. Past it, the rest are
+# one closing "and N more on Home" line.
+CARRIED_LIMIT = 8
+
+
+def card_link(p: dict[str, Any]) -> str:
+    """`` — link: <address>`` for a proposal's card on Home, or "" when the
+    app has no web address set (the brief then names it without a link)."""
+    from openexecutive.alerts.card_refs import card_url
+
+    alert_id = p.get("alert_id")
+    url = card_url(alert_id) if isinstance(alert_id, int) else ""
+    return f" — link: {url}" if url else ""
+
+
+def carried_lines(
+    carried: list[dict[str, Any]], now: datetime, limit: int = CARRIED_LIMIT
+) -> list[str]:
+    """The briefs' STILL OPEN FROM BEFORE block: one line per older open
+    proposal, ``- <headline> — needs: <suggested action> (open Nd) — link:
+    <card on Home>``, then ``(and N more on Home)`` past ``limit``. A count
+    alone ("6 older items are still open") told the reader nothing, so each
+    item is named. Shared by the morning brief and the end-of-day digest."""
+    lines: list[str] = []
+    for p in carried[:limit]:
+        created = parse_aware(p.get("created_at"))
+        days = max(0, (now - created).days) if created is not None else 0
+        line = f"- {quoted(p.get('headline'), 140)}"
+        action = quoted(p.get("suggested_action"), 110)
+        if action:
+            line += f" — needs: {action}"
+        line += f" (open {days}d"
+        if p.get("review_verdict") == "likely_stale":
+            line += ", likely stale"
+        lines.append(line + ")" + card_link(p))
+    rest = len(carried) - limit
+    if rest > 0:
+        from openexecutive.alerts.card_refs import on_home_note
+
+        lines.append(f"- (and {rest} more {on_home_note()})")
+    return lines
+
+
+# Handled kinds whose summary carries a watched page's own words.
+_OUTSIDE_HANDLED_KINDS = frozenset({"quiet_watch_found"})
+
+
+def handled_line(h: dict[str, Any]) -> str:
+    """One handled row as a brief's prompt lists it. A quiet watch's find
+    is the page's own words, so it goes in as untrusted content."""
+    summary = str(h.get("summary", ""))[:140]
+    if h.get("kind") in _OUTSIDE_HANDLED_KINDS:
+        from openexecutive.orchestrator.content_trust import wrap_untrusted
+
+        summary = wrap_untrusted(summary, source="watched page")
+    return f"- [{str(h.get('at', ''))[:10]}] {h.get('kind', '')}: {summary}"
+
+
 def handled_since(
-    since: datetime, limit: int = 20, *, include_private: bool = False
+    since: datetime, limit: int = 20, *, include_private: bool = False,
+    owned_by: int | None = None,
 ) -> list[dict[str, Any]]:
     """Completed autonomous moves recorded in the audit log since ``since``.
 
@@ -385,18 +462,24 @@ def handled_since(
     Rows private to the principal (one that names their contact, say) are
     left out unless ``include_private``: only the principal's own ``/today``
     asks for them. The briefs don't, as a written brief can be read by others.
+    One person's own rows (an email watch on their inbox, say) come only
+    with ``owned_by`` them: their own ``/today``.
     """
     try:
         from openexecutive.audit.logger import get_audit_logger
 
         logger_ = get_audit_logger()
         out: list[dict[str, Any]] = []
+        reads: list[dict[str, Any]] = [{"include_private": include_private}]
+        if owned_by is not None:
+            reads.append({"include_private": True, "owned_by": owned_by, "only_owned": True})
         for event_type, kind in HANDLED_EVENT_KINDS.items():
-            for ev in logger_.query(
-                event_type=event_type,
-                since=since.isoformat(),
-                limit=limit,
-                include_private=include_private,
+            for ev in (
+                ev
+                for read in reads
+                for ev in logger_.query(
+                    event_type=event_type, since=since.isoformat(), limit=limit, **read,
+                )
             ):
                 details = ev.details if isinstance(ev.details, dict) else {}
                 out.append({

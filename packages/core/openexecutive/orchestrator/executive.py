@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import itertools
 import json
 import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from typing import Any
 
 from openexecutive.audit import bind_turn, clear_turn, private_rows, set_turn
@@ -23,8 +26,7 @@ from openexecutive.audit.redaction import (
 from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
 from openexecutive.delegation.lockdown import (
-    mail_touched_withheld_error,
-    mail_touched_withholds,
+    mail_turn_withholds,
 )
 from openexecutive.delegation.settings import (
     block0_delegation_on,
@@ -41,23 +43,37 @@ from openexecutive.memory.workspace_settings import (
     pin_turn_workspace_mode,
 )
 from openexecutive.orchestrator import (
+    app_control_catalog,  # noqa: F401  (fills the app tools' catalog)
+    app_links,
     claim_check,
-    department_gate,
+    content_scan,
     extensions,
+    levels,
     outside_content,
+    reply_card_tools,
     take_the_lead,
     tool_groups,
+    tool_images,
+    turn_live,
+    turn_progress,
 )
+from openexecutive.orchestrator import pushback as pushback_mod
+from openexecutive.orchestrator import web_search_tool as web_searches
 from openexecutive.orchestrator.action_chips import summarize_action
 from openexecutive.orchestrator.activity_labels import (
     fallback_activity,
     summarize_activity,
 )
+from openexecutive.orchestrator.activity_tools import ACTIVITY_TOOL_HANDLERS, ACTIVITY_TOOLS
 from openexecutive.orchestrator.alert_tools import (
     CREATE_ALERT_TOOL,
     handle_create_alert,
 )
 from openexecutive.orchestrator.answer_sources import TurnSources, record_web_sources
+from openexecutive.orchestrator.app_control import (
+    APP_TOOL_HANDLERS,
+    APP_TOOLS,
+)
 from openexecutive.orchestrator.artifact_tools import (
     DRAFT_ARTIFACT_TOOL_HANDLERS,
     DRAFT_ARTIFACT_TOOLS,
@@ -69,14 +85,23 @@ from openexecutive.orchestrator.broadcast_tools import (
 from openexecutive.orchestrator.calendar_tools import (
     CALENDAR_TOOL_HANDLERS,
     CALENDAR_TOOLS,
+    typed_booking_only,
+)
+from openexecutive.orchestrator.chat_search_tools import (
+    CHAT_SEARCH_TOOL_HANDLERS,
+    CHAT_SEARCH_TOOL_NAMES,
+    CHAT_SEARCH_TOOLS,
+    recent_chats_block,
+    search_person,
 )
 from openexecutive.orchestrator.content_trust import (
     principal_only_withheld,
-    principal_only_withheld_error,
+    principal_speaking,
 )
 from openexecutive.orchestrator.correction_tools import (
     CORRECTION_TOOL_HANDLERS,
     CORRECTION_TOOLS,
+    pending_followups_block,
 )
 from openexecutive.orchestrator.debug_events import DebugCollector
 from openexecutive.orchestrator.decision_tools import (
@@ -100,7 +125,13 @@ from openexecutive.orchestrator.document_tools import (
 from openexecutive.orchestrator.fact_tools import (
     FACT_TOOL_HANDLERS,
     FACT_TOOLS,
+    own_chat_person,
 )
+from openexecutive.orchestrator.figure_tools import (
+    WORKED_OUT_TOOL_HANDLERS,
+    WORKED_OUT_TOOLS,
+)
+from openexecutive.orchestrator.file_tools import FILE_TOOL_HANDLERS, FILE_TOOLS
 from openexecutive.orchestrator.form_tools import (
     FORM_TOOL_HANDLERS,
     FORM_TOOLS,
@@ -134,6 +165,21 @@ from openexecutive.orchestrator.people_tools import (
     is_principal_on_verified_surface,
     turn_is_private_to_principal,
 )
+from openexecutive.orchestrator.reading import (
+    CUT_OFF_NOTE,
+    CUT_OFF_RESULT,
+    FULL_NOTE,
+    MAX_EMPTY_CUT_ROUNDS,
+    MAX_STEPS,
+    REPEAT_LIMIT,
+    REPEATING_NOTE,
+    STEPS_NOTE,
+    TurnReadingBudget,
+    apply_loop_cache_marker,
+    last_written_block,
+    says_something,
+    with_turn_limits,
+)
 from openexecutive.orchestrator.research_tools import (
     RESEARCH_TOOL_HANDLERS,
     RESEARCH_TOOLS,
@@ -145,31 +191,27 @@ from openexecutive.orchestrator.router import (
     route_parallel,
 )
 from openexecutive.orchestrator.schedule_tools import (
-    MCP_CLIENT_WITHHELD_TOOLS,
     PRIVATE_TURN_WITHHELD_TOOLS,
+    READ_ONLY_WITHHELD_TOOLS,
     SCHEDULE_TOOL_HANDLERS,
     SCHEDULE_TOOLS,
     SHARED_CHAT_WITHHELD_TOOLS,
     UNATTENDED_WITHHELD_TOOLS,
     current_session,
     filter_tools_for_workspace_mode,
-    mcp_client_allows_mcp_tool,
-    mcp_client_withheld_error,
-    mcp_client_withholds,
-    private_turn_allows_mcp_tool,
-    private_turn_withheld_error,
     private_turn_withholds,
     read_only_turn,
-    shared_chat_withheld_error,
+    read_only_withholds,
     shared_chat_withholds,
     tools_withheld_in_mode,
-    unattended_withheld_error,
     withheld_tool_error,
 )
 from openexecutive.orchestrator.session import Session
 from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS, SKILL_TOOLS
 from openexecutive.orchestrator.teammate_mail import guard_call_tool
 from openexecutive.orchestrator.turn_inbox import (
+    HAND_OVER_EMPTY_REPLY,
+    HAND_OVER_NOTE,
     TurnInbox,
     render_added_messages,
     with_added,
@@ -177,6 +219,7 @@ from openexecutive.orchestrator.turn_inbox import (
 from openexecutive.orchestrator.watchlist_tools import (
     WATCHLIST_TOOL_HANDLERS,
     WATCHLIST_TOOLS,
+    speakers_own_row,
 )
 from openexecutive.orchestrator.web_search_tool import (
     WEB_SEARCH_TOOL_NAME,
@@ -192,19 +235,84 @@ from openexecutive.orchestrator.workflow_run_tools import (
 )
 from openexecutive.prompts.cache_manager import build_system_blocks
 from openexecutive.providers import get_provider
+from openexecutive.providers.feature_gate import MAX_OUTPUT_TOKENS
+from openexecutive.providers.registry import reading_limits_for, sees_images
 from openexecutive.providers.translator import reasoning_replay_block
-from openexecutive.workflows import python_job, step_script
+from openexecutive.workflows import python_job, step_script, turn_files
 from openexecutive.workflows.action_step import looks_like_error
 from openexecutive.workflows.python_job import PYTHON_JOB_TOOL_HANDLERS, PYTHON_JOB_TOOLS
-from openexecutive.workflows.tool_catalog import filter_search_results
 
 logger = logging.getLogger(__name__)
+
+
+# Bound by ``Executive.chat`` to a list that a round the model refused
+# (stop_reason "refusal") appends to, so the collected reply never sends what
+# the refused round began writing.
+_REFUSED: ContextVar[list[int] | None] = ContextVar("executive_refused", default=None)
+
+# What ``Executive.chat`` answers for a turn the model refused.
+REFUSED_REPLY = "I can't help with that one."
+
+
+def _with_refusal(collected: str, refused_chars: int) -> str:
+    """A collected reply whose last round the model refused: the earlier
+    rounds' text without the refused round's (its last ``refused_chars``),
+    then ``REFUSED_REPLY``."""
+    kept = collected[: max(0, len(collected) - refused_chars)].strip()
+    return f"{kept}\n\n{REFUSED_REPLY}" if kept else REFUSED_REPLY
+
+# The tools that read the speaker's own notes or earlier chats: private rows,
+# withheld from the process log, and checked like a mail read.
+_OWN_RECALL_TOOL_NAMES: frozenset[str] = HISTORY_TOOL_NAMES | CHAT_SEARCH_TOOL_NAMES
+
+
+def _own_tool_call(tu: dict[str, Any], handlers: Any) -> dict[str, Any] | None:
+    """A ``call_tool`` that names one of the turn's own built-in tools, as
+    that tool's call (same id), or None. Only a plain name the gateway can't
+    hold (no server prefix) with object arguments."""
+    if tu.get("name") != "call_tool" or not isinstance(tu.get("input"), dict):
+        return None
+    named = tu["input"].get("name")
+    if not isinstance(named, str) or not named or "__" in named or named in MCP_TOOL_NAMES:
+        return None
+    if named not in handlers:
+        return None
+    arguments = tu["input"].get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, RecursionError):
+            return None
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return None
+    return {**tu, "name": named, "input": arguments}
 
 
 def _private_to_principal(session: Any) -> bool:
     """Whether this turn is about the principal's private mail (set by the
     email poller for mail from a contact and mail the principal forwarded)."""
     return getattr(session, "private_to_principal", False) is True
+
+
+def _mail_turn_words(session: Any, own_text: str, *, touched_mail: bool, host_words: bool) -> str:
+    """What a turn that touched the speaker's own mailbox may still teach:
+    the words they typed, never the reply (it quotes mail and a draft built
+    from it). Empty for any other turn, and for a replay, a host page's words
+    or mail private to the principal from someone else."""
+    if not touched_mail or host_words or chat_replay.is_replay(session) or _private_to_principal(session):
+        return ""
+    return own_text or ""
+
+
+def _sync_mail_turn_words(words: str, *, person_id: int | None, session_id: str | None) -> None:
+    """Peer memory from a mail turn: only the speaker's own words, with no
+    reply, no one else in the session and no department mirror, so what it
+    learns is what they said about their own mail and stays with them."""
+    from openexecutive.memory.honcho_client import sync_turn as _honcho_sync
+
+    _honcho_sync(words, "", person_id=person_id, session_id=session_id, co_present_person_ids=None)
 
 
 def _contacts_in_prompt(session: Any) -> bool:
@@ -244,7 +352,10 @@ def _log_value(tool_name: str, value: Any) -> str:
     audit row keeps it)."""
     from openexecutive.delegation.settings import turn_touched_delegate_mail
 
-    if tool_name in DELEGATION_TOOL_NAMES or tool_name in HISTORY_TOOL_NAMES or turn_touched_delegate_mail():
+    if (
+        tool_name in DELEGATION_TOOL_NAMES or tool_name in _OWN_RECALL_TOOL_NAMES
+        or turn_touched_delegate_mail()
+    ):
         return "<private>"
     return _trunc(value)
 
@@ -262,215 +373,6 @@ def _trunc(value: Any, limit: int = 200) -> str:
     return f"{s[:limit]}…[truncated {len(s) - limit} chars]"
 
 
-# Smallest cap for which the never-exceeds-limit guarantee holds; mirrored
-# by the ge= bound on TOOL_RESULT_MAX_CHARS in config.py.
-_MIN_USEFUL_CAP = 1_000
-
-# Longest tool name echoed into a truncation marker. Real names are well
-# under this (the longest in the MCP surface is ~40 chars); the bound exists
-# so a model-supplied name cannot inflate the marker past its own budget.
-_TOOL_NAME_MARKER_MAX = 80
-# Once a turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS) is used up, a
-# further tool result still shows this much, so the model sees what it got.
-_TURN_BUDGET_FLOOR = 3_000
-
-# Results the turn's reading budget counts but never cuts (see
-# _turn_result_limit).
-_NEVER_CUT_BY_TURN_BUDGET = frozenset(
-    {step_script.RUN_SCRIPT_TOOL, tool_groups.OPEN_TOOLS, "search_tools"}
-)
-
-
-def _cap_tool_result(
-    text: Any, *, tool_name: str, limit: int, budget_spent: bool = False, full_reread_left: bool = False
-) -> Any:
-    """Bound one tool result before it enters the prompt.
-
-    A circuit breaker, not a routine clipper: the default budget is set so
-    it never fires on ordinary tool output. It exists because a single
-    unbounded result (a large document fetch) otherwise lands in the
-    context and is then re-sent on every remaining iteration of the tool
-    loop, which is the dominant token cost of a long turn.
-
-    The marker is load-bearing. Truncating silently is worse than not
-    truncating: the model reads the cut text as the whole answer and
-    confabulates the rest. Naming the tool and steering toward a
-    *narrower* re-request (rather than a retry, which would re-trigger
-    the cut and burn another iteration) is what makes the cut recoverable.
-
-    Non-``str`` results pass through untouched — every producer returns a
-    string today, and guessing at the size of some other type is not this
-    function's job.
-
-    ``limit`` is passed in rather than read here: ``get_settings()`` builds
-    a fresh ``Settings`` on every call, and this runs once per tool result.
-
-    Precondition: ``limit`` must be at least ``_MIN_USEFUL_CAP``. The
-    "never exceeds ``limit``" guarantee holds by reserving the marker
-    inside the budget, and the marker itself is ~280-850 chars — below
-    that floor there is no room for it and the guarantee breaks. The
-    config field enforces this with ``ge=1_000``.
-
-    ``budget_spent`` says the turn's reading budget, not this result's own
-    size, set ``limit``: the marker then says to answer from what the turn
-    has rather than read more, and never to edit from the cut text. With
-    ``full_reread_left`` it also offers the turn's one full re-read
-    (``_TurnReadingBudget``), so an edit the question asked for can still
-    be done from the whole document.
-    """
-    if not isinstance(text, str):
-        return text
-    if len(text) <= limit:
-        return text
-
-    # ``tool_name`` comes from the model's tool_use block, so it is
-    # attacker-influenceable via prompt injection. Two consequences:
-    #   * it is never passed through ``str.format`` — a name containing
-    #     braces would otherwise be interpreted as a field reference,
-    #     substituting our locals or raising and killing the turn;
-    #   * it is length-bounded, so the marker cannot outgrow the budget
-    #     it is supposed to fit inside.
-    safe_name = tool_name[:_TOOL_NAME_MARKER_MAX] if isinstance(tool_name, str) else "?"
-
-    def marker(shown: int, pct: int) -> str:
-        return (
-            f"\n\n[TRUNCATED by Open Executive: showed the first {shown:,} of "
-            f"{len(text):,} characters from `{safe_name}` ({pct}% omitted). "
-            "This is NOT the full result."
-            + (
-                # A narrower re-read would be cut the same way, so the
-                # budget note replaces the "ask again" advice.
-                " This question has already read as much as it can. Never "
-                "edit, rewrite or replace anything from this cut result."
-                + (
-                    " If you need this whole result to edit or rewrite it, "
-                    "call the tool again with exactly the same input: that "
-                    "repeat does not run the tool again, it brings back this "
-                    "same result in full (once per question)."
-                    if full_reread_left
-                    else " If you needed it to edit or rewrite something, say "
-                    "it was too long to work on here and offer to do it as "
-                    "its own request."
-                )
-                + " Otherwise answer from what you have, and say what you "
-                "could not read."
-                if budget_spent
-                else " To see more, call the tool again with a narrower "
-                "request — a page range, a section name, a query or filter — "
-                "rather than re-requesting the whole document."
-            )
-            + "]"
-        )
-
-    # Reserve the marker inside the budget so the capped result never
-    # exceeds ``limit``. Reserve against the widest form: ``shown`` can
-    # never exceed ``limit``, and ``pct`` can round up to 100 (three
-    # digits), so no real marker is longer than this one. With safe_name
-    # bounded, the reserve stays well under the config's 1_000 minimum.
-    shown = max(0, limit - len(marker(limit, 100)))
-    pct = round((len(text) - shown) * 100 / len(text))
-    logger.warning(
-        "tool_result truncated tool=%s original_chars=%d shown_chars=%d limit=%d",
-        safe_name, len(text), shown, limit,
-    )
-    return text[:shown] + marker(shown, pct)
-
-
-def _turn_result_limit(name: str, *, per_result: int, turn_budget: int, used: int) -> tuple[int, bool]:
-    """The cap for one tool result, given what the turn has already read.
-
-    Every tool result stays in the prompt for each later call of the turn,
-    so a turn that reads several long documents re-sends all of them on
-    every call. ``turn_budget`` (TOOL_RESULTS_TURN_MAX_CHARS; 0 = off)
-    bounds what a turn's results add together: once ``used`` reaches it, a
-    further result is cut to ``_TURN_BUDGET_FLOOR``. Returns (limit, whether
-    the budget rather than ``per_result`` set it). A specialist's analysis
-    is the answer itself, not a read, so it neither counts nor is cut by the
-    budget. A built tool's result counts but is never cut below
-    ``per_result``: it is already bounded (step_script), and it lists the
-    writes that already ran, which a short cut would hide and the model would
-    then repeat. Tool discovery (``open_tools``, ``search_tools``) is treated
-    the same way: its result is the schema for the next call, and a cut one
-    would leave the model unable to make it.
-    """
-    if turn_budget <= 0 or name == "consult_specialist":
-        return per_result, False
-    if name in _NEVER_CUT_BY_TURN_BUDGET:
-        return per_result, False
-    remaining = turn_budget - used
-    if remaining >= per_result:
-        return per_result, False
-    return min(per_result, max(_TURN_BUDGET_FLOOR, remaining)), True
-
-
-class _TurnReadingBudget:
-    """One turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS), with one
-    escape hatch.
-
-    ``_turn_result_limit`` decides the cap from what the turn has used. A
-    read cut by the budget may be the very document the question asks to
-    edit, and an edit from a cut read would drop everything past the cut.
-    So the turn gets one full re-read: when the model repeats a call the
-    budget cut, same tool and same input, the loop answers it with the
-    result it already has (``replay``), under the per-result cap, and never
-    runs the tool again. Replaying rather than re-running matters: the
-    budget cuts any tool's result, and a repeated write (an event, a
-    message) would happen twice. Once per turn, so the budget still bounds
-    the turn: at most one extra ``per_result``.
-    """
-
-    def __init__(self, *, per_result: int, turn_budget: int) -> None:
-        self.per_result = per_result
-        self.turn_budget = turn_budget
-        self.used = 0
-        # Full text of each result the budget cut, by call.
-        self._cut_results: dict[str, str] = {}
-        # tool_use ids answered by ``replay``: shown in full, not cut again.
-        self._replayed: set[str] = set()
-        self.full_reread_left = True
-
-    @staticmethod
-    def _key(name: str, tool_input: Any) -> str:
-        try:
-            return name + "\x00" + json.dumps(tool_input, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            return name + "\x00" + repr(tool_input)
-
-    def replay(self, tool_use: dict[str, Any]) -> str | None:
-        """The stored full result if ``tool_use`` repeats a call the budget
-        cut and the turn's one re-read is left; the caller then answers it
-        with this text instead of dispatching it. ``None`` otherwise."""
-        if not self.full_reread_left:
-            return None
-        full = self._cut_results.get(self._key(tool_use["name"], tool_use["input"]))
-        if full is None:
-            return None
-        self.full_reread_left = False
-        self._replayed.add(tool_use["id"])
-        return full
-
-    def cap(self, name: str, tool_input: Any, text: Any, tool_use_id: str = "") -> Any:
-        """``text`` capped for the prompt, counted against the budget."""
-        if tool_use_id and tool_use_id in self._replayed:
-            limit, budget_spent = self.per_result, False
-        else:
-            limit, budget_spent = _turn_result_limit(
-                name, per_result=self.per_result, turn_budget=self.turn_budget, used=self.used
-            )
-            if budget_spent and isinstance(text, str) and len(text) > limit:
-                self._cut_results[self._key(name, tool_input)] = text
-        content = _cap_tool_result(
-            text,
-            tool_name=name,
-            limit=limit,
-            budget_spent=budget_spent,
-            full_reread_left=self.full_reread_left,
-        )
-        if name != "consult_specialist" and isinstance(content, str):
-            self.used += len(content)
-        return content
-
-
 # The history breakpoint lives an hour: people answer in minutes, not
 # seconds, and a 5m entry would be gone before most next messages.
 _HISTORY_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
@@ -486,7 +388,7 @@ def _apply_history_cache_marker(
     stored as plain text and rebuilt identically every turn, so on the next
     message everything up to that point is a cache read, and only what is
     new (the last exchange, this turn's context) is written. Without it the
-    loop marker (``_apply_loop_cache_marker``) writes the whole history again
+    loop marker (``apply_loop_cache_marker``) writes the whole history again
     on every turn, because the previous turn's cached prefix ended inside
     that turn's own context and tool calls, which history does not keep.
 
@@ -600,66 +502,16 @@ def _clear_turn_marker(message: dict[str, Any] | None) -> None:
             block.pop("cache_control", None)
 
 
-def _apply_loop_cache_marker(
-    messages: list[dict[str, Any]], start: int = 0
-) -> bool:
-    """Move the agent loop's intra-turn cache breakpoint to the newest
-    tool result, in place.
-
-    Without this the loop caches only the static tools+system prefix, so
-    every iteration re-sends the whole accumulated transcript at full
-    input price and ``cache_read_input_tokens`` stays pinned flat while
-    the prompt grows. Marking the newest tool result makes each iteration
-    read the previous iteration's write and extend it, so hits accrue.
-
-    The marker MOVES rather than accumulates: a per-iteration marker left
-    in place would reach ``max_iterations`` breakpoints and blow the
-    4-breakpoint API limit. Sweeping first also makes this idempotent and
-    self-healing — there is no bookkeeping index to drift out of sync.
-
-    Placement is the newest non-empty ``tool_result`` in a user message.
-    That is normally the last block of the last user message; when the
-    newest results are empty it falls back to the newest non-empty one
-    before them, so an all-empty iteration still gets a breakpoint. Only
-    the empty blocks then sit outside the cached prefix, which costs
-    nothing.
-
-    The marker must stay at the ``tool_result`` block's own top level:
-    ``providers.feature_gate._strip_cache_control`` removes markers one
-    level deep only, so a marker nested inside ``tool_result["content"]``
-    would survive the gate and reach a provider that rejects the field.
-
-    ``start`` bounds the sweep to messages this loop appended. The loop's
-    ``current_messages`` is a SHALLOW copy, so the caller still owns the
-    dicts before that index; without the bound a caller-supplied
-    ``tool_result`` would be mutated in place. Today no caller builds one,
-    but making that structural beats guarding it with a comment.
-    """
-    # Sweep every marker, and remember every markable block in order. The
-    # newest one wins, but keeping the whole list means an iteration whose
-    # last results are all empty falls back to the newest earlier result
-    # rather than shipping with no breakpoint at all — losing the marker
-    # costs the entire accumulated transcript at full price for that step.
-    markable: list[dict[str, Any]] = []
-    for msg in messages[start:]:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        is_user = msg.get("role") == "user"
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            block.pop("cache_control", None)
-            # An empty result carries nothing worth caching and risks an
-            # upstream 400 on the translated typed block. Non-str content
-            # (a typed/image result) is markable — it is real bytes in the
-            # prefix — but is left to the translator to render.
-            body = block.get("content")
-            if is_user and body:
-                markable.append(block)
-    if markable:
-        markable[-1]["cache_control"] = {"type": "ephemeral"}
-    return bool(markable)
+def _with_notice(result: Any, notice: str) -> Any:
+    """``result`` with the content check's notice before it
+    (``outside_content.FLAG_NOTICE``): text gets it as a prefix, content
+    blocks get it as a first text block."""
+    if isinstance(result, list):
+        return [{"type": "text", "text": notice}, *result]
+    if isinstance(result, str):
+        return notice + result
+    # Anything else as the JSON the model would read without the notice.
+    return notice + json.dumps(result, default=str)
 
 
 def _tool_error_result(tool_name: str, exc: BaseException) -> str:
@@ -701,6 +553,26 @@ def _drive_memory_block(session: Session, person_id: int | None) -> str:
     except Exception:
         logger.exception("drive_reads: failed to load drive memory")
         return ""
+
+
+def _current_time_block(now: datetime | None = None) -> str:
+    """Render the body of a <current_time> hint: when this turn is, in the
+    workspace's timezone (``get_user_timezone``, as the briefs use).
+
+    Without it a chat turn carries no date at all, so the model guesses one,
+    for instance from the newest record a tool returned, and "yesterday",
+    "this week" or "overdue" resolve against the wrong day.
+    """
+    from openexecutive.memory.workspace_settings import get_user_timezone
+
+    zone = get_user_timezone()
+    local = (now or datetime.now(UTC)).astimezone(zone)
+    offset = local.strftime("%z")
+    return (
+        f"{local:%A} {local.day} {local:%B %Y}, {local:%H:%M} "
+        f"({getattr(zone, 'key', None) or local.tzname()}, UTC{offset[:3]}:{offset[3:]}). "
+        "Resolve today, yesterday, this week, this month and other relative dates against this."
+    )
 
 
 def _build_current_speaker_block(person_id: int | None) -> str | None:
@@ -752,15 +624,19 @@ _ALL_SKILL_TOOLS = [
     *DEPARTMENT_TOOLS,
     *DECISION_TOOLS,
     *FACT_TOOLS,
+    *WORKED_OUT_TOOLS,
     *DOCUMENT_TOOLS,
     *BROADCAST_TOOLS,
     *WATCHLIST_TOOLS,
+    *ACTIVITY_TOOLS,
     *RESEARCH_TOOLS,
     *WORKFLOW_AUTHORING_TOOLS,
     *WORKFLOW_RUN_TOOLS,
     *FORM_TOOLS,
     *GUIDE_TOOLS,
     *PYTHON_JOB_TOOLS,
+    *FILE_TOOLS,
+    *APP_TOOLS,
 ]
 
 
@@ -783,15 +659,19 @@ _ALL_SKILL_HANDLERS = {
     **DEPARTMENT_TOOL_HANDLERS,
     **DECISION_TOOL_HANDLERS,
     **FACT_TOOL_HANDLERS,
+    **WORKED_OUT_TOOL_HANDLERS,
     **DOCUMENT_TOOL_HANDLERS,
     **BROADCAST_TOOL_HANDLERS,
     **WATCHLIST_TOOL_HANDLERS,
+    **ACTIVITY_TOOL_HANDLERS,
     **RESEARCH_TOOL_HANDLERS,
     **WORKFLOW_AUTHORING_TOOL_HANDLERS,
     **WORKFLOW_RUN_TOOL_HANDLERS,
     **FORM_TOOL_HANDLERS,
     **GUIDE_TOOL_HANDLERS,
     **PYTHON_JOB_TOOL_HANDLERS,
+    **FILE_TOOL_HANDLERS,
+    **APP_TOOL_HANDLERS,
 }
 
 
@@ -809,30 +689,79 @@ def builtin_tool_names() -> frozenset[str]:
         step_script.LIST_SAVED_TOOLS_TOOL,
         tool_groups.OPEN_TOOLS,
         tool_groups.USE_TOOL,
+        turn_progress.SHOW_PROGRESS,
         WEB_SEARCH_TOOL_NAME,
     })
 
 
-def _private_tool_row(tool_name: str) -> bool:
+def _private_tool_row(tool_name: str, tool_input: Any = None, result: Any = None) -> bool:
     """Whether a tool's dispatch audit row is private to the principal: Act as
     me reads the speaker's own mailbox, and the fact tools' input quotes the
     principal verbatim and ties a fact to their chat session and turn, which
-    ``GET /memories/facts`` hides from everyone else."""
+    ``GET /memories/facts`` hides from everyone else. A kept figure
+    (``keep_figure``) is the speaker's own and may come from their mail."""
     return (
         tool_name in DELEGATION_TOOL_NAMES
         or tool_name in FACT_TOOL_HANDLERS
-        or tool_name in HISTORY_TOOL_NAMES
+        or tool_name in WORKED_OUT_TOOL_HANDLERS
+        or tool_name in _OWN_RECALL_TOOL_NAMES
+        # An installed extension's tool that quotes the speaker's own data
+        # (orchestrator/extensions.py, private_row).
+        or extensions.private_row(tool_name)
+        # A watch on the speaker's own inbox (watchlist_tools.speakers_own_row).
+        or speakers_own_row(tool_name, tool_input, result)
     )
 
 
-def _artifact_row_owner(tool_name: str) -> int | None:
-    """The person a document tool's dispatch row belongs to alone (its input
-    and result quote the speaker's own documents), else None."""
-    if tool_name not in DRAFT_ARTIFACT_TOOL_HANDLERS:
+def _artifact_row_owner(tool_name: str, tool_input: Any = None, result: Any = None) -> int | None:
+    """The person a dispatch row belongs to alone, else None: a document
+    tool's input and result quote the speaker's own documents, and a
+    watch-list call on their own inbox quotes their mail."""
+    if tool_name not in DRAFT_ARTIFACT_TOOL_HANDLERS and not speakers_own_row(
+        tool_name, tool_input, result
+    ):
         return None
     from openexecutive.orchestrator.artifact_records import current_viewer
 
     return current_viewer().person_id
+
+
+def _pushback_for_turn(
+    settings: Any, session: Session, text: str, normal_model: str
+) -> pushback_mod.Pushback | None:
+    """The pushback model for this turn, when the person pushed back on the
+    last answer (``orchestrator.pushback``). The Executive's Council pick
+    wins over ``PUSHBACK_MODEL``. None runs the turn on ``normal_model``."""
+    try:
+        from openexecutive.agents.overrides import EXECUTIVE_AGENT_ID, get_override
+
+        ov = get_override(EXECUTIVE_AGENT_ID)
+        return pushback_mod.for_turn(
+            session_id=session.session_id,
+            text=text,
+            history=session.conversation_history,
+            normal_model=normal_model,
+            override_pick=ov.pushback_model if ov is not None else None,
+            default=getattr(settings, "pushback_model", "") or "",
+        )
+    except Exception:
+        logger.warning("pushback: couldn't pick the turn's model", exc_info=True)
+        return None
+
+
+def _log_pushback(
+    pushback: pushback_mod.Pushback | None, session: Session, turn_id: str
+) -> None:
+    if pushback is None:
+        return
+    audit_log(
+        "pushback_model",
+        f"Pushback on the last answer ({pushback.reason}); this answer on {pushback.model}",
+        session_id=session.session_id,
+        turn_id=turn_id,
+        actor="executive",
+        details={"reason": pushback.reason, "model": pushback.model},
+    )
 
 
 def _speaker_text(memory_text: str | None, user_message: str) -> str:
@@ -841,6 +770,41 @@ def _speaker_text(memory_text: str | None, user_message: str) -> str:
     the caller's ``memory_text`` when given (``""`` included — it means
     "nothing the person wrote"), else the prompt itself."""
     return memory_text if memory_text is not None else user_message
+
+
+def _turn_lessons(session: Session, person_id: int | None, text: str) -> str:
+    """The ``<lessons>`` body for this turn (``memory.lessons``), counted
+    under the surface the turn is on: the session's ``memory_surface`` when
+    its caller set one, an email for a turn that answers one, else a chat.
+    A turn with no single speaker (a shared call) reads the lessons of
+    ``session.lessons_person_id``, whoever the call belongs to, and is not
+    graded against them: nobody there is that person speaking alone."""
+    from openexecutive.memory import lessons as lessons_store
+
+    surface = str(getattr(session, "memory_surface", "") or "")
+    if surface not in lessons_store.SURFACES:
+        surface = (
+            lessons_store.SURFACE_EMAIL
+            if getattr(session, "origin_channel", "") == "email"
+            else lessons_store.SURFACE_CHAT
+        )
+    owner_id = getattr(session, "lessons_person_id", None)
+    shared = person_id is None and owner_id is not None
+    return lessons_store.build_lessons_block(
+        owner_id if shared else person_id,
+        text,
+        count=not chat_replay.is_replay(session),
+        surface=surface,
+        graded=not shared,
+    )
+
+
+def _lookup_text(memory_text: str | None, user_message: str) -> str:
+    """What the memory lookups (lessons, figures, standing facts) rank
+    against: the speaker's own words when the caller gave them, so notes put
+    before the question (a call's recap, a shared screen) don't steer them;
+    the prompt when there are none."""
+    return _speaker_text(memory_text, user_message).strip() or user_message
 
 
 def _sync_consulted_departments_to_honcho(
@@ -1017,6 +981,191 @@ def _emit_cache_event(
     )
 
 
+# What the person sees for a round that was cut off: the step it was on was
+# writing something long, not the read before it.
+CUT_OFF_LABEL = "Writing it in shorter parts…"
+REPEATING_EMPTY_REPLY = (
+    "I stopped because the same step kept coming back the same way, and "
+    "nothing was ready to show yet."
+)
+STEPS_EMPTY_REPLY = (
+    "I've used all the steps I get for one message. Ask me to carry on and "
+    "I'll pick up the rest."
+)
+FULL_EMPTY_REPLY = (
+    "I've read all I can hold for this one question. Ask me to carry on and "
+    "I'll pick up the rest."
+)
+# Said when it ends that way.
+EMPTY_CUTS_REPLY = (
+    "I kept running out of room before I could finish a step of this. "
+    "Ask me to carry on, or to do it in smaller steps."
+)
+
+
+# Said in place of a round's results when nothing came back to put there (a
+# round the model ended on a tool call the loop had no call for). The API
+# refuses a user message with no content, which would end the whole turn
+# mid-task, after its earlier steps already ran.
+EMPTY_ROUND_NOTE = (
+    "Nothing came back from that step. Carry on from where you are: make the "
+    "call again if you still need it, or answer from what you have."
+)
+
+async def _kept_if_unwritten(stream: AsyncIterator[Any], thinking: str) -> AsyncIterator[Any]:
+    """``stream`` as is, except that a ``rewrite`` whose new reply writes
+    nothing (an empty round, a stop or a cut-off before its first word)
+    streams the first reply again, so every reader (the saved reply, the web
+    and phone chats, an email or chat app) ends with words, never a blank."""
+    since: list[str] = []
+    before: list[str] = []
+    rewritten = False
+    async for item in stream:
+        if item == {"type": "rewrite"}:
+            # A second rewrite keeps the newest words anyone saw.
+            if "".join(since).strip():
+                before = since
+            since, rewritten = [], True
+        elif isinstance(item, str) and item != thinking:
+            since.append(item)
+        yield item
+    if rewritten and not "".join(since).strip() and before:
+        # Exactly as it streamed, so a reader can tell it from a new reply.
+        yield "".join(before)
+
+
+def _round_separator(tail: str, text: str) -> str:
+    """What goes between the text already streamed (its last characters,
+    ``tail``) and a new round's first ``text``: a paragraph break, less what
+    either already has."""
+    if tail.endswith("\n\n") or text.startswith("\n\n"):
+        return ""
+    if tail.endswith("\n") or text.startswith("\n"):
+        return "\n"
+    return "\n\n"
+
+
+# Longest text before a tool call that is still a working note.
+WORKING_NOTE_MAX_CHARS = 300
+# A sentence that only says what it does next: how a working note reads
+# ("Now the live data.", "Let me check the folder.", "Checking the sheet
+# now."). Matched whole: a short sentence with no comma, colon or figure,
+# so a sentence that carries a finding ("Searching the CRM turned up
+# nothing.", "Now the bad news: Acme churned.") is never one.
+_NEXT_STEP_RE = re.compile(
+    r"^(?:(?:let me|let's) (?:check|look|pull|find|search|try|see|get|grab|open|read|dig)\b"
+    r"|now (?:to|for|on to|let me|i'll|i will)\b|next (?:to|let me|i'll|i will)\b"
+    r"|(?:now|next) the \w+(?: \w+)?[.!]?$|time to (?:check|look|search|pull|find|dig)\b"
+    r"|i'll (?:check|look|search|pull|find|try)\b|i will (?:check|look|search|pull|find|try)\b"
+    r"|(?:checking|looking|searching|pulling)\b.*\bnow[.!]?$)",
+    re.IGNORECASE,
+)
+# Longest sentence a working note's step can be.
+NEXT_STEP_MAX_CHARS = 80
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+# A call that only looks something up (whole name segments, as in "search_gmail_messages").
+_LOOKUP_CALL_RE = re.compile(
+    r"(?:^|_)(?:search|read|get|list|find|lookup|query|fetch|consult|retrieve|recall|open)(?:_|$)", re.IGNORECASE
+)
+# Calls that neither look nor act: they don't change what a round is.
+_NEUTRAL_CALLS = frozenset({"show_progress"})
+
+
+def _only_looks(tool_uses: list[dict[str, Any]]) -> bool:
+    """Whether every call a round made only looks something up: a connected
+    app's call (call_tool) or a group's (use_tool) by the tool it runs. A
+    round that also acts (a send, a save) wrote its text as part of the
+    answer ("Runway is 14 months." before the email with it)."""
+    names = []
+    for tu in tool_uses:
+        name = str(tu.get("name", ""))
+        given = tu.get("input")
+        if name in ("call_tool", "use_tool") and isinstance(given, dict):
+            name = str(given.get("name") or name)
+        if name not in _NEUTRAL_CALLS:
+            names.append(name)
+    return bool(names) and all(_LOOKUP_CALL_RE.search(n) for n in names)
+
+
+def _is_next_step(sentence: str) -> bool:
+    return (
+        len(sentence) <= NEXT_STEP_MAX_CHARS
+        and not any(c.isdigit() or c in ",:;" for c in sentence)
+        and _NEXT_STEP_RE.match(sentence) is not None
+    )
+
+
+def _less_notes(text: str) -> str | None:
+    """A round's text before its lookups without its working-note
+    sentences (``_is_next_step``), when it had any, else None. Only a line
+    or two with no list or table is looked at, so "Yes, Acme signed it. Let
+    me pull the signed copy." keeps its answer."""
+    note = text.strip()
+    if not note or len(note) > WORKING_NOTE_MAX_CHARS or "\n" in note or "|" in note:
+        return None
+    sentences = _SENTENCE_END_RE.split(note)
+    kept = [
+        s for s in sentences if not _is_next_step(s)
+    ]
+    if len(kept) == len(sentences):
+        return None
+    if not kept:
+        return ""
+    # Its paragraph break before it (the round's separator) stays.
+    return text[: len(text) - len(text.lstrip())] + " ".join(kept)
+
+
+def _without_notes(rounds: list[tuple[str, bool]]) -> str | None:
+    """The reply without its working notes, when it had any, else None.
+    ``rounds`` is each round's streamed text (its separator first) and
+    whether the round went on only to look something up (``_only_looks``,
+    and not the rest of a cut round's text). A note stays when no round
+    after it wrote anything: then it is all the reply there is."""
+    last_text = max((i for i, (text, _) in enumerate(rounds) if text.strip()), default=-1)
+    out = ""
+    changed = cut = False
+    for i, (text, looked) in enumerate(rounds):
+        rest = _less_notes(text) if looked and i < last_text else None
+        if cut and out.strip() and text and not out[-1:].isspace() and not text[:1].isspace():
+            # Text after a web search in the same round follows the note
+            # with nothing between; with the note gone it needs its break.
+            out += _round_separator(out[-2:], text)
+        cut = rest is not None
+        if rest is None:
+            out += text
+        else:
+            changed = True
+            out += rest
+    if not changed:
+        return None
+    return out.lstrip()
+
+
+def _round_parts(
+    lead: str, text: str, content: list[dict[str, Any]], looked: bool, carries_on: bool
+) -> list[tuple[str, bool]]:
+    """A round's text for ``_without_notes``, split where it ran a web
+    search: a web search runs inside the round, so the text before one was
+    written before a lookup, like the text before a lookup call. ``lead`` is
+    the round's separator, ``looked`` whether its calls only look
+    (``_only_looks``) and ``carries_on`` whether it starts with the rest of
+    a cut round's text."""
+    parts: list[str] = []
+    current = ""
+    for block in content:
+        if block.get("type") == "text":
+            current += str(block.get("text", ""))
+        elif block.get("type") == "server_tool_use" and block.get("name") == WEB_SEARCH_TOOL_NAME and current:
+            parts.append(current)
+            current = ""
+    if not parts or "".join(parts) + current != text:
+        return [(lead + text, looked)]
+    out = [(part, not (i == 0 and carries_on)) for i, part in enumerate(parts)]
+    out[0] = (lead + out[0][0], out[0][1])
+    out.append((current, looked))
+    return out
+
+
 class Executive:
     """The Executive orchestrator — the single voice the user always interacts with.
 
@@ -1056,6 +1205,7 @@ class Executive:
         working_style: str = "",
         standing_facts: str = "",
         lessons: str = "",
+        worked_out: str = "",
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         history = session.get_recent_history()
@@ -1084,6 +1234,12 @@ class Executive:
 
         user_content_parts: list[dict[str, Any]] = []
 
+        # When this turn is, so relative dates resolve against today rather
+        # than a guess. Changes every turn, so the user turn, never a cached
+        # system block.
+        user_content_parts.append(
+            {"type": "text", "text": f"<current_time>\n{_current_time_block()}\n</current_time>"}
+        )
         # Name the human in the room first so the model never offers to loop
         # in / DM the person it is replying to. Lives in the user turn (never
         # the cached system block) since the speaker varies per request.
@@ -1103,6 +1259,12 @@ class Executive:
         # person's own words. Preferences only, in the user turn.
         if lessons:
             user_content_parts.append({"type": "text", "text": f"<lessons>\n{lessons}\n</lessons>"})
+        # Figures it worked out for this person before (memory.worked_out),
+        # with source and date: their own, ranked against this message.
+        if worked_out:
+            user_content_parts.append(
+                {"type": "text", "text": f"<worked_out>\n{worked_out}\n</worked_out>"}
+            )
 
         # Facts and corrections the principal asked to keep (memory/facts.py).
         # The same block every unattended prompt reads, so a correction made
@@ -1168,6 +1330,33 @@ class Executive:
             user_content_parts.append(
                 {"type": "text", "text": f"<drive_memory>\n{drive_memory}\n</drive_memory>"}
             )
+        # The speaker's own chats from the last two days, titles only
+        # (chat_search_tools.recent_chats_block), so "we did it earlier"
+        # reaches search_past_chats. Only where that tool is offered; per
+        # turn, so the user turn.
+        recent_chats = recent_chats_block(session)
+        if recent_chats:
+            user_content_parts.append(
+                {"type": "text", "text": f"<recent_chats>\n{recent_chats}\n</recent_chats>"}
+            )
+        # The follow-ups this speaker scheduled that haven't gone out
+        # (correction_tools.pending_followups_block), so a turn about the
+        # thing one waits for closes it instead of leaving it to fire stale.
+        # Changes as they are set and sent, so the user turn.
+        followups = pending_followups_block(session)
+        if followups:
+            user_content_parts.append(
+                {"type": "text", "text": f"<pending_followups>\n{followups}\n</pending_followups>"}
+            )
+        # What this speaker asked for in the last day, in any chat or app,
+        # that went or waits on its card (take_the_lead.done_lately_block),
+        # so the same ask sent again in a new chat is that ask, not a second
+        # email or card. Changes with every step, so the user turn.
+        from openexecutive.orchestrator.take_the_lead import done_lately_block
+
+        lately = done_lately_block(session)
+        if lately:
+            user_content_parts.append({"type": "text", "text": f"<done_lately>\n{lately}\n</done_lately>"})
 
         # Attachment blocks (images) are inserted before the text message so
         # the model sees the visual context first, then the user's question.
@@ -1191,7 +1380,6 @@ class Executive:
         retrieved_context: str = "",
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
-        max_iterations: int = 15,
         attachment_blocks: list[dict[str, Any]] | None = None,
         person_id: int | None = None,
         co_present_person_ids: list[int] | None = None,
@@ -1286,6 +1474,12 @@ class Executive:
             )
         except Exception:
             logger.exception("Failed to load executive override; using defaults")
+        # Pushback on the last answer: this one answer on the pushback model.
+        pushback = _pushback_for_turn(
+            self._settings, session, _speaker_text(memory_text, user_message), effective_model
+        )
+        if pushback is not None:
+            effective_model = pushback.model
         # Solo / team, resolved once per turn and pinned on the session, so the
         # persona, the org block, the toolkit the loop offers and every tool
         # handler agree even if the setting flips mid-turn (Session override →
@@ -1330,6 +1524,7 @@ class Executive:
         t0 = time.monotonic()
         full_response = ""
         with set_turn(session_id=session.session_id, turn_id=turn_id):
+            _log_pushback(pushback, session, turn_id)
             # Per-person prefetch from Honcho. Runs once per turn (NOT inside
             # the tool-call loop) so a long multi-tool turn doesn't accrue
             # multiple round trips. The wrapper enforces a hard timeout and
@@ -1347,17 +1542,25 @@ class Executive:
                     reasoning_level=peer_memory_reasoning_level,
                 )
             from openexecutive.attunement.style import build_style_block
-            from openexecutive.memory.lessons import build_lessons_block
 
             working_style = build_style_block(person_id)
             # What this workspace asked for differently before (memory.lessons):
             # a SQLite read, off the event loop like the facts.
             lessons = await asyncio.to_thread(
-                build_lessons_block, person_id, user_message, count=not chat_replay.is_replay(session)
+                _turn_lessons, session, person_id, _lookup_text(memory_text, user_message)
+            )
+            from openexecutive.memory.worked_out import build_worked_out_block
+
+            worked_out = await asyncio.to_thread(
+                build_worked_out_block, person_id, _lookup_text(memory_text, user_message), session=session
             )
             if standing_facts is None:
                 # A SQLite read: off the event loop, like the other context.
-                standing_facts = await asyncio.to_thread(render_facts_for_prompt)
+                standing_facts = await asyncio.to_thread(
+                    render_facts_for_prompt, query=_lookup_text(memory_text, user_message),
+                    # Their own private decisions, in their own chat only.
+                    reader=own_chat_person(session),
+                )
             messages = self._build_messages(
                 session,
                 user_message,
@@ -1372,6 +1575,7 @@ class Executive:
                 working_style=working_style,
                 standing_facts=standing_facts,
                 lessons=lessons,
+                worked_out=worked_out,
             )
 
             _emit_memory_snapshot(
@@ -1397,15 +1601,15 @@ class Executive:
                 user_message=user_message,
                 attachment_blocks=attachment_blocks,
                 retrieved_context=retrieved_context,
+                own_words=memory_text,
             )
             consulted: list[str] = []
             turn_calls: list[tuple[str, str]] = []
             try:
-                async for item in self._stream_agent_loop(
+                async for item in _kept_if_unwritten(self._stream_agent_loop(
                     system_blocks,
                     messages,
                     model=effective_model,
-                    max_iterations=max_iterations,
                     episodic_context=episodic_context,
                     debug_collector=debug_collector,
                     consulted_out=consulted,
@@ -1415,9 +1619,12 @@ class Executive:
                     workspace_mode=workspace_mode,
                     principal_role_tag=principal_role_context(principal_role),
                     inbox=inbox,
-                ):
+                ), self._THINKING):
                     if isinstance(item, str) and item != self._THINKING:
                         full_response += item
+                    elif item == {"type": "rewrite"}:
+                        # Written again whole: the history keeps only the new reply.
+                        full_response = ""
                     yield item
             finally:
                 outside_content.end_turn(outside_turn)
@@ -1434,9 +1641,10 @@ class Executive:
             session.add_user_message(added_text)
         session.add_assistant_message(full_response)
         # A turn that read or drafted in the speaker's own mailbox (Act as me)
-        # stays private to them from here on, and teaches no memory: its reply
-        # quotes a draft built from other people's mail. Read from this turn's
-        # own pin (a concurrent turn on the session has its own).
+        # stays private to them from here on, and teaches only their own
+        # private memory, from what they typed (its reply quotes a draft built
+        # from other people's mail). Read from this turn's own pin (a
+        # concurrent turn on the session has its own).
         touched_mail = delegation_pin.touched_mail
 
         # Audit the Executive's outbound response. Without this, the audit
@@ -1447,7 +1655,7 @@ class Executive:
         # entry point (web stream, .chat() wrapper used by Discord / Slack
         # / Telegram / Email / Google Chat) flows through.
         # Only emit on real text — an empty response means the agent loop
-        # produced only tool_use blocks or hit max_iterations without text,
+        # produced only tool_use blocks and no text,
         # and an audit row for "" adds noise without signal.
         if full_response.strip():
             audit_log(
@@ -1478,14 +1686,22 @@ class Executive:
         # said. A quoted Executive email or a briefing card's body in the
         # prompt would otherwise satisfy that quote gate with the Executive's
         # own words. A turn that touched the speaker's own mailbox (Act as me)
-        # has none to learn from: its reply quotes a draft built from other
-        # people's mail, so should_extract refuses the empty text and every
-        # other pass below is skipped outright.
-        speaker_text = "" if touched_mail else with_added(_speaker_text(memory_text, user_message), inbox)
+        # teaches only what is theirs alone, from what they typed
+        # (``mail_words``): their private notes and their own peer memory,
+        # without the reply (it quotes a draft built from other people's
+        # mail). Its lessons come from the review (``record_turn``'s
+        # ``mail``). Extraction, open loops and style skip it.
+        own_text = with_added(_speaker_text(memory_text, user_message), inbox)
+        # A host-surface turn (Session.from_host) is kept nowhere either: its
+        # words may be a script's on the host's page, never the person's own.
+        host_words = getattr(session, "from_host", False) is True
+        speaker_text = "" if touched_mail or host_words else own_text
         # A replay of a graded turn (memory.replay) is kept nowhere: no open
         # loops, style, review or mirror of it (should_extract and
         # schedule_chat_notes refuse a replay session themselves).
-        kept = not touched_mail and not chat_replay.is_replay(session)
+        kept = not touched_mail and not host_words and not chat_replay.is_replay(session)
+        repeat_offer: dict[str, Any] | None = None
+        mail_words = _mail_turn_words(session, own_text, touched_mail=touched_mail, host_words=host_words)
 
         # Re-bind the audit ContextVars for the duration of these calls so
         # the fire-and-forget tasks they schedule can snapshot the right
@@ -1534,17 +1750,47 @@ class Executive:
             # (history_chat). Their own words only, never the reply.
             from openexecutive.memory.history_chat import schedule_chat_notes
 
-            if not touched_mail:
-                schedule_chat_notes(speaker_text, session=session, person_id=person_id)
+            # A turn that touched their mailbox notes their own words too:
+            # notes are theirs alone (memory.history), and own_text is what
+            # they typed, never the mail or the draft.
+            schedule_chat_notes(speaker_text or mail_words, session=session, person_id=person_id)
 
             # Kept for the conversation review once the chat goes quiet
             # (memory.chat_review): a verified speaker's own words, the reply
-            # and the tools the turn ran.
+            # and the tools the turn ran. A turn that touched their mailbox is
+            # kept too, for their own review only (record_turn's ``mail``).
             from openexecutive.memory.chat_review import record_turn
 
-            if kept:
-                record_turn(speaker_text, full_response, session=session,
-                            person_id=person_id, calls=turn_calls)
+            if not chat_replay.is_replay(session):
+                record_turn(own_text, full_response, session=session,
+                            person_id=person_id, calls=turn_calls, mail=touched_mail)
+
+            # The same ask on a few different days: offer to do it on a
+            # schedule (workflows.repeat_asks), under this reply and on
+            # Workflows. Only words they typed: not a turn private to their
+            # mailbox, a host page's or a replay (``kept``), nor one whose
+            # words were composed for them (``memory_text``: a card's
+            # Approve line, a hand-off, a shared chat's or attachment's).
+            if kept and memory_text is None:
+                from openexecutive.workflows.repeat_asks import note_ask
+
+                repeat_offer = await asyncio.to_thread(
+                    note_ask, own_text, session=session, person_id=person_id, calls=turn_calls,
+                )
+
+            # What it worked out (memory.worked_out): the figures the
+            # Executive chose to keep this turn (keep_figure), checked against
+            # the reply now that it is written and kept for this person alone
+            # (private when the turn touched their mailbox).
+            from openexecutive.memory.worked_out import KEEP_TOOL, keep_turn_figures
+
+            # Not from a turn the person wrote nothing in (``memory_text=""``,
+            # e.g. an app's own ask): its numbers repeat what it was shown.
+            # Most turns keep nothing: only a turn that called keep_figure
+            # opens the database.
+            if own_text.strip() and any(name == KEEP_TOOL for name, _ in turn_calls):
+                await asyncio.to_thread(keep_turn_figures, full_response, turn_calls, session=session,
+                                        person_id=person_id, private=touched_mail)
 
             # Mirror the completed exchange into Honcho so its server-side
             # extraction can update the peer card. Fire-and-forget; the
@@ -1553,7 +1799,7 @@ class Executive:
             # their contacts, mail they forwarded): the reply summarises that
             # mail, and peer and department memory are read on other people's
             # turns. Nor for a turn that touched the speaker's own mailbox.
-            if not _private_to_principal(session) and kept:
+            if not _private_to_principal(session) and kept and own_text.strip():
                 from openexecutive.memory.honcho_client import sync_turn as _honcho_sync
                 _honcho_sync(
                     speaker_text,
@@ -1574,6 +1820,12 @@ class Executive:
                     session_id=session.session_id,
                     co_present_person_ids=co_present_person_ids,
                 )
+            elif mail_words:
+                _sync_mail_turn_words(mail_words, person_id=person_id, session_id=session.session_id)
+
+        # Outside the turn's context block: the next step may run on another task.
+        if repeat_offer is not None:
+            yield {"type": "repeat_offer", "offer": repeat_offer, "session_id": session.session_id}
 
     async def stream_chat_with_committee(
         self,
@@ -1582,7 +1834,6 @@ class Executive:
         retrieved_context: str = "",
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
-        max_iterations: int = 15,
         attachment_blocks: list[dict[str, Any]] | None = None,
         person_id: int | None = None,
         co_present_person_ids: list[int] | None = None,
@@ -1651,6 +1902,12 @@ class Executive:
             )
         except Exception:
             logger.exception("Failed to load executive override; using defaults")
+        # Pushback on the last answer: this one answer on the pushback model.
+        pushback = _pushback_for_turn(
+            self._settings, session, _speaker_text(memory_text, user_message), effective_model
+        )
+        if pushback is not None:
+            effective_model = pushback.model
 
         workspace_mode = pin_turn_workspace_mode(session)
         principal_role = pin_turn_principal_role(session, workspace_mode)
@@ -1697,6 +1954,7 @@ class Executive:
         # refactor adds a raising step in this window, wrap that step in
         # try/finally with clear_turn() or migrate to `with set_turn`.
         bind_turn(session_id=session.session_id, turn_id=turn_id)
+        _log_pushback(pushback, session, turn_id)
 
         # Per-person prefetch from Honcho (see stream_chat for rationale).
         # Skip when caller pre-resolved (e.g. parallel context fetch in route).
@@ -1709,14 +1967,21 @@ class Executive:
                 reasoning_level=peer_memory_reasoning_level,
             )
         from openexecutive.attunement.style import build_style_block
-        from openexecutive.memory.lessons import build_lessons_block
 
         working_style = build_style_block(person_id)
         lessons = await asyncio.to_thread(
-            build_lessons_block, person_id, user_message, count=not chat_replay.is_replay(session)
+            _turn_lessons, session, person_id, _lookup_text(memory_text, user_message)
+        )
+        from openexecutive.memory.worked_out import build_worked_out_block
+
+        worked_out = await asyncio.to_thread(
+            build_worked_out_block, person_id, _lookup_text(memory_text, user_message), session=session
         )
         if standing_facts is None:
-            standing_facts = await asyncio.to_thread(render_facts_for_prompt)
+            standing_facts = await asyncio.to_thread(
+                render_facts_for_prompt, query=_lookup_text(memory_text, user_message),
+                reader=own_chat_person(session),
+            )
         messages = self._build_messages(
             session,
             user_message,
@@ -1731,6 +1996,7 @@ class Executive:
             working_style=working_style,
             standing_facts=standing_facts,
             lessons=lessons,
+            worked_out=worked_out,
         )
 
         # ----- Phase 1: drafting -----------------------------------------
@@ -1768,14 +2034,18 @@ class Executive:
             user_message=user_message,
             attachment_blocks=attachment_blocks,
             retrieved_context=retrieved_context,
+            own_words=memory_text,
         )
         turn_calls: list[tuple[str, str]] = []
+        # A refused draft goes to no review or revision: they could rewrite
+        # it into an answer.
+        draft_refused: list[int] = []
+        refusing = _REFUSED.set(draft_refused)
         try:
-            async for item in self._stream_agent_loop(
+            async for item in _kept_if_unwritten(self._stream_agent_loop(
                 system_blocks,
                 messages,
                 model=effective_model,
-                max_iterations=max_iterations,
                 episodic_context=episodic_context,
                 debug_collector=debug_collector,
                 consulted_out=consulted,
@@ -1786,16 +2056,23 @@ class Executive:
                 workspace_mode=workspace_mode,
                 principal_role_tag=principal_role_context(principal_role),
                 inbox=inbox,
-            ):
+            ), self._THINKING):
                 # Swallow draft text and the THINKING sentinel — the user sees
                 # only the revised stream. Pass debug-event dicts through so the
                 # UI still gets specialist routing visibility.
                 if isinstance(item, str):
                     if item != self._THINKING:
                         draft += item
+                elif item == {"type": "rewrite"}:
+                    # The draft is written again whole: reviewers see only that.
+                    draft = ""
                 else:
                     yield item
         finally:
+            # Closed from another context (a client that went away), the
+            # token can't be reset there; the turn still ends.
+            with contextlib.suppress(ValueError):
+                _REFUSED.reset(refusing)
             outside_content.end_turn(outside_turn)
 
         draft_ms = round((time.monotonic() - t0) * 1000)
@@ -1806,11 +2083,11 @@ class Executive:
             len(draft),
         )
 
-        # If the draft came back empty (timeout, max_iterations, etc.) skip
+        # If the draft came back empty (a timeout, a turn that wrote nothing) skip
         # review — there is nothing to critique. Still emit the remaining
         # phase events so the UI's stepper completes; otherwise it stays
         # frozen on "drafting" until the connection closes.
-        if not draft.strip():
+        if draft_refused or not draft.strip():
             yield {
                 "type": "phase",
                 "phase": "reviewing",
@@ -1821,7 +2098,10 @@ class Executive:
                 "phase": "finalizing",
                 "session_id": session.session_id,
             }
-            fallback = "I was unable to complete the analysis. Please try again."
+            fallback = (
+                REFUSED_REPLY if draft_refused
+                else "I was unable to complete the analysis. Please try again."
+            )
             yield fallback
             session.add_user_message(user_message)
             for added_text in inbox.taken_texts() if inbox is not None else []:
@@ -1923,7 +2203,7 @@ class Executive:
         revision_final_msg: Any = None
         async with get_provider(effective_model).messages_stream(
             model=effective_model,
-            max_tokens=8192,
+            max_tokens=MAX_OUTPUT_TOKENS,
             system=system_blocks,  # type: ignore[arg-type]
             messages=revision_messages,  # type: ignore[arg-type]
         ) as stream:
@@ -1970,7 +2250,7 @@ class Executive:
         for added_text in inbox.taken_texts() if inbox is not None else []:
             session.add_user_message(added_text)
         # Act as me: a turn that touched the speaker's mailbox stays private
-        # and teaches no memory (see stream_chat).
+        # and teaches only their own private memory (see stream_chat).
         touched_mail = delegation_pin.touched_mail
         # Guard against a revision pass that produced no text (only tool_use
         # blocks, model_stop, etc.). Persisting an empty assistant turn
@@ -2034,10 +2314,16 @@ class Executive:
         # The speaker's own words, for extraction, open loops and peer
         # memory alike — none for a turn that touched their mailbox; see
         # stream_chat.
-        speaker_text = "" if touched_mail else with_added(_speaker_text(memory_text, user_message), inbox)
+        own_text = with_added(_speaker_text(memory_text, user_message), inbox)
+        # A host-surface turn (Session.from_host) is kept nowhere either: its
+        # words may be a script's on the host's page, never the person's own.
+        host_words = getattr(session, "from_host", False) is True
+        speaker_text = "" if touched_mail or host_words else own_text
         # private_rows: see stream_chat — the scheduled passes copy it.
         # A replay (memory.replay) is kept nowhere — see stream_chat.
-        kept = not touched_mail and not chat_replay.is_replay(session)
+        kept = not touched_mail and not host_words and not chat_replay.is_replay(session)
+        repeat_offer: dict[str, Any] | None = None
+        mail_words = _mail_turn_words(session, own_text, touched_mail=touched_mail, host_words=host_words)
         with private_rows(touched_mail):
             if should_extract(speaker_text, session=session):
                 schedule_extraction(
@@ -2061,20 +2347,34 @@ class Executive:
             # Always in the loop — see stream_chat.
             from openexecutive.memory.history_chat import schedule_chat_notes
 
-            if not touched_mail:
-                schedule_chat_notes(speaker_text, session=session, person_id=person_id)
+            schedule_chat_notes(speaker_text or mail_words, session=session, person_id=person_id)
 
             # Conversation review — see stream_chat.
             from openexecutive.memory.chat_review import record_turn
 
-            if kept:
-                record_turn(speaker_text, final_response, session=session,
-                            person_id=person_id, calls=turn_calls)
+            if not chat_replay.is_replay(session):
+                record_turn(own_text, final_response, session=session,
+                            person_id=person_id, calls=turn_calls, mail=touched_mail)
+
+            # Repeated asks — see stream_chat.
+            if kept and memory_text is None:
+                from openexecutive.workflows.repeat_asks import note_ask
+
+                repeat_offer = await asyncio.to_thread(
+                    note_ask, own_text, session=session, person_id=person_id, calls=turn_calls,
+                )
+
+            # What it worked out — see stream_chat.
+            from openexecutive.memory.worked_out import KEEP_TOOL, keep_turn_figures
+
+            if own_text.strip() and any(name == KEEP_TOOL for name, _ in turn_calls):
+                await asyncio.to_thread(keep_turn_figures, final_response, turn_calls, session=session,
+                                        person_id=person_id, private=touched_mail)
 
         # Mirror the completed exchange into Honcho (see stream_chat for
         # rationale, and for why a turn private to the principal — or one
         # that touched the speaker's own mailbox — is not).
-        if not _private_to_principal(session) and kept:
+        if not _private_to_principal(session) and kept and own_text.strip():
             from openexecutive.memory.honcho_client import sync_turn as _honcho_sync
             _honcho_sync(
                 speaker_text,
@@ -2091,6 +2391,12 @@ class Executive:
                 session_id=session.session_id,
                 co_present_person_ids=co_present_person_ids,
             )
+        elif mail_words:
+            with private_rows(True):
+                _sync_mail_turn_words(mail_words, person_id=person_id, session_id=session.session_id)
+
+        if repeat_offer is not None:
+            yield {"type": "repeat_offer", "offer": repeat_offer, "session_id": session.session_id}
 
         # Reset audit ContextVars at normal completion. The abandoned-stream
         # case (SSE client drop mid-yield) doesn't reach here — accept that
@@ -2103,7 +2409,6 @@ class Executive:
         system_blocks: list[dict[str, Any]],
         messages: list[dict[str, Any]],
         model: str = "",
-        max_iterations: int = 15,
         episodic_context: str = "",
         debug_collector: DebugCollector | None = None,
         consulted_out: list[str] | None = None,
@@ -2170,15 +2475,15 @@ class Executive:
         # Python jobs need the sandbox the API image installs: without it the
         # tool is not offered (fixed per process, so the prefix stays stable).
         sandbox_missing = frozenset() if python_job.available() else frozenset({python_job.TOOL_NAME})
-        # Another AI app asking over Open Executive's MCP server
-        # (`Session.from_mcp_client`): it reads and advises, and nothing that
-        # sends, posts, books, schedules, runs or changes stored state is
-        # offered or run (`MCP_CLIENT_WITHHELD_TOOLS`) — a fixed set, so the
-        # variant keeps a stable tool prefix of its own. A scheduled run a
-        # teammate queued gets the same (`read_only_turn`): the runner sends
-        # what it writes.
+        # A turn that may only read and advise (`read_only_turn`: a page in
+        # another app, or a scheduled run a teammate queued, whose message the
+        # runner sends): nothing that sends, posts, books, schedules, runs or
+        # changes stored state runs without the owner's card
+        # (`READ_ONLY_WITHHELD_TOOLS`, `levels.READ_ONLY`). Another AI app's
+        # turn is the signed-in person's own: Approvals decides it like the
+        # web chat.
         mcp_client = read_only_turn(current_session.get())
-        mcp_client_withheld = MCP_CLIENT_WITHHELD_TOOLS if mcp_client else frozenset()
+        mcp_client_withheld = READ_ONLY_WITHHELD_TOOLS if mcp_client else frozenset()
         # A shared web chat someone other than its owner has written into
         # since the owner last did (`Session.others_spoke_last`): nothing
         # that sends to people or changes contacts (`SHARED_CHAT_WITHHELD_TOOLS`,
@@ -2188,16 +2493,21 @@ class Executive:
             and getattr(current_session.get(), "others_spoke_last", False) is True
         )
         shared_withheld = SHARED_CHAT_WITHHELD_TOOLS if others_spoke else frozenset()
+        # Someone on no People entry (an unmatched Google Chat sender, a web
+        # sign-in on nobody's entry) has no level of their own: everything
+        # they ask to send or change waits on the owner's card at every level.
+        unrostered = levels.unrostered_speaker(current_session.get())
         # A replay of a graded turn (memory.replay): nothing that runs a
         # script or a job, or changes the install; its acting tools are
         # faked below, after the gates.
         replaying = chat_replay.is_replay(current_session.get())
         replay_withheld = chat_replay.WITHHELD_TOOLS if replaying else frozenset()
-        not_offered = (
-            unattended_withheld | private_withheld | principal_withheld | sandbox_missing
-            | mcp_client_withheld | shared_withheld | replay_withheld
-        )
+        # The gates' tools are offered at every level: the one check
+        # (orchestrator.levels) decides at dispatch whether a call they
+        # notice runs (Hands-off) or waits on an Approve card.
+        not_offered = sandbox_missing | replay_withheld
         withheld_tools = tools_withheld_in_mode(workspace_mode) | not_offered
+        turn_level = levels.turn_level(current_session.get())
         # Act as me: ghostwrite_email joins the toolkit only on a turn
         # pin_turn_delegation offered it to. Its own registry, never
         # _ALL_SKILL_TOOLS, and a per-turn handler map built from it — so on
@@ -2224,6 +2534,16 @@ class Executive:
         if history_offered:
             delegation_tools = [*delegation_tools, *HISTORY_TOOLS]
             turn_handlers = {**turn_handlers, **HISTORY_TOOL_HANDLERS}
+        # Earlier chats: search_past_chats joins the same way, on a turn whose
+        # speaker is verified in a chat nobody else reads (chat_search_tools).
+        if not mcp_client and not replaying and search_person(current_session.get()) is not None:
+            delegation_tools = [*delegation_tools, *CHAT_SEARCH_TOOLS]
+            turn_handlers = {**turn_handlers, **CHAT_SEARCH_TOOL_HANDLERS}
+        # The inbox's work turn on a reply card (delegation.card_work):
+        # update_reply_card hands back what it did, with Act as me's tools.
+        if ghostwrite_offered and reply_card_tools.offered(current_session.get()):
+            delegation_tools = [*delegation_tools, *reply_card_tools.REPLY_CARD_TOOLS]
+            turn_handlers = {**turn_handlers, **reply_card_tools.REPLY_CARD_TOOL_HANDLERS}
         # Tools an installed extension adds (orchestrator/extensions.py): only
         # on a turn someone is in, never an unattended run or a turn private
         # to the principal, and only where each tool says it is offered.
@@ -2237,13 +2557,14 @@ class Executive:
         leading = bool(unattended_withheld) and take_the_lead.executive_on()
         if leading:
             turn_handlers = take_the_lead.gated_handlers(turn_handlers, source="scheduled")
-        # A team member's turn (not the principal's): every send or edit goes
-        # through their department's authority first (department_gate), as
-        # unattended work goes through the scheduler's and Take the lead's.
-        seat = None if unattended_withheld else department_gate.speaker(current_session.get())
-        seat_session_id = getattr(current_session.get(), "session_id", None)
-        if seat is not None:
-            turn_handlers = department_gate.gated_handlers(turn_handlers, seat, session_id=seat_session_id)
+        # A step someone asked for on a turn that isn't the owner's own ask
+        # (a teammate, a contact's mail) also meets the owner's Waits rules,
+        # then In training, after Approvals.
+        asked_checks = not leading and not replaying and take_the_lead.asked_checks_apply(current_session.get())
+        if asked_checks:
+            turn_handlers = take_the_lead.asked_handlers(turn_handlers)
+        # A team member's turn runs like the owner's: Approvals decides each
+        # step (orchestrator.levels), and a held one is their own card.
         # A replay (memory.replay): outermost, so a tool that would send,
         # post, book, schedule, run or change stored state is recorded on the
         # session and answered "done" before any gate or handler sees it;
@@ -2254,7 +2575,7 @@ class Executive:
         # Take the lead on, the reflection looks at it soon, batched.
         origin = str(getattr(current_session.get(), "origin_channel", "") or "")
         if origin and not unattended_withheld and not replaying:
-            take_the_lead.wake(f"a message on {origin}")
+            take_the_lead.wake(take_the_lead.arrival_reason(origin))
         current_messages = list(messages)
         if self._settings.enable_caching:
             system_blocks, current_messages = _apply_history_cache_marker(
@@ -2270,14 +2591,25 @@ class Executive:
         fanout_hinted = False
         # Shallow copy — the caller owns every dict up to this index.
         caller_message_count = len(current_messages)
-        last_full_text = ""
+        # The end of the text this turn has streamed so far, across rounds:
+        # a round's text after an earlier round's (the model's words before a
+        # tool call, then its answer) starts a new paragraph, so the two
+        # never run together ("...stock.Yes. ITEM-1...").
+        streamed_tail = ""
+        # Each round's streamed text (its separator first) and whether it went
+        # on only to look something up, since the reply was last written
+        # again: the working notes among them leave the reply at the end
+        # (_without_notes).
+        rounds: list[tuple[str, bool]] = []
+        # Set once a failed web search got its one more round this turn.
+        searched_again = False
+        # Set by a round cut off mid-text: the next round's text carries it
+        # on, so that round alone gets no paragraph break before its text.
+        run_on = False
         specialists_consulted: list[str] = []
         # What this turn's tool results have put in the prompt so far: every
         # one is re-sent on each later call.
-        reading_budget = _TurnReadingBudget(
-            per_result=self._settings.tool_result_max_chars,
-            turn_budget=self._settings.tool_results_turn_max_chars,
-        )
+        reading_budget = TurnReadingBudget(reading_limits_for(model))
 
         # Every tool call this turn with the start of its result, for the
         # end-of-turn check that the reply claims nothing it didn't do
@@ -2285,16 +2617,43 @@ class Executive:
         # Every tool the turn ran with its result: for the claim check, and
         # (``calls_out``) for the conversation review's record of the turn.
         turn_calls: list[tuple[str, str]] = calls_out if calls_out is not None else []
+        # What the after-reply check reads (claim_check): each call with what
+        # it was asked to do, since a result's first line rarely says it all.
+        claim_calls: list[tuple[str, str]] = []
+        # Reply text of cut rounds the next round carries on: the claim
+        # check reads it with the round that finishes the reply.
+        cut_text = ""
+        # Cut rounds in a row that wrote nothing (MAX_EMPTY_CUT_ROUNDS).
+        empty_cuts = 0
         claim_checked = False
+        # Set once the person asks to finish the work themselves: the next
+        # round writes up what the turn has, and runs no tool.
+        handing_over = False
+        # Set once the same call came back the same REPEAT_LIMIT times: the next
+        # round writes up what the turn has, and runs no tool, as on a hand-over.
+        repeating = False
+        # What a write-up that wrote nothing says: why it was asked for.
+        write_up_empty = REPEATING_EMPTY_REPLY
+        # What the turn last showed the person (show_progress), so each call
+        # adds to it, and the reads it made, counted once each for the card.
+        shown_progress: turn_progress.Progress | None = None
+        turn_reads = turn_progress.Reads()
 
-        for iteration in range(1, max_iterations + 1):
+        for iteration in itertools.count(1):
             logger.info(
-                "iter %d/%d", iteration, max_iterations,
+                "iter %d", iteration,
                 extra={"iter_marker": True},
             )
             full_text = ""
+            # The separator streamed before this round's text (_round_separator).
+            round_sep = 0
+            round_sep_text = ""
+            carries_on, run_on = run_on, False
             tool_uses: list[dict[str, Any]] = []
             response_content: list[dict[str, Any]] = []
+            # The content check's notice on each result this round, for every
+            # part of it (orchestrator.reading).
+            read_notices: dict[str, str] = {}
 
             # If specialists were already consulted, this is the synthesis pass.
             # Emit synthesis_start before text chunks begin streaming.
@@ -2319,13 +2678,17 @@ class Executive:
                 t for t in filter_tools_for_workspace_mode(
                     [
                         *SPECIALIST_TOOLS, *_offered_skill_tools(), *self._mcp_tools,
-                        *self._script_tools, *delegation_tools,
+                        *self._script_tools, *delegation_tools, turn_progress.SHOW_PROGRESS_TOOL,
                     ],
                     workspace_mode,
                 )
                 if t["name"] not in not_offered
             )
             client_tools = sorted(direct_tools, key=lambda t: t["name"])
+            booking_offered = any(
+                isinstance(t, dict) and t.get("name") == "create_calendar_event"
+                for t in [*direct_tools, *deferred_tools]
+            )
             tools_with_cache: list[dict[str, Any]] = [
                 *client_tools[:-1],
                 {**client_tools[-1], "cache_control": {"type": "ephemeral", "ttl": "1h"}},
@@ -2336,7 +2699,7 @@ class Executive:
             stream_model = model or self._settings.default_model
             async with get_provider(stream_model).messages_stream(
                 model=stream_model,
-                max_tokens=8192,
+                max_tokens=MAX_OUTPUT_TOKENS,
                 system=system_blocks,  # type: ignore[arg-type]
                 tools=tools_with_cache,  # type: ignore[arg-type,list-item]
                 messages=current_messages,  # type: ignore[arg-type]
@@ -2349,7 +2712,15 @@ class Executive:
                         and hasattr(event.delta, "type")
                         and event.delta.type == "text_delta"
                     ):
+                        if not full_text and streamed_tail and event.delta.text and not carries_on:
+                            separator = _round_separator(streamed_tail, event.delta.text)
+                            if separator:
+                                yield separator
+                                streamed_tail = separator
+                                round_sep = len(separator)
+                                round_sep_text = separator
                         full_text += event.delta.text
+                        streamed_tail = (streamed_tail + event.delta.text)[-2:]
                         yield event.delta.text
 
                 final_msg = await stream.get_final_message()
@@ -2395,8 +2766,16 @@ class Executive:
                     response_content.append(replay)
             if turn_sources is not None:
                 record_web_sources(turn_sources, final_msg.content)
-
-            last_full_text = full_text
+            rounds.extend(_round_parts(
+                round_sep_text,
+                full_text,
+                response_content,
+                final_msg.stop_reason == "tool_use" and not carries_on and _only_looks(tool_uses),
+                carries_on,
+            ))
+            # A web search is a look, like any read: the after-reply check
+            # sees it with the turn's other calls.
+            claim_calls.extend(web_searches.searched(response_content))
 
             if web_search_queries:
                 session_id = getattr(current_session.get(), "session_id", None)
@@ -2425,19 +2804,124 @@ class Executive:
                         },
                     )
 
-            if final_msg.stop_reason != "tool_use":
+            # Cut off at MAX_OUTPUT_TOKENS mid-answer: carry on rather than
+            # end the turn on half a step. A cut tool call is answered with
+            # CUT_OFF_RESULT below and never runs; cut text gets CUT_OFF_NOTE.
+            reading_budget.saw(getattr(final_msg, "usage", None))
+            cut_off = final_msg.stop_reason == "max_tokens"
+            # The call the round was still writing when it was cut off is the
+            # last one; its input is unfinished, so nothing reads or runs it.
+            # Only text and calls count as written: a reasoning block that a
+            # translated provider (OpenRouter, OpenAI) puts last is skipped.
+            # A call followed by text or by a call the provider dropped closed
+            # before the cut and runs. A translated provider lists text first,
+            # so its last call always counts as cut and is asked for again.
+            last_written = last_written_block(response_content)
+            # A cut round got somewhere when its cut fell in text (shown, and
+            # carried on) or a call closed before the cut (it runs). A round
+            # cut while writing its only call got nowhere, however much it
+            # wrote before it: that call never runs.
+            cut_in_call = last_written is not None and last_written.get("type") == "tool_use"
+            closed_calls = sum(b.get("type") == "tool_use" for b in response_content) - int(cut_in_call)
+            got_somewhere = closed_calls > 0 or (
+                last_written is not None and not cut_in_call and says_something(str(last_written.get("text", "")))
+            )
+            empty_cuts = empty_cuts + 1 if cut_off and not got_somewhere else 0
+            if empty_cuts > MAX_EMPTY_CUT_ROUNDS:
+                logger.warning("round %d: %d cut rounds in a row wrote nothing; ending the turn", iteration, empty_cuts)
+                yield ("\n\n" if streamed_tail else "") + EMPTY_CUTS_REPLY
+                return
+            if cut_off:
+                logger.warning(
+                    "round %d cut off at max_tokens=%d; carrying on", iteration, MAX_OUTPUT_TOKENS,
+                )
+                if not tool_uses:
+                    if not any(b.get("type") == "text" and str(b.get("text", "")).strip() for b in response_content):
+                        # Nothing was said: the step was writing something
+                        # long (a call the provider dropped whole).
+                        yield {"type": "activity", "label": CUT_OFF_LABEL, "tool": "", "iteration": iteration}
+                    if response_content:
+                        current_messages.append({"role": "assistant", "content": response_content})
+                    cut_text += "".join(
+                        str(b.get("text", "")) for b in response_content if b.get("type") == "text"
+                    )
+                    if reading_budget.window_full:
+                        # Another cut round would not fit the window: what
+                        # it wrote stays shown and the turn ends plainly.
+                        logger.warning("round %d cut off with the window full; ending the turn", iteration)
+                        yield ("\n\n" if streamed_tail else "") + FULL_EMPTY_REPLY
+                        return
+                    note: list[dict[str, Any]] = [{"type": "text", "text": CUT_OFF_NOTE}]
+                    current_messages.append({"role": "user", "content": note})
+                    # The next round carries on the cut text where it
+                    # stopped: no paragraph break between them
+                    # (_round_separator). A cut that streamed nothing keeps
+                    # the break after earlier rounds' text, and any round
+                    # after the next gets the break as usual.
+                    run_on = bool(full_text)
+                    continue
+            if final_msg.stop_reason != "tool_use" and not cut_off:
+                # A reply with no tool call still gets the queued files and
+                # synced excerpts checked, so what they tried is flagged to
+                # the person (outside_content.settle).
+                await outside_content.settle()
+                if final_msg.stop_reason == "refusal":
+                    # The model refused: no claim check or retry round, and
+                    # a caller collecting the reply learns of it (_REFUSED).
+                    logger.warning("round %d refused by the model", iteration)
+                    refused = _REFUSED.get()
+                    if refused is not None:
+                        # How much of the collected text the refused round
+                        # wrote, its separator included.
+                        refused.append(round_sep + len(full_text))
+                    else:
+                        # A streamed reply (the web chat) ends on a plain
+                        # refusal, not on what the refused round began.
+                        yield ("\n\n" if streamed_tail else "") + REFUSED_REPLY
+                    return
+                # A web search stopped by the limit for one step gets one more
+                # round, once a turn, to search for what is still open: the
+                # limit starts over each step.
+                if (
+                    not (searched_again or handing_over or repeating)
+                    and web_searches.search_failed(response_content)
+                ):
+                    searched_again = True
+                    audit_log(
+                        "search_again",
+                        "A web search didn't run; one more round",
+                        session_id=getattr(current_session.get(), "session_id", None),
+                        turn_id=turn_id,
+                        actor="executive",
+                        details={"iteration": iteration},
+                        private=private_turn,
+                    )
+                    current_messages.append({"role": "assistant", "content": response_content})
+                    # Written again whole, as on the claim check's round below.
+                    yield {"type": "rewrite"}
+                    streamed_tail, rounds, cut_text = "", [], ""
+                    again: list[dict[str, Any]] = [{"type": "text", "text": web_searches.SEARCH_AGAIN_NOTE}]
+                    current_messages.append({"role": "user", "content": again})
+                    continue
                 # Do what it says: a reply that claims a change no call this
                 # turn made gets one more round to make it or say it can't.
-                if claim_checked or iteration >= max_iterations:
-                    return
-                claim_checked = True
-                reply_text = "\n".join(
-                    str(b.get("text", "")) for b in response_content if b.get("type") == "text"
-                )
-                claim = await claim_check.unbacked_claim(
-                    claim_check.last_person_message(messages), reply_text, turn_calls,
-                )
+                claim: str | None = None
+                if not (claim_checked or handing_over or repeating):
+                    claim_checked = True
+                    reply_text = cut_text + "\n".join(
+                        str(b.get("text", "")) for b in response_content if b.get("type") == "text"
+                    )
+                    claim = await claim_check.unbacked_claim(
+                        claim_check.last_person_message(messages), reply_text, claim_calls,
+                    )
                 if claim is None:
+                    # The reply is the answer alone: a working note written
+                    # before a lookup ("Now the live data.") leaves it, on
+                    # every page and channel showing it (``rewrite``).
+                    clean = _without_notes(rounds)
+                    if clean is not None:
+                        yield {"type": "rewrite"}
+                        yield clean
                     return
                 audit_log(
                     "claim_check",
@@ -2450,18 +2934,67 @@ class Executive:
                     private=private_turn,
                 )
                 current_messages.append({"role": "assistant", "content": response_content})
-                current_messages.append(
-                    {"role": "user", "content": [{"type": "text", "text": claim_check.nudge(claim)}]}
-                )
-                yield "\n\n"
+                # The retry writes the whole reply again and it replaces the
+                # first, never trailing it as a correction: a collected reply
+                # (an email, a chat app) drops it before it is sent, and the
+                # web chat swaps it out on ``rewrite``.
+                yield {"type": "rewrite"}
+                streamed_tail, rounds = "", []
+                nudge: list[dict[str, Any]] = [
+                    {"type": "text", "text": claim_check.nudge(claim)}
+                ]
+                current_messages.append({"role": "user", "content": nudge})
+                # The retry's text gets its paragraph break from
+                # _round_separator, like any other round's.
                 continue
 
+            # Handed over (or repeating itself): the write-up asked for a tool
+            # anyway. Run nothing; what it wrote (if anything) is the reply.
+            if handing_over or repeating:
+                if not any(
+                    b.get("type") == "text" and str(b.get("text", "")).strip()
+                    for b in response_content
+                ):
+                    yield HAND_OVER_EMPTY_REPLY if handing_over else write_up_empty
+                return
+
+            cut_text = ""
             # open_tools is answered here; a use_tool call becomes the call it
             # stands for (same id), so every guard, handler, chip and audit
             # row below sees the tool's own name, as for a direct call.
+            # show_progress is answered here too: nothing runs, and the chat
+            # gets it before this round's activity label.
             group_results: dict[str, str] = {}
+            cut_id = (
+                tool_uses[-1]["id"]
+                if cut_off and tool_uses and last_written is not None
+                and last_written.get("type") == "tool_use"
+                and last_written.get("id") == tool_uses[-1]["id"]
+                else None
+            )
+            # The cut call's half-written input is never read: drop it from
+            # the history, which every later round sends again.
+            if cut_id is not None and last_written is not None:
+                last_written["input"] = {}
+            # Nothing below sees the cut call (no hand-over ask, no count of
+            # calls made): it only gets CUT_OFF_RESULT, after the others.
+            cut_results: list[dict[str, Any]] = []
+            if cut_id is not None:
+                tool_uses = [tu for tu in tool_uses if tu["id"] != cut_id]
+                cut_results.append({"type": "tool_result", "tool_use_id": cut_id, "content": CUT_OFF_RESULT})
             for i, tu in enumerate(tool_uses):
-                if tu["name"] == tool_groups.OPEN_TOOLS:
+                if tu["name"] == turn_progress.SHOW_PROGRESS:
+                    result, progress_event, shown_progress = turn_progress.apply(
+                        tu["input"],
+                        shown_progress,
+                        alone=all(
+                            other["name"] == turn_progress.SHOW_PROGRESS for other in tool_uses
+                        ),
+                    )
+                    group_results[tu["id"]] = result
+                    if progress_event is not None:
+                        yield progress_event
+                elif tu["name"] == tool_groups.OPEN_TOOLS:
                     group_results[tu["id"]] = tool_groups.open_result(tu["input"], deferred_tools)
                 elif tu["name"] == tool_groups.USE_TOOL:
                     call, error = tool_groups.unwrap(tu)
@@ -2469,14 +3002,41 @@ class Executive:
                         group_results[tu["id"]] = error or ""
                     else:
                         tool_uses[i] = call
-            # The turn's one full re-read of a result the reading budget cut
-            # is answered from that result, never by running the tool again
-            # (it may have been a write).
+                else:
+                    # A built-in tool asked for through the gateway
+                    # (call_tool name="create_alert") is that tool's own call,
+                    # checked by its own name: the gateway doesn't have it.
+                    own = _own_tool_call(tu, turn_handlers)
+                    if own is not None:
+                        tool_uses[i] = own
+            # A repeat of a call whose result came back in parts is answered
+            # with its next part, never by running the tool again (it may
+            # have been a write).
             for tu in tool_uses:
                 if tu["id"] not in group_results:
                     replayed = reading_budget.replay(tu)
                     if replayed is not None:
                         group_results[tu["id"]] = replayed
+            # A read of the company's own Drive item is not outside content:
+            # look those up first, so source_of (and defers_read) pass them.
+            await outside_content.vet_reads(
+                [tu for tu in tool_uses if tu["id"] not in group_results], self._mcp_gateway
+            )
+            # The person just said go to what the last turn held: the first
+            # round that reads runs its other calls without those reads, so a
+            # re-read doesn't hold the approved steps again
+            # (orchestrator.outside_content.defers_read).
+            deferred = [
+                tu for tu in tool_uses
+                if tu["id"] not in group_results and outside_content.defers_read(tu["name"], tu["input"])
+            ]
+            if deferred:
+                for tu in deferred:
+                    named = tu["input"].get("name") if isinstance(tu["input"], dict) else None
+                    label = named[:200] if tu["name"] == "call_tool" and isinstance(named, str) and named else tu["name"]
+                    group_results[tu["id"]] = outside_content.go_first_error(label)
+                outside_content.go_first_round_done()
+                logger.info("go_first: deferred %d read(s) until the held steps ran", len(deferred))
             dispatch_uses = [tu for tu in tool_uses if tu["id"] not in group_results]
 
             specialist_tool_uses = [tu for tu in dispatch_uses if tu["name"] == "consult_specialist"]
@@ -2494,48 +3054,39 @@ class Executive:
                 if self._script_tools
                 and tu["name"] in (step_script.RUN_SCRIPT_TOOL, step_script.LIST_SAVED_TOOLS_TOOL)
             ]
-            # A turn private to the principal is not offered run_script
-            # (PRIVATE_TURN_WITHHELD_TOOLS); the same guard refuses it.
-            if (private_turn or mcp_client) and script_tool_uses:
-                withheld_uses = [*withheld_uses, *script_tool_uses]
-                script_tool_uses = []
-            # list_saved_tools is principal-only (PRINCIPAL_ONLY_TOOLS).
-            refused_scripts = [tu for tu in script_tool_uses if tu["name"] in principal_withheld]
-            if refused_scripts:
-                withheld_uses = [*withheld_uses, *refused_scripts]
-                script_tool_uses = [tu for tu in script_tool_uses if tu not in refused_scripts]
-            # A private turn is not offered load_mcp_server either (it
-            # reaches any URL), nor any MCP tool through call_tool but those
-            # in PRIVATE_TURN_MCP_TOOLS (Google Workspace reads, and the Gmail
-            # send the gateway narrows to the principal), and the same guard
-            # refuses them.
-            withheld_mcp_uses = [
-                tu for tu in mcp_tool_uses
-                if private_turn and private_turn_withholds(tu["name"], tu["input"])
-            ]
-            withheld_mcp_uses += [
-                tu for tu in mcp_tool_uses
-                if tu["name"] in principal_withheld and tu not in withheld_mcp_uses
-            ]
-            # A turn from another AI app: gateway reads only
-            # (MCP_CLIENT_MCP_TOOLS), never load_mcp_server.
-            withheld_mcp_uses += [
-                tu for tu in mcp_tool_uses
-                if mcp_client
-                and mcp_client_withholds(tu["name"], tu["input"])
-                and tu not in withheld_mcp_uses
-            ]
-            # A shared chat others have written into: no mail send, reply,
-            # forward or draft through the gateway.
-            withheld_mcp_uses += [
-                tu for tu in mcp_tool_uses
-                if others_spoke
-                and shared_chat_withholds(tu["name"], tu["input"])
-                and tu not in withheld_mcp_uses
-            ]
-            if withheld_mcp_uses:
-                mcp_tool_uses = [tu for tu in mcp_tool_uses if tu not in withheld_mcp_uses]
-                withheld_uses = [*withheld_uses, *withheld_mcp_uses]
+            # What the gates notice (they decide nothing): a step the
+            # owner's level then runs or puts on an Approve card
+            # (orchestrator.levels.decide, below).
+            script_ids = {tu["id"] for tu in script_tool_uses}
+
+            def _noticed(tu: dict[str, Any], script_ids: set[str] = script_ids) -> str | None:
+                name, given = tu["name"], tu["input"]
+                is_mcp = name in MCP_TOOL_NAMES
+                is_script = tu["id"] in script_ids
+                if name in unattended_withheld:
+                    return levels.UNATTENDED
+                if unrostered and (is_script or levels.acts(name, given)):
+                    return levels.STRANGER
+                if name in principal_withheld:
+                    return levels.NOT_OWNER
+                if private_turn and (
+                    name in private_withheld or is_script or (is_mcp and private_turn_withholds(name, given))
+                ):
+                    return levels.PRIVATE
+                if mcp_client and (
+                    name in mcp_client_withheld or is_script
+                    or (is_mcp and read_only_withholds(name, given))
+                ):
+                    return levels.READ_ONLY
+                if others_spoke and (name in shared_withheld or (is_mcp and shared_chat_withholds(name, given))):
+                    return levels.SHARED
+                return None
+
+            gate_reasons: dict[str, str] = {
+                tu["id"]: reason
+                for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
+                if (reason := _noticed(tu)) is not None
+            }
             # Act as me: once the turn has read the principal's own mail (in
             # an earlier round, or with a ghostwrite_email, a mailbox read or
             # recall_history in this one — a round's tools run together),
@@ -2545,19 +3096,23 @@ class Executive:
             # but is not locked: it is the person asking again. The offered
             # list stays as it is, so the cached prefix never changes
             # mid-turn.
+            # How much of it holds is the safety level's, like any read: every
+            # mail read is checked once its round is done (check_mail_read
+            # below), and Balanced then holds it all only if one was flagged
+            # or too big to check; a round that reads mail holds it all for
+            # that round, since its reads aren't checked yet; Hands-off holds
+            # none of it (delegation.lockdown.mail_turn_withholds).
             mail_touched_uses: list[dict[str, Any]] = []
-            if pinned_delegation is not None and (
-                pinned_delegation.read_mail
-                or any(tu["name"] in MAILBOX_TOOL_NAMES or tu["name"] in HISTORY_TOOL_NAMES for tu in tool_uses)
-            ):
+            reads_mail_now = any(
+                tu["name"] in MAILBOX_TOOL_NAMES or tu["name"] in _OWN_RECALL_TOOL_NAMES for tu in dispatch_uses
+            )
+            if pinned_delegation is not None and (pinned_delegation.read_mail or reads_mail_now):
                 mail_touched_uses = [
                     tu for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
-                    if mail_touched_withholds(tu["name"], tu["input"])
+                    if mail_turn_withholds(
+                        tu["name"], tu["input"], reading_now=reads_mail_now, pinned=pinned_delegation
+                    )
                 ]
-            if mail_touched_uses:
-                skill_tool_uses = [tu for tu in skill_tool_uses if tu not in mail_touched_uses]
-                mcp_tool_uses = [tu for tu in mcp_tool_uses if tu not in mail_touched_uses]
-                script_tool_uses = [tu for tu in script_tool_uses if tu not in mail_touched_uses]
             # Outside content: once the turn has read anything from outside
             # the team (an earlier round, or a web search in this response),
             # what the Act as me lockdown withholds, contact writes and every
@@ -2566,8 +3121,13 @@ class Executive:
             # round's other such calls too, since a round's tools run
             # together; the reads themselves run, and mark the turn once the
             # round is done. The offered list stays as it is, as above.
+            # Reads queued for their check (an attachment, a synced excerpt)
+            # are checked first, so the owner's safety level can decide
+            # whether they hold this round (outside_content.settle). Under
+            # Hands-off a read in this round holds nothing either.
+            await outside_content.settle()
             read_before_round = outside_content.read_outside()
-            round_sources = [
+            round_sources = [] if outside_content.trusted_turn() else [
                 (tu, source) for tu in dispatch_uses
                 if (source := outside_content.source_of(tu["name"], tu["input"])) is not None
             ]
@@ -2577,12 +3137,33 @@ class Executive:
                 outside_uses = [
                     tu for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
                     if (read_before_round or tu["id"] not in round_source_ids)
-                    and outside_content.outside_withholds(tu["name"], tu["input"])
+                    and outside_content.outside_withholds(
+                        tu["name"], tu["input"], pending=[source for _, source in round_sources]
+                    )
                 ]
-            if outside_uses:
-                skill_tool_uses = [tu for tu in skill_tool_uses if tu not in outside_uses]
-                mcp_tool_uses = [tu for tu in mcp_tool_uses if tu not in outside_uses]
-                script_tool_uses = [tu for tu in script_tool_uses if tu not in outside_uses]
+            # The one check: each step a gate noticed runs or waits on an
+            # Approve card, by the owner's level (orchestrator.levels).
+            stranger = outside_content.answers_off_team_mail()
+            noticed: dict[str, tuple[dict[str, Any], str]] = {
+                tu["id"]: (tu, gate_reasons[tu["id"]])
+                for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
+                if tu["id"] in gate_reasons
+            }
+            mail_why = levels.mail_reason() if mail_touched_uses else levels.OWN_MAIL
+            for tu in mail_touched_uses:
+                noticed.setdefault(tu["id"], (tu, mail_why))
+            for tu in outside_uses:
+                noticed.setdefault(tu["id"], (tu, levels.STRANGER if stranger else levels.outside_reason()))
+            held_uses = [
+                (tu, reason) for tu, reason in noticed.values()
+                if levels.decide(reason, mode=turn_level) == levels.CARD
+                and not levels.only_to_owner(tu["name"], tu["input"])
+            ]
+            held_ids = {tu["id"] for tu, _ in held_uses}
+            if held_ids:
+                skill_tool_uses = [tu for tu in skill_tool_uses if tu["id"] not in held_ids]
+                mcp_tool_uses = [tu for tu in mcp_tool_uses if tu["id"] not in held_ids]
+                script_tool_uses = [tu for tu in script_tool_uses if tu["id"] not in held_ids]
 
             specialist_calls = [
                 {
@@ -2647,7 +3228,21 @@ class Executive:
             # indicator on. Never fatal: a labelling bug must not take the
             # turn down with it.
             try:
-                activity = summarize_activity(tool_uses, iteration=iteration)
+                # The progress call is not what the round is doing.
+                round_work = [
+                    tu for tu in tool_uses
+                    if tu["name"] != turn_progress.SHOW_PROGRESS
+                ]
+                activity = summarize_activity(round_work, iteration=iteration)
+                # What the round read, by kind, for the card when the turn
+                # names nothing itself.
+                reads = turn_reads.add(round_work)
+                if activity is not None and reads:
+                    activity["reads"] = reads
+                if cut_id is not None:
+                    # The step was writing something long, not the call's own
+                    # kind of work (which never ran).
+                    activity = {**(activity or fallback_activity(iteration=iteration)), "label": CUT_OFF_LABEL}
             except Exception:
                 logger.warning(
                     "activity_label_failed iteration=%d", iteration, exc_info=True
@@ -2658,6 +3253,18 @@ class Executive:
             # label it saw captioning this round with the previous round's
             # work; an honest "Working…" beats a stale name.
             yield activity or fallback_activity(iteration=iteration)
+            # A step in their browser only they can do is asked in the chat
+            # they're typing in, with Done and Stop, before it runs
+            # (browser.tools.hand_over_asks).
+            try:
+                from openexecutive.browser import tools as browser_tools
+
+                for ask in browser_tools.hand_over_asks(
+                    tool_uses, getattr(current_session.get(), "session_id", None)
+                ):
+                    yield ask
+            except Exception:
+                logger.warning("hand_over_ask_failed iteration=%d", iteration, exc_info=True)
 
             # Signal that tool calls are in flight so the client can show progress.
             yield self._THINKING
@@ -2666,22 +3273,34 @@ class Executive:
 
             event_cursor = len(debug_collector._events) if debug_collector else 0
             session_id = getattr(current_session.get(), "session_id", None)
-            for tu in mail_touched_uses:
-                # Fail closed, with a trace private to the principal (the
-                # turn's rows already are). A call_tool is named by the tool
-                # it asked for.
+            to_card: dict[tuple[str, bool, str], list[tuple[dict[str, Any], str, dict[str, Any]]]] = {}
+            for tu, reason in held_uses:
+                # Never dropped: the exact step goes on an Approve card for
+                # the owner, or the model is told why it didn't run.
                 kind = "mcp" if tu["name"] in MCP_TOOL_NAMES else "skill"
                 label = tu["name"]
+                held_tool, held_input, held_mcp = tu["name"], tu["input"], False
                 if label == "call_tool" and isinstance(tu["input"], dict):
                     named = tu["input"].get("name")
                     label = named[:200] if isinstance(named, str) and named else label
-                logger.warning(
-                    "%s:%s refused — the turn read the principal's own mail",
-                    kind, _loggable_tool(label),
+                    arguments = tu["input"].get("arguments")
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except (ValueError, RecursionError):
+                            arguments = None
+                    if isinstance(named, str) and named and isinstance(arguments, dict | None):
+                        held_tool, held_input, held_mcp = named, dict(arguments or {}), True
+                can_card = (
+                    tu["id"] not in script_ids
+                    and (held_mcp or tu["name"] not in MCP_TOOL_NAMES)
+                    and isinstance(held_input, dict)
+                    and levels.carriable(held_tool, mcp=held_mcp)
                 )
+                logger.info("%s:%s held for approval (%s)", kind, _loggable_tool(label), reason)
                 audit_log(
                     "tool_invocation",
-                    f"{kind}:{label} refused: the turn read the principal's own mail",
+                    f"{kind}:{label} waiting for approval: {reason}",
                     session_id=session_id,
                     turn_id=turn_id,
                     actor="executive",
@@ -2690,152 +3309,36 @@ class Executive:
                         "kind": kind,
                         "iteration": iteration,
                         "ok": False,
-                        "refused": "mail_touched",
-                    },
-                    private=True,
-                )
-                results_by_id[tu["id"]] = mail_touched_withheld_error(label)
-            for tu in outside_uses:
-                kind = "mcp" if tu["name"] in MCP_TOOL_NAMES else "skill"
-                label = tu["name"]
-                if label == "call_tool" and isinstance(tu["input"], dict):
-                    named = tu["input"].get("name")
-                    label = named[:200] if isinstance(named, str) and named else label
-                logger.warning(
-                    "%s:%s refused — the turn read outside content",
-                    kind, _loggable_tool(label),
-                )
-                audit_log(
-                    "tool_invocation",
-                    f"{kind}:{label} refused: the turn read content from outside the team",
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    actor="executive",
-                    details={
-                        "tool": label,
-                        "kind": kind,
-                        "iteration": iteration,
-                        "ok": False,
-                        "refused": "outside_content",
+                        "held": reason,
+                        "card": can_card,
                         "sources": sorted(getattr(outside_content.current(), "sources", ())),
                     },
                     private=private_turn or bool(
                         pinned_delegation is not None and pinned_delegation.touched_mail
-                    ),
+                    ) or reason in (levels.OWN_MAIL, levels.MAIL_FLAGGED, levels.PRIVATE),
                 )
-                results_by_id[tu["id"]] = outside_content.outside_withheld_error(label)
+                if not can_card:
+                    results_by_id[tu["id"]] = levels.not_carriable_error(label, reason)
+                    continue
+                to_card.setdefault((held_tool, held_mcp, reason), []).append((tu, label, held_input))
+            # Steps of one kind held together (fourteen renames in a round)
+            # go on one card, so one Approve does them all.
+            for (held_tool, held_mcp, reason), group in to_card.items():
+                held_result = await asyncio.to_thread(
+                    levels.hold, held_tool, group[0][2],
+                    mcp=held_mcp, reason=reason, session=current_session.get(),
+                ) if len(group) == 1 else await asyncio.to_thread(
+                    levels.hold_many, held_tool, [held_input for _, _, held_input in group],
+                    mcp=held_mcp, reason=reason, session=current_session.get(),
+                )
+                for tu, _, _ in group:
+                    results_by_id[tu["id"]] = held_result
+                # The card shows under this reply (the web chat) and goes to
+                # the chat app the turn came from (Executive.chat's cards).
+                held_chip = levels.waiting_chip(held_result, label=group[0][1], iteration=iteration)
+                if held_chip is not None:
+                    yield held_chip
             for tu in withheld_uses:
-                if mcp_client and mcp_client_withholds(tu["name"], tu["input"]):
-                    # Fail closed: never run, and leave a trace. A call_tool
-                    # is named by the tool it asked for.
-                    kind = "mcp" if tu["name"] in MCP_TOOL_NAMES else "skill"
-                    label = tu["name"]
-                    if label == "call_tool" and isinstance(tu["input"], dict):
-                        named = tu["input"].get("name")
-                        label = named[:200] if isinstance(named, str) and named else label
-                    logger.warning(
-                        "%s:%s refused — the turn comes from an MCP client",
-                        kind, _loggable_tool(label),
-                    )
-                    audit_log(
-                        "tool_invocation",
-                        f"{kind}:{label} refused: the turn comes from another AI app",
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        actor="executive",
-                        details={
-                            "tool": label,
-                            "kind": kind,
-                            "iteration": iteration,
-                            "ok": False,
-                            "refused": "mcp_client",
-                        },
-                        private=private_turn,
-                    )
-                    results_by_id[tu["id"]] = mcp_client_withheld_error(label)
-                    continue
-                if private_turn and private_turn_withholds(tu["name"], tu["input"]):
-                    # Fail closed: never run, and leave a trace — private to
-                    # the principal like every row this turn writes. A
-                    # call_tool is named by the tool it asked for.
-                    kind = "mcp" if tu["name"] in MCP_TOOL_NAMES else "skill"
-                    label = tu["name"]
-                    if label == "call_tool" and isinstance(tu["input"], dict):
-                        named = tu["input"].get("name")
-                        label = named[:200] if isinstance(named, str) and named else label
-                    logger.warning(
-                        "%s:%s refused — the turn is private to the principal",
-                        kind, _loggable_tool(label),
-                    )
-                    audit_log(
-                        "tool_invocation",
-                        f"{kind}:{label} refused: the turn is private to the principal",
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        actor="executive",
-                        details={
-                            "tool": label,
-                            "kind": kind,
-                            "iteration": iteration,
-                            "ok": False,
-                            "refused": "private_turn",
-                        },
-                        private=True,
-                    )
-                    results_by_id[tu["id"]] = private_turn_withheld_error(label)
-                    continue
-                if others_spoke and shared_chat_withholds(tu["name"], tu["input"]):
-                    kind = "mcp" if tu["name"] in MCP_TOOL_NAMES else "skill"
-                    label = tu["name"]
-                    if label == "call_tool" and isinstance(tu["input"], dict):
-                        named = tu["input"].get("name")
-                        label = named[:200] if isinstance(named, str) and named else label
-                    logger.warning(
-                        "%s:%s refused — others wrote in this shared chat since its owner",
-                        kind, _loggable_tool(label),
-                    )
-                    audit_log(
-                        "tool_invocation",
-                        f"{kind}:{label} refused: others wrote in this shared chat since its owner",
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        actor="executive",
-                        details={
-                            "tool": label,
-                            "kind": kind,
-                            "iteration": iteration,
-                            "ok": False,
-                            "refused": "shared_chat",
-                        },
-                        private=private_turn,
-                    )
-                    results_by_id[tu["id"]] = shared_chat_withheld_error(label)
-                    continue
-                if tu["name"] in unattended_withheld:
-                    logger.warning("skill:%s refused — not offered in an unattended run", tu["name"])
-                    results_by_id[tu["id"]] = unattended_withheld_error(tu["name"])
-                    continue
-                if tu["name"] in principal_withheld:
-                    logger.warning(
-                        "%s refused — offered only while the principal is speaking", tu["name"]
-                    )
-                    audit_log(
-                        "tool_invocation",
-                        f"{tu['name']} refused: the principal is not speaking on this turn",
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        actor="executive",
-                        details={
-                            "tool": tu["name"],
-                            "kind": "mcp" if tu["name"] in MCP_TOOL_NAMES else "skill",
-                            "iteration": iteration,
-                            "ok": False,
-                            "refused": "not_principal",
-                        },
-                        private=private_turn,
-                    )
-                    results_by_id[tu["id"]] = principal_only_withheld_error(tu["name"])
-                    continue
                 logger.warning(
                     "skill:%s refused — not offered in %s mode", tu["name"], workspace_mode
                 )
@@ -2937,10 +3440,25 @@ class Executive:
                     logger.info("→ skill:%s  input=%s", tu["name"], _log_value(tu["name"], tu["input"]))
                 # return_exceptions=True: one crashing handler must not abort
                 # the whole turn. See `_tool_error_result`.
-                skill_results = await asyncio.gather(
-                    *(turn_handlers[tu["name"]](tu["input"]) for tu in skill_tool_uses),
-                    return_exceptions=True,
-                )
+                # What a running tool says meanwhile (a workflow's steps)
+                # streams as it happens (orchestrator.turn_live).
+                # Bound only while the task is made (it copies the context),
+                # never across a yield.
+                feed = turn_live.Feed()
+                with feed.bound():
+                    skill_task = asyncio.ensure_future(asyncio.gather(
+                        *(
+                            with_turn_limits(reading_budget.limits, turn_handlers[tu["name"]](tu["input"]))
+                            for tu in skill_tool_uses
+                        ),
+                        return_exceptions=True,
+                    ))
+                # Closed here, so a turn that stops at a yield cancels the
+                # tools at once, not when the generator is collected.
+                async with contextlib.aclosing(feed.until(skill_task)) as live_events:
+                    async for live in live_events:
+                        yield live
+                skill_results = skill_task.result()
                 # `raw` rather than `result` so the narrowed value keeps the
                 # plain `str` type the rest of this function's loops use.
                 for tu, raw in zip(skill_tool_uses, skill_results, strict=True):
@@ -2971,9 +3489,9 @@ class Executive:
                             },
                             # Act as me reads the speaker's own mailbox; the
                             # fact tools carry the principal's own words.
-                            private=_private_tool_row(tu["name"])
+                            private=_private_tool_row(tu["name"], tu["input"])
                             or tu["name"] in DRAFT_ARTIFACT_TOOL_HANDLERS,
-                            private_to_person=_artifact_row_owner(tu["name"]),
+                            private_to_person=_artifact_row_owner(tu["name"], tu["input"]),
                         )
                         # Hand the model an error tool_result and move on. No
                         # chip: summarize_action must never see an exception.
@@ -3032,25 +3550,24 @@ class Executive:
                         },
                         # A document tool quotes the speaker's own
                         # documents: the row is theirs alone.
-                        private=_private_tool_row(tu["name"])
+                        private=_private_tool_row(tu["name"], tu["input"], result)
                         or tu["name"] in DRAFT_ARTIFACT_TOOL_HANDLERS,
-                        private_to_person=_artifact_row_owner(tu["name"]),
+                        private_to_person=_artifact_row_owner(tu["name"], tu["input"], result),
                     )
 
             if mcp_tool_uses and self._mcp_gateway is not None:
                 # A teammate's mail with the Executive stays theirs: every
                 # mailbox read the model makes is filtered (teammate_mail).
-                guarded_call_tool = guard_call_tool(
+                guarded_call_tool = typed_booking_only(booking_offered, guard_call_tool(
                     take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                     if leading
-                    else department_gate.gated_call_tool(
-                        self._mcp_gateway.call_tool, seat, session_id=seat_session_id,
-                    )
-                    if seat is not None
+                    else take_the_lead.asked_call_tool(self._mcp_gateway.call_tool)
+                    if asked_checks
                     else self._mcp_gateway.call_tool
-                )
+                ))
                 _mcp_dispatch = {
-                    "search_tools": self._mcp_gateway.search_tools,
+                    # An empty search names the groups open_tools opens.
+                    "search_tools": tool_groups.searching(self._mcp_gateway.search_tools, deferred_tools),
                     # A replay (memory.replay) makes the reads and records the rest.
                     "call_tool": (
                         chat_replay.faked_call_tool(guarded_call_tool, current_session.get())
@@ -3124,12 +3641,6 @@ class Executive:
                         results_by_id[tu["id"]] = _tool_error_result(tool_label, raw)
                         continue
                     result = raw
-                    if private_turn and tu["name"] == "search_tools":
-                        # Offer a private turn PRIVATE_TURN_MCP_TOOLS only.
-                        result = filter_search_results(result, private_turn_allows_mcp_tool)
-                    if mcp_client and tu["name"] == "search_tools":
-                        # And a turn from another AI app MCP_CLIENT_MCP_TOOLS.
-                        result = filter_search_results(result, mcp_client_allows_mcp_tool)
                     logger.info("← %s  result=%s", tool_label, _log_value(tool_label, result))
                     results_by_id[tu["id"]] = result
                     # MCP chip emission. search_tools is read-only (gets
@@ -3167,15 +3678,13 @@ class Executive:
                 # matters: the gateway's own gates (discovery, deny-list,
                 # recipients), Take the lead's gate on an unattended run, and
                 # the same chip and audit row, as each call happens.
-                script_call = guard_call_tool(
+                script_call = typed_booking_only(booking_offered, guard_call_tool(
                     take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                     if leading
-                    else department_gate.gated_call_tool(
-                        self._mcp_gateway.call_tool, seat, session_id=seat_session_id,
-                    )
-                    if seat is not None
+                    else take_the_lead.asked_call_tool(self._mcp_gateway.call_tool)
+                    if asked_checks
                     else self._mcp_gateway.call_tool
-                )
+                ))
                 # The Executive's own tools a script may call this turn: the
                 # fixed list, less any this turn is not offered. Each runs
                 # through the turn's handler (Take the lead's gate included).
@@ -3186,12 +3695,17 @@ class Executive:
                 # (call_tool input, result text, the exception if the call
                 # raised); an own tool's input is {"name", "arguments", "own": True}.
                 made: list[tuple[dict[str, Any], str, BaseException | None]] = []
+                # The safety check's notices on the script's reads: shown to
+                # the model above the script's result, never put into the
+                # text the script parses.
+                notices: list[str] = []
 
                 async def _script_call(
                     tool: str,
                     arguments: dict[str, Any],
                     _call: Any = script_call,
                     _made: list[tuple[dict[str, Any], str, BaseException | None]] = made,
+                    _notices: list[str] = notices,
                     _own: frozenset[str] = script_own,
                     _handlers: dict[str, Any] = turn_handlers,
                     _counts: dict[str, int] = script_counts,
@@ -3205,7 +3719,11 @@ class Executive:
                         call_input["own"] = True
                     # Budgets for the whole turn: a direct call needs a
                     # tool_use each, a script could otherwise make thousands.
-                    cap = step_script.CHAT_OWN_TOOL_CAPS.get(tool) if own else None
+                    cap = (
+                        step_script.CHAT_OWN_TOOL_CAPS.get(tool)
+                        if own and not principal_speaking(current_session.get())
+                        else None
+                    )
                     if _counts.get("", 0) >= self._settings.chat_script_max_calls or (
                         cap is not None and _counts.get(tool, 0) >= cap
                     ):
@@ -3225,14 +3743,41 @@ class Executive:
                     probe_name, probe_input = (
                         (tool, arguments) if own else ("call_tool", {"name": tool, "arguments": arguments})
                     )
+                    await outside_content.settle()
+                    # A script's call is checked as a direct one would be:
+                    # what a gate notices runs or waits on an Approve card,
+                    # by the owner's level (orchestrator.levels).
+                    script_reason: str | None = None
                     if outside_content.read_outside() and outside_content.outside_withholds(
                         probe_name, probe_input
                     ):
-                        return outside_content.outside_withheld_error(tool[:200]), True
+                        script_reason = (
+                            levels.STRANGER if outside_content.answers_off_team_mail() else levels.outside_reason()
+                        )
+                    elif pinned_delegation is not None and mail_turn_withholds(
+                        probe_name, probe_input, pinned=pinned_delegation
+                    ):
+                        script_reason = levels.mail_reason()
+                    if (
+                        script_reason is not None
+                        and levels.decide(script_reason, mode=turn_level) == levels.CARD
+                        and not levels.only_to_owner(probe_name, probe_input)
+                    ):
+                        if isinstance(arguments, dict) and levels.carriable(tool, mcp=not own):
+                            held = await asyncio.to_thread(
+                                levels.hold, tool, dict(arguments), mcp=not own,
+                                reason=script_reason, session=current_session.get(),
+                            )
+                            return held, False
+                        return levels.not_carriable_error(tool[:200], script_reason), True
+                    if not own:
+                        await outside_content.vet_reads(
+                            [{"name": probe_name, "input": probe_input}], self._mcp_gateway
+                        )
                     source = outside_content.source_of(probe_name, probe_input)
                     try:
                         if own:
-                            text = str(await _handlers[tool](arguments))
+                            text = str(await with_turn_limits(reading_budget.limits, _handlers[tool](arguments)))
                         else:
                             text = str(await _call({"name": tool, "arguments": arguments}))
                     except asyncio.CancelledError:
@@ -3261,10 +3806,16 @@ class Executive:
                         text = _tool_error_result(tool, exc)
                         _made.append((call_input, text, exc))
                         if source is not None:
-                            outside_content.mark(source)
+                            # The error can carry what the tool read: checked
+                            # like any read.
+                            notice = await outside_content.mark_read(source, probe_input, text, self._mcp_gateway)
+                            if notice:
+                                _notices.append(notice)
                         return text, True
                     if source is not None:
-                        outside_content.mark(source)
+                        notice = await outside_content.mark_read(source, probe_input, text, self._mcp_gateway)
+                        if notice:
+                            _notices.append(notice)
                     _made.append((call_input, text, None))
                     return text, looks_like_error(text)
 
@@ -3286,6 +3837,7 @@ class Executive:
                     script_result = json.dumps({"error": "the script did not finish"})
                     script_failed = True
                     script_stats: dict[str, Any] = {}
+                    notices.clear()
                     # aclosing: a stopped turn closes the script, and with it
                     # the Monty worker, instead of leaving it to the GC.
                     async with contextlib.aclosing(
@@ -3294,12 +3846,12 @@ class Executive:
                             tools=None,
                             call=_script_call,
                             origin="chat",
-                            # Saving only while the principal speaks on a
-                            # verified, interactive surface: a saved tool
-                            # runs on whoever's turn calls it later.
+                            # Saving and running while someone on the team
+                            # (the principal or a teammate) speaks on a
+                            # verified, interactive surface: each call a
+                            # saved tool makes is checked on the turn that
+                            # runs it, by that turn's level.
                             may_save=not principal_withheld and not unattended_withheld,
-                            # Running one too: someone else's turn would run
-                            # the principal's recipe with inputs they chose.
                             may_run_saved=not principal_withheld and not unattended_withheld,
                             wall_clock_s=script_clock,
                             own_tools=script_own,
@@ -3407,7 +3959,8 @@ class Executive:
                             elif kind == "done":
                                 script_result, script_failed = payload
                     logger.info("← run_script  result=%s", _trunc(script_result))
-                    results_by_id[tu["id"]] = script_result
+                    read_notices[tu["id"]] = "".join(dict.fromkeys(notices))
+                    results_by_id[tu["id"]] = read_notices[tu["id"]] + script_result
                     # Agent Activity: the built tool as one card, with the
                     # calls it made (the result lists them, capped). Sent by
                     # the round's event replay below, like specialist events.
@@ -3463,11 +4016,63 @@ class Executive:
                 for evt in debug_collector._events[event_cursor:]:
                     yield debug_collector.to_sse_dict(evt)
 
+            # A picture a tool held (the browser's screenshot) comes off its
+            # answer first. The model sees it only when it can see images and
+            # the check below can read it too (text in a picture is outside
+            # content like any other); otherwise it gets the text alone.
+            images_by_id: dict[str, dict[str, Any]] = {}
+            for tu in tool_uses:
+                bare, image = tool_images.take(results_by_id.get(tu["id"]))
+                if image is not None:
+                    results_by_id[tu["id"]] = bare
+                    images_by_id[tu["id"]] = image
+            sees = bool(images_by_id) and sees_images(stream_model) and sees_images(content_scan.scan_model())
             # What this round read from outside reaches the model with its
             # results: from the next round on the turn is held.
-            for tu, source in round_sources:
-                if tu not in outside_uses and tu not in mail_touched_uses and tu not in withheld_uses:
-                    outside_content.mark(source)
+            # The check sees each read's result first (orchestrator.content_scan):
+            # a flagged one reaches the model behind a notice not to follow it.
+            for tu, source in [
+                (tu, source) for tu in dispatch_uses
+                if (source := outside_content.source_of(tu["name"], tu["input"])) is not None
+            ]:
+                if tu["id"] not in held_ids and tu not in withheld_uses:
+                    notice = await outside_content.mark_read(
+                        source,
+                        tu["input"],
+                        tool_images.content(
+                            results_by_id.get(tu["id"], ""), images_by_id.get(tu["id"]), sees=sees
+                        ),
+                        self._mcp_gateway,
+                    )
+                    if notice:
+                        results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+                        read_notices[tu["id"]] = notice
+            # The owner's own mail this round read is checked the same way,
+            # and decides how much of the Act as me lockdown holds from the
+            # next round on (delegation.lockdown.mail_lock_holds).
+            if pinned_delegation is not None and reads_mail_now:
+                for tu in dispatch_uses:
+                    if tu["name"] not in MAILBOX_TOOL_NAMES and tu["name"] not in _OWN_RECALL_TOOL_NAMES:
+                        continue
+                    if tu["id"] not in results_by_id:
+                        continue  # never ran (not offered): no mail was read
+                    checked, notice = await outside_content.check_mail_read(
+                        pinned_delegation, results_by_id.get(tu["id"], "")
+                    )
+                    results_by_id[tu["id"]] = checked
+                    if notice:
+                        results_by_id[tu["id"]] = _with_notice(results_by_id.get(tu["id"], ""), notice)
+                        # Before the content check's notice, as _with_notice
+                        # put them, so every later part carries both.
+                        read_notices[tu["id"]] = notice + read_notices.get(tu["id"], "")
+                # A script that ran beside the read may have read mail the
+                # loop never checks: the turn stays unvetted.
+                ran_script = any(
+                    tu["name"] in (step_script.RUN_SCRIPT_TOOL, "run_python_job")
+                    for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
+                )
+                if not ran_script:
+                    outside_content.check_mail_reads_done(pinned_delegation)
 
             current_messages.append({"role": "assistant", "content": response_content})
             # Cap here, at the single point every result reaches the model,
@@ -3478,14 +4083,33 @@ class Executive:
             tool_results: list[dict[str, Any]] = []
             for tu in tool_uses:
                 turn_calls.append((tu["name"], str(results_by_id.get(tu["id"], ""))))
+                claim_calls.append(
+                    (claim_check.call_label(tu["name"], tu["input"]), str(results_by_id.get(tu["id"], "")))
+                )
+            # A call that may have changed something drops the parts held
+            # from before it (orchestrator.reading).
+            reading_budget.ran(tool_uses)
             for tu in tool_uses:
                 content = reading_budget.cap(
                     tu["name"],
                     tu["input"],
-                    results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}"),
+                    app_links.for_model(results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}")),
                     tu["id"],
+                    read_notices.get(tu["id"], ""),
                 )
+                content = tool_images.content(content, images_by_id.get(tu["id"]), sees=sees)
                 tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": content})
+            tool_results.extend(cut_results)
+            # Cut in text written after a call that closed: the call ran, and the
+            # next round carries the text on where it stopped.
+            if cut_off and last_written is not None and last_written.get("type") == "text":
+                tool_results.append({"type": "text", "text": CUT_OFF_NOTE})
+                run_on = True
+                # The claim check reads the cut text with the round that ends it.
+                last_call = max(n for n, blk in enumerate(response_content) if blk.get("type") == "tool_use")
+                cut_text = "".join(
+                    str(blk.get("text", "")) for blk in response_content[last_call + 1:] if blk.get("type") == "text"
+                )
             # Messages the person sent since the last round ride in this
             # round's user message, after the tool results (which must come
             # first). Only this loop's own, newest message changes, so the
@@ -3509,18 +4133,45 @@ class Executive:
                 # Audited by the inbox's owner (the web chat route), under
                 # the same privacy as the turn's own message.
                 yield {"type": "message_added", "ids": [m.id for m in added]}
+            if inbox is not None and inbox.take_hand_over():
+                tool_results.append({"type": "text", "text": HAND_OVER_NOTE})
+                handing_over = True
+                yield {"type": "handing_over"}
+            for tu in tool_uses:
+                reading_budget.came_back(tu["name"], tu["input"], results_by_id.get(tu["id"], ""))
+            if not handing_over and reading_budget.repeating:
+                logger.warning("round %d: a call came back the same %d times; writing up", iteration, REPEAT_LIMIT)
+                tool_results.append({"type": "text", "text": REPEATING_NOTE})
+                repeating = True
+            elif not handing_over and not repeating and reading_budget.full:
+                logger.info("round %d: the turn has read all its model holds; writing up", iteration)
+                tool_results.append({"type": "text", "text": FULL_NOTE})
+                repeating = True
+                write_up_empty = FULL_EMPTY_REPLY
+            elif not handing_over and not repeating and iteration >= MAX_STEPS:
+                logger.info("round %d: the turn has run its %d steps; writing up", iteration, MAX_STEPS)
+                tool_results.append({"type": "text", "text": STEPS_NOTE})
+                repeating = True
+                write_up_empty = STEPS_EMPTY_REPLY
+            if sees:
+                # Only the newest screenshots ride along: older ones would be
+                # sent again every round.
+                tool_images.drop_older(current_messages)
+            if not tool_results:
+                logger.warning(
+                    "round %d ended on %s with no tool call to answer; blocks=%s",
+                    iteration, final_msg.stop_reason, [b.get("type") for b in response_content],
+                )
+                tool_results.append({"type": "text", "text": EMPTY_ROUND_NOTE})
             current_messages.append({"role": "user", "content": tool_results})
             # Bounded to the messages this loop appended: current_messages
             # is a shallow copy, so anything at a lower index is still owned
             # by the caller and must not be mutated.
-            if self._settings.enable_caching and _apply_loop_cache_marker(
+            if self._settings.enable_caching and apply_loop_cache_marker(
                 current_messages, caller_message_count
             ):
                 _clear_turn_marker(turn_marked)
                 turn_marked = None
-
-        logger.warning("max_iterations=%d reached — returning partial result", max_iterations)
-        yield last_full_text or "I was unable to complete the analysis. Please try again."
 
     async def chat(
         self,
@@ -3528,7 +4179,6 @@ class Executive:
         session: Session,
         retrieved_context: str = "",
         episodic_context: str = "",
-        max_iterations: int = 15,
         committee_review: bool = False,
         debug_collector: DebugCollector | None = None,
         attachment_blocks: list[dict[str, Any]] | None = None,
@@ -3540,8 +4190,21 @@ class Executive:
         channel_context_block: str = "",
         memory_text: str | None = None,
         standing_facts: str | None = None,
+        cards: list[int] | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         """Non-streaming chat — collects and returns the full response.
+        A turn the model refused ends on ``REFUSED_REPLY``.
+
+        ``on_progress``, when given, sees each ``activity`` and ``progress``
+        event as the turn runs (what the web chat's progress card shows),
+        for a caller with its own way of showing it, such as the steps on a
+        reply card while its work runs (``delegation.card_work``).
+
+        ``cards``, when given, collects the ids of the approval cards the
+        reply left (the ``decision_id`` on its ``action_taken`` events, as the
+        web chat shows under the reply), for a chat app that shows them
+        (``integrations.channel_cards``).
 
         When ``committee_review=True`` the call routes through
         ``stream_chat_with_committee`` so the answer is the revised
@@ -3571,7 +4234,6 @@ class Executive:
             "retrieved_context": retrieved_context,
             "episodic_context": episodic_context,
             "debug_collector": debug_collector,
-            "max_iterations": max_iterations,
             "attachment_blocks": attachment_blocks,
             "person_id": person_id,
             "co_present_person_ids": co_present_person_ids,
@@ -3585,13 +4247,59 @@ class Executive:
             common_kwargs["peer_memory_context"] = peer_memory_context
         if standing_facts is not None:
             common_kwargs["standing_facts"] = standing_facts
+        # A chat app turn from the person's own account: messages to them go
+        # here next, unless they picked a channel (people.reach).
+        if session.origin_channel:
+            from openexecutive.people.reach import note_talked
+
+            await asyncio.to_thread(note_talked, session)
+        # The files a chat app read for this message (turn_files.offer): bound
+        # for the turn and kept for the conversation, as a web upload is.
+        offered = turn_files.take_offered()
+        if offered:
+            from openexecutive.orchestrator import conversation_files
+
+            await asyncio.to_thread(conversation_files.keep, session.session_id, offered)
         stream = (
             self.stream_chat_with_committee(**common_kwargs)
             if committee_review
             else self.stream_chat(**common_kwargs)
         )
         result = ""
-        async for chunk in stream:
-            if isinstance(chunk, str) and chunk != self._THINKING:
-                result += chunk
-        return result
+        rewritten = False
+        refused: list[int] = []
+        refusing = _REFUSED.set(refused)
+        try:
+            with turn_files.bind(offered or None) if offered else contextlib.nullcontext():
+                async for chunk in stream:
+                    if isinstance(chunk, str) and chunk != self._THINKING:
+                        result += chunk
+                    elif isinstance(chunk, dict) and chunk.get("type") == "rewrite":
+                        # The next round writes the reply again.
+                        result, rewritten = "", True
+                    elif isinstance(chunk, dict) and chunk.get("type") in ("activity", "progress"):
+                        if on_progress is not None:
+                            on_progress(chunk)
+                    elif cards is not None and isinstance(chunk, dict) and chunk.get("type") == "action_taken":
+                        decision_id = chunk.get("decision_id")
+                        if isinstance(decision_id, int) and not isinstance(decision_id, bool) and decision_id not in cards:
+                            cards.append(decision_id)
+        finally:
+            _REFUSED.reset(refusing)
+        if rewritten:
+            # A retry that wrote nothing streams the first reply again
+            # (_kept_if_unwritten).
+            result = result.lstrip()
+        if refused:
+            # Nothing the refused round began ("You're") is sent. What the
+            # earlier rounds said stays (what their tools did), then a plain
+            # refusal.
+            result = _with_refusal(result, refused[-1])
+        # A card named by its number ("card 220") tells the reader nothing:
+        # name it by its headline, linked to it on Home (alerts.card_refs).
+        # Private cards only when the principal reads it alone.
+        from openexecutive.alerts.card_refs import name_cards_in_reply
+
+        return await asyncio.to_thread(
+            name_cards_in_reply, result, session, person_id, co_present_person_ids,
+        )

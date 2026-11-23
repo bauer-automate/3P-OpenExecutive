@@ -23,17 +23,23 @@ Design notes
   gets per-person answers by the web app's rules: a signed-in email is that
   person (no one when off the roster); open mode with no ``x-caller-email``,
   or an operator, is the principal; a service (signed callers on, no
-  assertion) is no one. The principal's own records (episodic memory, the
-  activity feed) go to the principal alone; the briefing and roster to a
-  rostered caller, the briefing narrowed as ``GET /today`` narrows it; the
+  assertion) is no one. Episodic memory, the activity feed, the briefing and
+  the roster go to a rostered caller, as the web app gives them to anyone on
+  the team, the briefing narrowed as ``GET /today`` narrows it, and so do
+  the watches, which name the companies and people being watched; Needs
+  you, Done for you, tasks and Approvals are read through the web app's
+  own routes with the same request, so they follow its rules exactly; the
   company profile, departments, specialists, knowledge and the workflow
-  catalog to anyone who reached ``/mcp``.
+  catalog go to anyone who reached ``/mcp``.
 
-* **ask_executive never acts.** Its turn is marked
-  ``Session.from_mcp_client``: the chat loop offers and runs no tool that
-  sends, posts, books, schedules, runs or changes stored state
-  (``schedule_tools.MCP_CLIENT_WITHHELD_TOOLS``), no Act as me or extension
-  tool, and of the gateway tools only reads (``MCP_CLIENT_MCP_TOOLS``).
+* **An AI app is the person signed in to it.** ``ask_executive``,
+  ``run_workflow`` and ``answer_card`` each run one Executive turn marked
+  ``Session.from_mcp_client`` for the verified caller, the same turn the web
+  chat runs: Approvals, then Your rules, then In training decide each step
+  (``orchestrator.levels``), and nothing else does. Every audit row and card
+  the turn writes names the app (``audit.via_app``). A caller that is no one
+  (a service) is someone not in People, so everything it asks to send or
+  change waits on the owner's card.
 
 * **DNS-rebinding protection** (FastMCP's Host-header check) is disabled: the
   endpoint authenticates with a header secret (not a cookie), so a browser
@@ -53,6 +59,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -76,19 +83,23 @@ SpecialistKey = Literal[
 ]
 
 _INSTRUCTIONS = (
-    "Open Executive as an MCP server: a company's executive context and a "
-    "council of specialist analysts, answered as the person signed in.\n\n"
-    "Resources (read-only): the company profile, today's briefing and recent "
-    "activity, the people roster, department state, and episodic memory (past "
-    "decisions, initiatives, advice). Recent activity and episodic memory are "
-    "the owner's alone; the briefing and roster need someone on the roster.\n\n"
-    "Tools: `consult_specialist` (domain analysis from one specialist, grounded "
-    "in company knowledge), `search_knowledge` (retrieval over the curated "
-    "business knowledge base and company documents), `list_workflows` (the "
-    "catalog of multi-step executive workflows), and `ask_executive` (one "
-    "synthesized answer from the Executive). None of them sends, posts, books "
-    "or changes anything."
+    "Open Executive: a company's Executive and its council of specialists, "
+    "answering as the person signed in.\n\n"
+    "Read: the company profile, today's brief, Needs you (the cards waiting "
+    "on this person), Done for you, tasks, watches, departments, people, "
+    "Approvals (what it may do on its own), and past decisions, initiatives "
+    "and advice.\n\n"
+    "Do: `ask_executive` (one answer from the Executive, who can also act), "
+    "`answer_card` (Approve, Skip or reply to a Needs you card), "
+    "`run_workflow` (start a workflow from `list_workflows`), "
+    "`consult_specialist` (one specialist's analysis) and `search_knowledge` "
+    "(the knowledge base and company documents).\n\n"
+    "This app acts as the person, under their Approvals: anything that "
+    "reaches someone else goes on its own or waits on a card for them, as it "
+    "would in Open Executive."
 )
+
+_CLIENT_NAME_MAX = 60
 
 mcp = FastMCP(
     name="open-executive",
@@ -126,7 +137,6 @@ def _json(payload: Any) -> str:
 # ---------------------------------------------------------------------------
 # Who is asking.
 # ---------------------------------------------------------------------------
-OWNER_ONLY = "Only the owner can read this."
 ROSTER_ONLY = "Only someone on the team can read this."
 
 
@@ -173,6 +183,23 @@ def _who() -> api_caller.Caller:
     return api_caller.caller(request)
 
 
+def client_name() -> str:
+    """The MCP client's own name (``clientInfo.name`` from its initialize),
+    as one plain line, or "an AI app" when it gave none (a stateless request
+    has no initialize of its own)."""
+    from openexecutive.utils.prompt_blocks import plain
+
+    name = ""
+    try:
+        params = mcp.get_context().session.client_params
+        info = getattr(params, "clientInfo", None)
+        name = str(getattr(info, "name", "") or "")
+    except Exception:
+        name = ""
+    cleaned = " ".join(plain(name).split())[:_CLIENT_NAME_MAX].strip()
+    return cleaned or "an AI app"
+
+
 def _resolve(who: api_caller.Caller) -> McpCaller:
     """``who`` on the roster, by ``api.caller.person_id_for``. Fails closed:
     a roster that can't be read makes them no principal."""
@@ -195,13 +222,6 @@ async def current_caller() -> McpCaller:
     return await asyncio.to_thread(_resolve, who)
 
 
-async def _require_principal() -> McpCaller:
-    resolved = await current_caller()
-    if not resolved.is_principal:
-        raise CallerRefused(OWNER_ONLY)
-    return resolved
-
-
 async def _require_person() -> McpCaller:
     """The principal, or someone on the roster; a service or an unrostered
     caller names no one, so reads nothing about the people here."""
@@ -215,10 +235,34 @@ async def _require_person() -> McpCaller:
 # Resources — company-grounded context. Read-only, no LLM calls. The unique
 # thing OE has that a generic agent does not.
 # ---------------------------------------------------------------------------
+def _http_request() -> Any:
+    """The HTTP request of the MCP call in progress, for reading through the
+    web app's own routes with the caller it verified. None outside one."""
+    request = _request()
+    return None if request is _NO_MCP_REQUEST else request
+
+
+async def _through_route(route: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call one of the web app's own GET routes with this MCP request, so the
+    answer follows that route's rules for the caller. A refusal comes back as
+    the route's own words."""
+    from fastapi import HTTPException
+
+    request = _http_request()
+    if request is None:
+        raise CallerRefused(ROSTER_ONLY)
+    try:
+        if inspect.iscoroutinefunction(route):
+            return await route(request, *args, **kwargs)
+        return await asyncio.to_thread(route, request, *args, **kwargs)
+    except HTTPException as exc:
+        raise CallerRefused(exc.detail if isinstance(exc.detail, str) else ROSTER_ONLY) from exc
+
+
 @mcp.resource(
     "oe://company/profile",
     name="Company profile",
-    description="Structured company profile rendered as a prompt block.",
+    description="What the company is: the profile Open Executive works from.",
     mime_type="text/markdown",
 )
 async def company_profile() -> str:
@@ -230,140 +274,271 @@ async def company_profile() -> str:
     return profile.to_prompt_block()
 
 
+async def _today_for(who: McpCaller) -> Any:
+    """Home's snapshot for ``who``, as ``GET /today`` builds it: the
+    principal's private rows for the principal alone, a drafted artifact's
+    card for its owner."""
+    from openexecutive.api.routes.today import _build_today
+    from openexecutive.orchestrator.artifact_records import viewer_for_person
+
+    viewer = await asyncio.to_thread(viewer_for_person, who.person_id)
+    today = await asyncio.to_thread(_build_today, include_private=who.is_principal, viewer=viewer)
+    today.caller_person_id = who.person_id
+    return today
+
+
 @mcp.resource(
     "oe://today/briefing",
-    name="Today briefing",
+    name="Today's brief",
     description=(
-        "The morning-brief snapshot: department health, roster, proposals. "
-        "For someone on the roster, as the web app shows it to them."
+        "Home for the person signed in: departments and their Approvals "
+        "levels, people, and the cards waiting on them."
     ),
     mime_type="application/json",
 )
 async def today_briefing() -> str:
-    """As ``GET /today`` gives it: the principal's private rows for the
-    principal alone, a drafted artifact's card for its owner."""
-    from openexecutive.api.routes.today import _build_today
-    from openexecutive.orchestrator.artifact_records import viewer_for_person
-
-    who = await _require_person()
-    viewer = await asyncio.to_thread(viewer_for_person, who.person_id)
-    today = await asyncio.to_thread(
-        _build_today, include_private=who.is_principal, viewer=viewer
-    )
-    today.caller_person_id = who.person_id
+    today = await _today_for(await _require_person())
     return _json(today.model_dump(mode="json"))
 
 
 @mcp.resource(
-    "oe://today/activity",
-    name="Recent activity",
-    description="Recent self-initiated Executive activity (last 20 actions). The owner's alone.",
+    "oe://cards/needs-you",
+    name="Needs you",
+    description=(
+        "The cards waiting on the person signed in, as Home shows them. Answer "
+        "one with answer_card."
+    ),
     mime_type="application/json",
 )
-async def today_activity() -> str:
-    from openexecutive.api.routes.today import _build_activity
+async def needs_you() -> str:
+    today = await _today_for(await _require_person())
+    return _json([p.model_dump(mode="json") for p in today.proposals])
 
-    await _require_principal()
-    activity = await asyncio.to_thread(_build_activity, 20)
-    return _json(activity.model_dump(mode="json"))
+
+@mcp.resource(
+    "oe://today/done-for-you",
+    name="Done for you",
+    description="What the Executive did for the person signed in in the last day, as Home shows it.",
+    mime_type="application/json",
+)
+async def done_for_you() -> str:
+    from openexecutive.api.routes.today import get_today_done
+
+    rows = await _through_route(get_today_done)
+    return _json([r.model_dump(mode="json") for r in rows])
+
+
+@mcp.resource(
+    "oe://tasks",
+    name="Tasks",
+    description="Open tasks, soonest due first: the owner sees everyone's, anyone else their own.",
+    mime_type="application/json",
+)
+async def tasks() -> str:
+    from openexecutive.api.routes.people import list_tasks_route
+
+    found = await _through_route(list_tasks_route, limit=200)
+    return _json(found.model_dump(mode="json"))
+
+
+@mcp.resource(
+    "oe://watches",
+    name="Watches",
+    description="What the Executive is watching (companies, people, pages, topics) and how each is set.",
+    mime_type="application/json",
+)
+async def watches() -> str:
+    from openexecutive.api.routes.watchlist import list_watchlist
+
+    await _require_person()
+    # Through the route, so an email watch shows to its owner alone.
+    rows = await _through_route(list_watchlist)
+    return _json([r.model_dump(mode="json") for r in rows])
+
+
+@mcp.resource(
+    "oe://approvals",
+    name="Approvals",
+    description=(
+        "What the Executive may do on its own for the person signed in, and "
+        "what waits on a card: their Approvals level, As you, Your "
+        "rules and In training, as the What it may do page shows them."
+    ),
+    mime_type="application/json",
+)
+async def approvals_summary() -> str:
+    from openexecutive.api.routes.may_do import get_what_it_may_do
+
+    found = await _through_route(get_what_it_may_do)
+    return _json(found.model_dump(mode="json"))
 
 
 @mcp.resource(
     "oe://people/roster",
-    name="People roster",
-    description="Active team members on the company roster. For someone on the roster.",
+    name="People",
+    description="Who is on the team. For someone on the roster.",
     mime_type="application/json",
 )
 async def people_roster() -> str:
     from openexecutive.people.store import list_people
 
     # The team, never the principal's contacts (as GET /people gives it).
-    await _require_person()
+    who = await _require_person()
     people = await asyncio.to_thread(list_people)
-    return _json([p.model_dump(mode="json") for p in people])
+    # A teammate's phone, website and other details go only to the principal
+    # and to that person (as GET /people shows them).
+    shown = [
+        p if who.is_principal or not p.details or p.id == who.person_id
+        else p.model_copy(update={"details": []})
+        for p in people
+    ]
+    return _json([p.model_dump(mode="json") for p in shown])
+
+
+async def _reader(who: McpCaller) -> Any:
+    """``who``'s view of follow-ups and advice (``api.own_rows``):
+    the team's rows and their own."""
+    from openexecutive.api.own_rows import Reader
+    from openexecutive.api.routes.today import principal_id
+
+    viewer = who.person_id
+    if viewer is None and who.is_principal:
+        # The principal with no roster id of their own (a local, unsigned
+        # caller): their own rows are the roster principal's.
+        viewer = await asyncio.to_thread(principal_id)
+    return await asyncio.to_thread(Reader, viewer)
+
+
+def _department_view(state: Any, names: dict[int, str]) -> dict[str, Any]:
+    """One department as its page says it: its Approvals level by name, its
+    lead and people by name, its goals. No ids or channel settings."""
+    config = state.config
+    return {
+        "slug": config.slug,
+        "title": config.title,
+        "mission": config.charter.mission,
+        "scope": config.charter.scope,
+        "out_of_scope": config.charter.out_of_scope,
+        "approvals": config.approvals,
+        "lead": names.get(config.head_person_id) if config.head_person_id is not None else None,
+        "people": [names[i] for i in state.member_person_ids if i in names],
+        "check_in": config.cadences.get("check_in") or None,
+        "watching": config.watched_entities,
+        "headcount": state.headcount,
+        "budget_usd": state.budget_usd,
+        "goals": [
+            {
+                "goal": g.key_result,
+                "target": g.target,
+                "current": g.current,
+                "status": g.status,
+                "period": g.period_value,
+            }
+            for g in state.goals
+        ],
+    }
 
 
 @mcp.resource(
     "oe://departments/state",
-    name="Department state",
-    description="Departments with goals, cadences, and current state.",
+    name="Departments",
+    description="Each department: what it does, its Approvals level, who leads it, its goals.",
     mime_type="application/json",
 )
 async def departments_state() -> str:
     from openexecutive.departments.store import list_departments
+    from openexecutive.people.store import list_people
 
     depts = await asyncio.to_thread(list_departments)
-    return _json([d.model_dump(mode="json") for d in depts])
+    names: dict[int, str] = {}
+    try:
+        # Who leads and works in each one is the team's to know, as the
+        # People list is: none for a caller who is no one.
+        if await asyncio.to_thread(api_caller.person_id_for, _who()) is not None:
+            people = await asyncio.to_thread(list_people)
+            names = {p.id: p.full_name for p in people if p.id is not None}
+    except Exception:
+        logger.warning("mcp_server: couldn't read the People list — departments without names", exc_info=True)
+        names = {}
+    return _json([_department_view(d, names) for d in depts])
 
 
 @mcp.resource(
     "oe://memory/decisions",
-    name="Episodic memory: decisions",
-    description="Past decisions recorded in episodic memory. The owner's alone.",
+    name="Decisions",
+    description="Decisions on record: the team's, and the caller's own. For someone on the roster.",
     mime_type="application/json",
 )
 async def memory_decisions() -> str:
     from openexecutive.memory.episodic import list_decisions
 
-    await _require_principal()
-    rows = await asyncio.to_thread(list_decisions)
+    # The team's, and the caller's own private ones.
+    who = await _require_person()
+    reader = who.person_id
+    if reader is None and who.is_principal:
+        from openexecutive.api.routes.today import principal_id
+
+        reader = await asyncio.to_thread(principal_id)
+    rows = await asyncio.to_thread(list_decisions, reader=reader)
     return _json([r.model_dump(mode="json") for r in rows])
 
 
 @mcp.resource(
     "oe://memory/initiatives",
-    name="Episodic memory: initiatives",
-    description="Tracked initiatives recorded in episodic memory. The owner's alone.",
+    name="Initiatives",
+    description="Initiatives being tracked. For someone on the roster.",
     mime_type="application/json",
 )
 async def memory_initiatives() -> str:
     from openexecutive.memory.episodic import list_initiatives
 
-    await _require_principal()
+    await _require_person()
     rows = await asyncio.to_thread(list_initiatives)
     return _json([r.model_dump(mode="json") for r in rows])
 
 
 @mcp.resource(
     "oe://memory/advice",
-    name="Episodic memory: advice",
-    description="Advice given, recorded in episodic memory. The owner's alone.",
+    name="Advice",
+    description="Advice the Executive gave: the team's, and the caller's own. For someone on the roster.",
     mime_type="application/json",
 )
 async def memory_advice() -> str:
     from openexecutive.memory.episodic import list_advice
 
-    await _require_principal()
-    rows = await asyncio.to_thread(list_advice)
+    reader = await _reader(await _require_person())
+    rows = await asyncio.to_thread(lambda: [r for r in list_advice() if reader.sees_session_row(r)])
     return _json([r.model_dump(mode="json") for r in rows])
 
 
 # ---------------------------------------------------------------------------
-# Tools — structured capabilities. None of them sends, posts, books or
-# changes anything; ask_executive records the conversation in memory.
+# Tools. consult_specialist, search_knowledge and list_workflows only read.
+# ask_executive, answer_card and run_workflow each run one Executive turn as
+# the person signed in (``_executive_turn``), under their Approvals.
 # ---------------------------------------------------------------------------
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_ACTS = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
 
 
 @mcp.tool(title="Consult a specialist", annotations=_READ_ONLY)
 async def consult_specialist(
     specialist: SpecialistKey, query: str, context: str = ""
 ) -> str:
-    """Consult one of Open Executive's specialist executives for domain analysis.
+    """Ask one of Open Executive's specialists for analysis in their area.
 
-    Each specialist runs its own knowledge retrieval and returns a grounded,
-    domain-expert read. Specialists: cso (strategy/M&A/OKRs), cfo (finance/unit
-    economics/fundraising), chro (people/comp/org design), gc (legal/contracts/
-    compliance), coo (operations/process/metrics), cmo (GTM/brand/PR), cpo
-    (product/roadmap), sales (pipeline/deals/pricing conversations/forecast),
-    board_comms (board decks/IR/governance),
-    triage (chief of staff — significance of inbound events).
+    Each specialist searches the company's knowledge and documents and gives
+    a grounded read. Specialists: cso (strategy, M&A, OKRs), cfo (finance,
+    unit economics, fundraising), chro (people, pay, org design), gc (legal,
+    contracts, compliance), coo (operations, process, metrics), cmo (go to
+    market, brand, PR), cpo (product, roadmap), sales (pipeline, deals,
+    pricing, forecast), board_comms (board decks, investors, governance),
+    triage (chief of staff: what in what came in needs someone).
 
     Args:
-        specialist: Which specialist to consult.
-        query: The specific question or task. The specialist sees only this
-            query plus ``context``, so be precise.
-        context: Relevant background from your own task to ground the answer.
+        specialist: Which specialist to ask.
+        query: The question or task. The specialist sees only this and
+            ``context``, so be precise.
+        context: Background from your own task that grounds the answer.
     """
     from openexecutive.orchestrator.router import (
         SPECIALIST_REGISTRY,
@@ -380,10 +555,10 @@ async def consult_specialist(
 
 @mcp.tool(title="Search knowledge", annotations=_READ_ONLY)
 async def search_knowledge(query: str) -> str:
-    """Search Open Executive's curated business knowledge base and indexed company docs.
+    """Search Open Executive's business knowledge base and the company's documents.
 
-    Returns the most relevant retrieved chunks, each prefixed with its
-    ``[source]``. No LLM call: raw retrieval to cite or reason over.
+    Returns the most relevant passages, each starting with its ``[source]``.
+    No model call: raw retrieval to cite or reason over.
     """
     from openexecutive.knowledge.retriever import retrieve
 
@@ -392,11 +567,10 @@ async def search_knowledge(query: str) -> str:
 
 @mcp.tool(title="List workflows", annotations=_READ_ONLY)
 async def list_workflows() -> str:
-    """List the available multi-step executive workflows and their input schemas.
+    """List the workflows Open Executive can run, with the inputs each takes.
 
-    Returns a JSON array of workflow metadata (name, title, description,
-    estimated minutes, input schema, steps). Workflows are run from Open
-    Executive itself, not over MCP.
+    Returns a JSON array (name, title, description, estimated minutes, input
+    schema, steps). Start one with run_workflow.
     """
     from openexecutive.workflows import list_workflows as _list
 
@@ -404,39 +578,50 @@ async def list_workflows() -> str:
     return _json([w.meta().model_dump(mode="json") for w in workflows])
 
 
-@mcp.tool(
-    title="Ask the Executive",
-    annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False,
-    ),
-)
-async def ask_executive(message: str) -> str:
-    """Ask the Executive a question and get one synthesized, cross-domain answer.
+async def _open_card(card_id: int) -> None:
+    """Refuse a card the caller can't see on Home or that is already answered,
+    by the alerts route's own visibility rule, before any model call."""
+    from fastapi import HTTPException
 
-    The Executive answers as it would in Open Executive for the person signed
-    in, drawing on the specialists, company knowledge and memory. It reads and
-    advises only: it does not send, post, book or change anything. The
-    conversation is recorded in Open Executive's memory. Non-streaming.
+    from openexecutive.api.routes.alerts import _visible_alert
+    from openexecutive.orchestrator.schedule_tools import _FIND_ALERTS_ACKABLE_STATUSES
 
-    Args:
-        message: The question for the Executive.
-    """
+    request = _http_request()
+    if request is None:
+        raise CallerRefused(ROSTER_ONLY)
+    try:
+        alert = await asyncio.to_thread(_visible_alert, card_id, request)
+    except HTTPException:
+        alert = None
+    if alert is None or alert.status not in _FIND_ALERTS_ACKABLE_STATUSES:
+        raise ValueError(f"No open card {card_id}. Pick one from the Needs you resource.")
+
+
+# The web chat's own cap on one message (``POST /chat``), for every turn here.
+MAX_MESSAGE = 32_000
+
+
+async def _executive_turn(message: str, card_id: int | None = None) -> str:
+    """One Executive turn for the verified caller, as the web chat runs it:
+    their live board shown, Approvals deciding each step, and every row it
+    writes naming the app. With ``card_id`` the turn may answer that card
+    and no other: it is the only trusted id, and ``find_alerts`` adds none."""
+    from openexecutive.audit import via_app
+    from openexecutive.briefing.context import render_and_trust
+    from openexecutive.onboarding.profile_builder import load_or_create_profile
     from openexecutive.orchestrator.artifact_records import NOBODY
     from openexecutive.orchestrator.executive import Executive
     from openexecutive.orchestrator.mcp_gateway import get_active_gateway
     from openexecutive.orchestrator.session import Session
+
+    if len(message) > MAX_MESSAGE:
+        raise ValueError(f"That is too long for one message; keep it under {MAX_MESSAGE:,} characters.")
 
     # Who is asking comes from the verified request, never from the message:
     # a signed-in person, the principal for a request that names no one in
     # open mode, no one for a service.
     who = _who()
     person_id = await asyncio.to_thread(api_caller.person_id_for, who)
-
-    from openexecutive.onboarding.profile_builder import load_or_create_profile
-
     profile = await asyncio.to_thread(load_or_create_profile)
     session = Session(
         company_profile=profile if not profile.is_empty() else None,
@@ -444,16 +629,105 @@ async def ask_executive(message: str) -> str:
         # documents (``artifact_records.current_viewer`` would otherwise take
         # a speakerless session for the principal's own work).
         documents_viewer=NOBODY if person_id is None else None,
-        # Another AI app is asking: the turn reads and advises but never
-        # sends, posts, books or changes anything (Session.from_mcp_client).
         from_mcp_client=True,
         caller_person_id=person_id,
+        # The web chat's rule for what needs a sign-in (Act as me): a
+        # request that names someone, never one that only holds the secret.
+        web_caller_signed_in=bool(who.email),
     )
-
     executive = Executive(mcp_gateway=get_active_gateway())
-    return await executive.chat(
-        user_message=message, session=session, person_id=person_id
+    # The live board, as the web chat shows it, and what a card answer may
+    # touch: only for someone on the roster.
+    briefing_context = (
+        await asyncio.to_thread(render_and_trust, session) if person_id is not None else ""
     )
+    if card_id is not None:
+        if person_id is None:
+            raise CallerRefused(ROSTER_ONLY)
+        await _open_card(card_id)
+        session.trusted_alert_ids = {card_id}
+        session.answering_card = card_id
+    with via_app(client_name()):
+        return await executive.chat(
+            user_message=message, session=session, person_id=person_id,
+            briefing_context=briefing_context,
+        )
+
+
+@mcp.tool(title="Ask the Executive", annotations=_ACTS)
+async def ask_executive(message: str) -> str:
+    """Ask the Executive anything, or ask it to do something, as the person signed in.
+
+    It answers as it would in Open Executive, drawing on the specialists,
+    company knowledge and memory, and can act: tasks, follow-ups, watches,
+    goals, decisions, notes, email and messages. What it does follows the
+    person's Approvals: a step goes on its own or waits on a card for them,
+    exactly as in Open Executive. The conversation is kept in Open
+    Executive's history. Non-streaming.
+
+    Args:
+        message: What to ask or ask it to do.
+    """
+    return await _executive_turn(message)
+
+
+CardAnswer = Literal["approve", "skip", "reply"]
+
+
+@mcp.tool(title="Answer a card", annotations=_ACTS)
+async def answer_card(card_id: int, answer: CardAnswer, reply: str = "") -> str:
+    """Approve, skip or reply to one of the person's Needs you cards.
+
+    Does what the card's own button or reply box does on Home: approve
+    carries it out, skip drops it, reply answers a card that asks something
+    (or tells it what to change). Only the person a card is for can approve
+    or answer it, as on Home (``card_answers``).
+
+    Args:
+        card_id: The card's ``alert_id`` from the Needs you resource.
+        answer: "approve", "skip" or "reply".
+        reply: The person's words, for "reply".
+    """
+    if answer == "approve":
+        message = f"Yes, approve card {card_id}."
+    elif answer == "skip":
+        message = f"No, drop card {card_id}."
+    else:
+        words = " ".join(reply.split())
+        if not words:
+            raise ValueError("Give the person's words in `reply`.")
+        message = f"About card {card_id}: {words}"
+    return await _executive_turn(message, card_id=card_id)
+
+
+@mcp.tool(title="Run a workflow", annotations=_ACTS)
+async def run_workflow(workflow: str, inputs: dict[str, Any] | None = None) -> str:
+    """Run one of the workflows from list_workflows, as the person signed in.
+
+    It runs as if they asked for it in Open Executive: its steps follow their
+    Approvals, and it returns what the workflow made.
+
+    Args:
+        workflow: The workflow's ``name`` from list_workflows.
+        inputs: Its input fields, matching that workflow's input schema.
+    """
+    from pydantic import ValidationError
+
+    from openexecutive.workflows import list_workflows as _list
+
+    name = " ".join(workflow.split())
+    known = {w.name: w for w in await asyncio.to_thread(_list)}
+    if name not in known:
+        raise ValueError("No workflow by that name. Pick one from list_workflows.")
+    # The inputs are the workflow's own fields, checked against its input
+    # schema as its run is, and no longer than a person would type.
+    try:
+        checked = known[name].input_model().model_validate(inputs or {})
+    except ValidationError as exc:
+        wrong = ", ".join(str(e["loc"][0]) for e in exc.errors() if e.get("loc")) or "inputs"
+        raise ValueError(f"These inputs don't fit the workflow: {wrong}. See its input_schema in list_workflows.") from exc
+    fields = _json(checked.model_dump(mode="json"))
+    return await _executive_turn(f"Run the {name} workflow with these inputs: {fields}")
 
 
 # ---------------------------------------------------------------------------

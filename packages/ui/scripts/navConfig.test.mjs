@@ -25,11 +25,11 @@ test("the main menu is seven places, team is the default", () => {
   assert.deepEqual(links(buildDestinations()), [
     "Home → /",
     "Chats → /chats",
-    "Work → /jobs",
+    "Work → /tasks",
     "Company → /people",
-    "Delegate → /delegate/what-it-may-do",
+    "Delegate → /delegate",
     "Knowledge → /knowledge",
-    "Pulse → /memories",
+    "Memory → /memories",
   ]);
   assert.deepEqual(buildDestinations({ mode: "team" }), buildDestinations());
 });
@@ -37,13 +37,19 @@ test("the main menu is seven places, team is the default", () => {
 test("solo swaps Company for You, which opens on Goals", () => {
   const solo = links(buildDestinations({ mode: "solo", roleKind: "owner" }));
   assert.equal(solo[3], "You → /goals");
-  assert.equal(solo[4], "Delegate → /delegate/what-it-may-do");
+  assert.equal(solo[4], "Delegate → /delegate");
   assert.equal(solo.length, 7);
 });
 
 test("team hubs: Work and Company tabs", () => {
   const [work, company] = buildHubs();
-  assert.deepEqual(links(work.tabs), ["Workflows → /jobs", "Documents → /artifacts", "Watch list → /watchlist"]);
+  assert.deepEqual(links(work.tabs), [
+    "Tasks → /tasks",
+    "Workflows → /jobs",
+    "Made for you → /artifacts",
+    "Watch list → /watchlist",
+    "Schedule → /schedule",
+  ]);
   assert.deepEqual(links(company.tabs), [
     "People → /people",
     "Goals → /goals",
@@ -58,21 +64,14 @@ test("team hubs: Work and Company tabs", () => {
   );
 });
 
-test("Delegate opens on What it may do, then Act as me, Handle it for me and Take the lead, each a named feature", () => {
+test("Delegate is one page, not a hub, in both modes", () => {
   for (const opts of [{}, { mode: "solo", roleKind: "owner" }]) {
-    const delegate = buildHubs(opts).find((h) => h.key === "delegate");
-    assert.deepEqual(links(delegate.tabs), [
-      "What it may do → /delegate/what-it-may-do",
-      "Act as me → /delegate/act-as-me",
-      "Handle it for me → /delegate/handle-it",
-      "Take the lead → /delegate/take-the-lead",
-    ]);
-    assert.deepEqual(
-      delegate.tabs.map((t) => t.feature),
-      [undefined, "act_as_me", "handle_it", "take_the_lead"],
-    );
-    assert.equal(hubForPath("/delegate/handle-it", opts)?.key, "delegate");
-    assert.equal(hubForPath("/delegate/what-it-may-do", opts)?.key, "delegate");
+    assert.ok(!buildHubs(opts).some((h) => h.key === "delegate"));
+    assert.equal(hubForPath("/delegate", opts), null);
+    const delegate = buildDestinations(opts).find((d) => d.key === "delegate");
+    assert.equal(delegate.href, "/delegate");
+    assert.ok(isDestinationActive(delegate, "/delegate"));
+    assert.ok(isDestinationActive(delegate, "/delegate/act-as-me"));
   }
 });
 
@@ -118,6 +117,21 @@ test("a hub's menu entry stays lit on every one of its tabs", () => {
   assert.deepEqual(lit("/settings"), []);
 });
 
+test("team: the Departments tab shows only once a department exists", () => {
+  const company = buildHubs({ hasDepartments: false })[1];
+  assert.deepEqual(links(company.tabs), [
+    "People → /people",
+    "Goals → /goals",
+    "Company profile → /company-profile",
+  ]);
+  // The Departments pages keep it: that is where the first one is added.
+  const onDepts = hubForPath("/departments/new", { hasDepartments: false });
+  assert.ok(onDepts?.tabs.some((t) => t.href === "/departments"));
+  assert.ok(!hubForPath("/goals", { hasDepartments: false })?.tabs.some((t) => t.href === "/departments"));
+  // Solo never shows it, departments or not.
+  assert.ok(!JSON.stringify(buildHubs({ mode: "solo", hasDepartments: true })).includes("/departments"));
+});
+
 test("hubForPath finds the hub a page belongs to", () => {
   assert.equal(hubForPath("/jobs/new")?.key, "work");
   assert.equal(hubForPath("/people/3")?.key, "company");
@@ -150,8 +164,8 @@ test("the review badge rides on Knowledge in both modes", () => {
 });
 
 test("phone bar: five, with New chat in the middle", () => {
-  assert.deepEqual(buildMobilePrimary().map((i) => i.href), ["/", "/chats", "/?new=1", "/jobs", "/people"]);
-  assert.deepEqual(buildMobilePrimary({ mode: "solo" }).map((i) => i.href), ["/", "/chats", "/?new=1", "/jobs", "/goals"]);
+  assert.deepEqual(buildMobilePrimary().map((i) => i.href), ["/", "/chats", "/?new=1", "/tasks", "/people"]);
+  assert.deepEqual(buildMobilePrimary({ mode: "solo" }).map((i) => i.href), ["/", "/chats", "/?new=1", "/tasks", "/goals"]);
 });
 
 test("every destination and tab explains itself", () => {
@@ -192,7 +206,7 @@ test("the Settings tools are grouped by what you'd use them for", () => {
     {
       key: "configure",
       label: "Configure",
-      items: ["Agent Council → /council", "Custom tools → /settings/tools", "Company Simulator → /demo", "Client Companies → /clients"],
+      items: ["Agent Council → /council", "Tools I built → /settings/tools", "Company Simulator → /demo", "Client Companies → /clients"],
     },
     { key: "learn", label: "Learn", items: ["User Guide → /guide", "Architecture → /architecture"] },
   ]);
@@ -207,6 +221,7 @@ test("the Settings hub: one tile per page, each with its own route", () => {
       "Your Executive → /settings/executive",
       "Notifications → /settings/notifications",
       "About you → /settings/memory",
+      "Browser → /settings/browser",
       "Workspace → /settings/workspace",
       "Advanced → /settings/advanced",
       "About → /settings/about",
@@ -227,8 +242,8 @@ test("old /settings#anchors land on the matching page", () => {
   assert.equal(to("#on-its-own"), "/settings/executive");
   assert.equal(to("#workspace"), "/settings/workspace");
   assert.equal(to("act-as-me"), null);
-  // Act as me moved out of Settings: its old anchor goes to its Delegate tab.
-  assert.equal(settingsHrefForHash("#act-as-me"), "/delegate/act-as-me");
+  // Act as me moved out of Settings: its old anchor goes to its Delegate block.
+  assert.equal(settingsHrefForHash("#act-as-me"), "/delegate#as-you");
   assert.equal(settingsHrefForHash("#workspace"), "/settings/workspace");
   assert.equal(settingsHrefForHash("#nope"), null);
   assert.equal(to("#memory"), "/settings/memory");
@@ -250,7 +265,7 @@ test("every Settings page sits in a known group, and the hub lists the groups in
   assert.deepEqual(
     groupSettingsPages(SETTINGS_PAGES).map(({ group, pages }) => [group.label, pages.map((p) => p.label)]),
     [
-      ["You and your Executive", ["Your Executive", "Notifications", "About you"]],
+      ["You and your Executive", ["Your Executive", "Notifications", "About you", "Browser"]],
       ["Company", ["Workspace"]],
       ["More", ["Advanced", "About"]],
     ],

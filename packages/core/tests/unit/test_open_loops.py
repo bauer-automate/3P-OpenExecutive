@@ -13,6 +13,7 @@ import pytest
 
 from openexecutive.attunement import open_loops
 from openexecutive.memory import episodic, session_store
+from openexecutive.orchestrator.session import Session
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
 from openexecutive.scheduler import nudge_engine
@@ -337,7 +338,7 @@ def test_reflection_context_lists_open_loops(team: SimpleNamespace) -> None:
         period_label="p", today_data={}, activity=[], recent_alerts=[],
         external_signals=[], open_loops=lines,
     )
-    assert "OPEN LOOPS" in text and "OVERDUE" in text and "owner=Sara Kim" in text
+    assert "TASKS (what people owe" in text and "OVERDUE" in text and "owner=Sara Kim" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -371,12 +372,29 @@ async def _list_as(caller: int | None, *, session_id: str = "s", web: bool = Fal
     from openexecutive.orchestrator.schedule_tools import current_session
     from openexecutive.orchestrator.session import Session
 
-    token = current_session.set(
-        Session(session_id=session_id, caller_person_id=caller, from_web_chat=web)
-    )
+    # The channel a chat app's adapter names, from its session id
+    # ("slack:dm:U1" is Slack, chat "U1"; "telegram:42" is Telegram, chat 42).
+    channel, _, rest = session_id.partition(":")
+    ref = rest.rpartition(":")[2] if channel != "telegram" else rest
+    token = current_session.set(Session(
+        session_id=session_id, caller_person_id=caller, from_web_chat=web, web_caller_signed_in=web,
+        origin_channel="" if web or not rest else channel, origin_channel_ref="" if web else ref,
+    ))
     try:
         args = {} if person_id is None else {"person_id": person_id}
         result: dict[str, Any] = json.loads(await handle_list_open_loops(args))
+        return result
+    finally:
+        current_session.reset(token)
+
+
+async def _list_as_session(session: Any) -> dict[str, Any]:
+    from openexecutive.orchestrator.open_loop_tools import handle_list_open_loops
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    token = current_session.set(session)
+    try:
+        result: dict[str, Any] = json.loads(await handle_list_open_loops({}))
         return result
     finally:
         current_session.reset(token)
@@ -386,7 +404,13 @@ def _owners(result: dict[str, Any]) -> set[int]:
     return {lp["owner_person_id"] for lp in result.get("open_loops", [])}
 
 
-async def test_list_tool_principal_sees_all_only_in_private(team: SimpleNamespace) -> None:
+async def test_list_tool_principal_sees_all_only_in_private(
+    team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.config import get_settings
+
+    # Telegram proves who sent a message only with its webhook secret set.
+    monkeypatch.setattr(type(get_settings()), "telegram_webhook_secret_valid", True)
     open_loops.open_loop(owner_person_id=team.sara, description="send the quote", due_at=datetime.now(UTC))
     open_loops.open_loop(owner_person_id=team.ben, description="send the plan", due_at=datetime.now(UTC))
     everyone = {team.sara, team.ben}
@@ -394,6 +418,12 @@ async def test_list_tool_principal_sees_all_only_in_private(team: SimpleNamespac
     assert _owners(await _list_as(team.principal, session_id="slack:dm:U_PAT")) == everyone
     assert _owners(await _list_as(team.principal, session_id="discord:dm:1")) == everyone
     assert _owners(await _list_as(team.principal, session_id="telegram:42")) == everyone
+    # A call with the Executive, private and verified by its app, is the same.
+    call = await _list_as_session(Session(
+        session_id="call-1", caller_person_id=team.principal, origin_channel="meeting",
+        origin_channel_ref="app:c1", private_chat=True, speaker_verified=True,
+    ))
+    assert _owners(call) == everyone
     # Shared surfaces: a list there is read by everyone present.
     for shared in ("slack:channel:C1:U_PAT", "slack:thread:C1:1.2", "discord:thread:9",
                    "telegram:-100", "email:thread-1", "google_chat:spaces/x:t"):
@@ -489,7 +519,7 @@ def test_close_open_loop_chip_only_when_closed() -> None:
 
     closed = summarize_action(tool_name="close_open_loop", tool_input={"loop_id": 4},
                               tool_result=json.dumps({"status": "closed", "loop_id": 4}))
-    assert closed is not None and closed["summary"] == "Closed open loop #4"
+    assert closed is not None and closed["summary"] == "Closed a task"
     for status in ("refused", "not_open", "not_found"):
         assert summarize_action(tool_name="close_open_loop", tool_input={"loop_id": 4},
                                 tool_result=json.dumps({"status": status})) is None
@@ -880,7 +910,7 @@ def test_solo_standalone_brief_prompt_has_a_due_section() -> None:
     assert "**Due this week**" in STANDALONE_BRIEF_SOLO_SYSTEM
     assert "DUE THIS WEEK" in STANDALONE_BRIEF_SOLO_SYSTEM
     assert "Due this week" not in STANDALONE_BRIEF_SYSTEM
-    assert "what's due this week" in BRIEFING_NARRATIVE_SOLO_SYSTEM
+    assert "what is due" in BRIEFING_NARRATIVE_SOLO_SYSTEM
 
 
 def test_today_header_counts_due_items_in_solo(team: SimpleNamespace) -> None:

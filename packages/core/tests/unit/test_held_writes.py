@@ -216,6 +216,32 @@ async def test_new_target_is_held_not_run(
 
 
 @pytest.mark.asyncio
+async def test_under_hands_off_a_new_target_runs(
+    monkeypatch: pytest.MonkeyPatch, gateway: _FakeGateway, audit: list[dict[str, Any]]
+) -> None:
+    from openexecutive.orchestrator import outside_mode
+
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
+    provider = _ScriptedProvider(
+        [
+            _resp(_use(APPEND, {"spreadsheet_id": OTHER, "rows": [["x"]]}, "tu_1")),
+            _resp(_text("Filed it.")),
+        ]
+    )
+    _install(monkeypatch, provider)
+    out = []
+    async for item in act.run_action_step(
+        _step(max_tool_calls=1),
+        workflow_name="file_bills_wf", workflow_title="File bills", goal="File them.",
+        values={}, company_block="", prior_outputs={},
+        policy=_policy(approved={SHEET}),
+    ):
+        out.append(item)
+    assert not [p for k, p in out if k == "held"]
+    assert [c["arguments"]["spreadsheet_id"] for c in gateway.calls] == [OTHER]
+
+
+@pytest.mark.asyncio
 async def test_read_only_calls_and_no_policy_never_hold(
     monkeypatch: pytest.MonkeyPatch, gateway: _FakeGateway, audit: list[dict[str, Any]]
 ) -> None:
@@ -323,7 +349,7 @@ def test_run_pauses_after_the_step_and_asks_the_owner(
     pause = events[-1]
     assert isinstance(pause, WaitForHumanEvent)
     assert pause.person_id == 7 and pause.on_timeout == "auto_proceed"
-    assert OTHER in pause.question and APPEND in pause.question
+    assert OTHER in pause.question and "Sheets: append rows" in pause.question
     state = pause.resume_state
     assert state is not None and state.kind == "held_writes"
     assert state.gate_step_id == "file_bills" and state.gate_step_index == 0
@@ -382,7 +408,7 @@ def test_approve_runs_exactly_the_held_call_and_remembers_it(
         {"name": APPEND, "arguments": {"spreadsheet_id": OTHER, "rows": [["x"]]}}
     ]
     artifact = next(e for e in events if e.type == "artifact").content or ""
-    assert f'`{APPEND}` → spreadsheet_id "{OTHER}" — done' in artifact
+    assert f'Sheets: append rows → spreadsheet_id "{OTHER}" — done' in artifact
     assert OTHER in at.approved_values("file_bills_wf")
     # The next run writes there without asking.
     _install(monkeypatch, _ScriptedProvider(
@@ -657,9 +683,21 @@ def test_resumer_delivers_a_scheduled_runs_artifact(monkeypatch: pytest.MonkeyPa
         sent.append(payload)
         return "{}"
 
+    written: list[dict[str, Any]] = []
+
+    async def _message(**kw: Any) -> str:
+        written.append(kw)
+        return "" if kw["artifact"] == "# Nothing found" else "Filed 2 bills."
+
     monkeypatch.setattr("openexecutive.orchestrator.schedule_tools.handle_message_person", _send)
-    asyncio.run(resumer._deliver_artifact("run-1", 11, "# Report"))
-    assert sent == [{"person_id": 11, "text": "# Report"}]
+    monkeypatch.setattr("openexecutive.workflows.run_message.message_for_run", _message)
+    monkeypatch.setattr("openexecutive.workflows.dynamic_store.get_definition", lambda name: None)
+    asyncio.run(resumer._deliver_artifact("run-1", "file_bills", 11, "# Report"))
+    # What the run came to, not its full report; nothing when it had nothing.
+    assert sent == [{"person_id": 11, "text": "Filed 2 bills."}]
+    assert written[0]["title"] == "file_bills" and written[0]["artifact"] == "# Report"
+    asyncio.run(resumer._deliver_artifact("run-2", "file_bills", 11, "# Nothing found"))
+    assert len(sent) == 1
 
 
 def test_held_call_model_round_trips_through_resume_json() -> None:
@@ -894,3 +932,54 @@ def test_a_conditional_save_that_changes_tools_clears_approvals_in_the_same_writ
     current = dynamic_store.get_definition("file_bills_wf")
     assert dynamic_store.save_if_unchanged(retooled, current) is not None
     assert at.approved_values("file_bills_wf") == set()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_that_asks_through_approvals_is_not_held_again(
+    monkeypatch: pytest.MonkeyPatch, gateway: _FakeGateway, audit: list[dict[str, Any]]
+) -> None:
+    from openexecutive.orchestrator import extensions
+
+    monkeypatch.setattr(extensions, "asks_through_approvals", lambda name: name == APPEND)
+    provider = _ScriptedProvider(
+        [
+            _resp(_use(APPEND, {"spreadsheet_id": OTHER, "rows": [["x"]]}, "tu_1")),
+            _resp(_text("Filed it.")),
+        ]
+    )
+    _install(monkeypatch, provider)
+    out = []
+    async for item in act.run_action_step(
+        _step(max_tool_calls=1),
+        workflow_name="file_bills_wf", workflow_title="File bills", goal="File them.",
+        values={}, company_block="", prior_outputs={},
+        policy=_policy(approved={SHEET}),
+    ):
+        out.append(item)
+    assert not [p for k, p in out if k == "held"]
+    assert [c["arguments"]["spreadsheet_id"] for c in gateway.calls] == [OTHER]
+
+
+def test_only_card_tools_ask_through_approvals() -> None:
+    from openexecutive.orchestrator import extensions
+
+    async def handler(_: dict[str, Any]) -> str:
+        return "ok"
+
+    def tool(name: str, card: bool) -> extensions.ExtraTool:
+        return extensions.ExtraTool(
+            definition={"name": name, "description": name, "input_schema": {"type": "object"}},
+            handler=handler, workflow=True, card=card,
+        )
+
+    saved = dict(extensions._tools)
+    try:
+        extensions.register_tool(tool("held_test_carded", True))
+        extensions.register_tool(tool("held_test_plain", False))
+        assert extensions.asks_through_approvals("oe__held_test_carded")
+        assert extensions.asks_through_approvals("held_test_carded")
+        assert not extensions.asks_through_approvals("oe__held_test_plain")
+        assert not extensions.asks_through_approvals("oe__no_such_tool")
+    finally:
+        extensions._tools.clear()
+        extensions._tools.update(saved)

@@ -106,10 +106,10 @@ def _reset_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolated: P
     return _settings_stub(tmp_path)
 
 
-def _run_reset(settings: Any) -> None:
+def _run_reset(settings: Any, keep: tuple[str, ...] = ()) -> None:
     with patch.object(ChromaDBStore, "delete_company_docs", lambda self: None), \
          patch.object(ChromaDBStore, "delete_documents", lambda self, **kw: None):
-        asyncio.run(fixture_loader.reset_all_state(settings))
+        asyncio.run(fixture_loader.reset_all_state(settings, keep=keep))
 
 
 def test_reset_returns_to_team_defaults_and_rebootstraps(_reset_harness: Any, _isolated: Path) -> None:
@@ -126,8 +126,7 @@ def test_reset_path_bootstrap_honours_solo(
     """The solo check lives inside bootstrap_cadences, so the reset's own call
     honours it too (here the workspace is held at solo through the reset)."""
     ws.restore_workspace_settings(ws.WorkspaceSettings(mode="solo"))
-    monkeypatch.setattr(ws, "reset_workspace_settings", lambda db_path=None: None)
-    _run_reset(_reset_harness)
+    _run_reset(_reset_harness, keep=("workspace_settings",))
     assert ws.get_workspace().mode == "solo"
     assert _count(_isolated, "dept_cadence") == 0
     # The principal's own rhythm is still seeded.
@@ -321,7 +320,8 @@ def test_fixture_load_path_always_applies_the_workspace_file() -> None:
 
 
 def test_blank_client_slot_wipes_the_workspace_settings() -> None:
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES, _GLOBAL_TABLES
+    from openexecutive.cli.fixture_loader import RESET_KEEPS
+    from openexecutive.clients.slots import _GLOBAL_TABLES
 
-    assert "workspace_settings" in _BLANK_WIPE_TABLES
+    assert "workspace_settings" not in RESET_KEEPS
     assert "workspace_settings" not in _GLOBAL_TABLES

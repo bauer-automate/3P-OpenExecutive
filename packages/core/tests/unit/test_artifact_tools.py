@@ -378,6 +378,11 @@ async def test_get_artifact_returns_display_content_truncated(
                                                 "max_chars": 200}))
     assert len(cut["content"]) == 200 and cut["truncated"] is True
 
+    # Asked for nothing less, a long one comes back whole.
+    longer = await _draft(document="word " * 30_000)
+    whole = json.loads(await handle_get_artifact({"id": longer["artifact_id"]}))
+    assert len(whole["content"]) >= 150_000 - 10 and whole["truncated"] is False
+
 
 async def test_get_artifact_html_returns_text_not_markup(
     db: Path, audit_calls: list[dict],
@@ -427,7 +432,7 @@ async def test_draft_indexes_artifact_into_research_collection(
     assert "Churn is up in SMB." in " ".join(added["texts"])
 
     await artifact_tools.unindex_artifact(result["artifact_id"])
-    assert store.deleted == [("recent_research", {"artifact_id": result["artifact_id"]})]
+    assert ("recent_research", {"artifact_id": result["artifact_id"]}) in store.deleted
 
 
 async def test_indexing_failure_does_not_fail_draft(

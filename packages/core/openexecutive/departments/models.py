@@ -11,23 +11,44 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class AuthorityLevel(StrEnum):
-    """How autonomously a department may take proactive action."""
+    """How a department's work goes, from the Approvals level it runs at
+    (``departments.authority.department_level``)."""
 
     AUTO_EXECUTE = "auto_execute"
     PROPOSE_ONLY = "propose_only"
     ESCALATE = "escalate"
 
+    @property
+    def label(self) -> str:
+        """The Approvals level's name, as the product says it."""
+        return APPROVALS_LABELS[self]
 
-GoalStatus = Literal["on_track", "at_risk", "off_track"]
+
+# The one place an authority level gets its name.
+APPROVALS_LABELS: dict[AuthorityLevel, str] = {
+    AuthorityLevel.AUTO_EXECUTE: "Hands-off",
+    AuthorityLevel.PROPOSE_ONLY: "Balanced",
+    AuthorityLevel.ESCALATE: "Careful",
+}
+
+
+# "done" is a person's call (the goals page, or telling the Executive in
+# chat): the weekly reviews neither grade a done goal nor move it back.
+GoalStatus = Literal["on_track", "at_risk", "off_track", "done"]
 PeriodType = Literal["week", "month", "quarter", "year", "ongoing"]
 
 
 class Goal(BaseModel):
-    """A single Goal row for one department, scoped to a period.
+    """A single Goal, scoped to a period.
+
+    A goal stands on its own: ``department_slug`` is optional (None = no
+    department) and ``owner_person_id`` names who it is on. An unset owner
+    means the department's lead, or the principal when there is no lead or
+    no department (``departments.goals.effective_owner_id``).
 
     `period_type` says how to interpret `period_value`:
       • week → e.g. "Week of May 18"
@@ -38,7 +59,8 @@ class Goal(BaseModel):
     """
 
     id: int | None = None
-    department_slug: str
+    department_slug: str | None = None
+    owner_person_id: int | None = None
     period_type: PeriodType = "quarter"
     period_value: str
     key_result: str
@@ -80,6 +102,8 @@ class DepartmentConfig(BaseModel):
     # and are skipped by specialist-routing workflows.
     specialist_key: str | None = None
     charter: DepartmentCharter
+    # The level its work runs at now: the store fills it from Approvals
+    # (``departments.authority.department_level``) on every read.
     authority_level: AuthorityLevel = AuthorityLevel.PROPOSE_ONLY
     head_person_id: int | None = None
     head_persona_slug: str | None = None
@@ -95,6 +119,8 @@ class DepartmentConfig(BaseModel):
     slack_channel_id: str | None = None
     discord_channel_id: str | None = None
     telegram_chat_id: str | None = None
+    # A Google Chat space the Chat app is in ("spaces/AAAA..."), for posts.
+    google_chat_space: str | None = None
     # Named external entities this department wants monitored (vendors it
     # is evaluating, competitors in its lane, tickers it tracks). The
     # research watch policy treats these as strong grounding — like the
@@ -102,6 +128,12 @@ class DepartmentConfig(BaseModel):
     # them can be added to the watchlist directly and routed to this
     # department (and its head) instead of waiting on the principal.
     watched_entities: list[str] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def approvals(self) -> str:
+        """Its Approvals level by name: Careful, Balanced or Hands-off."""
+        return self.authority_level.label
 
 
 class DepartmentState(BaseModel):

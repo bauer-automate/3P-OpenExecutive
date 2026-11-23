@@ -23,8 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Generator
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -39,7 +37,10 @@ from openexecutive.monitoring.models import (
     ORIGIN_MANUAL,
     ORIGIN_RESEARCH,
     ORIGIN_RESEARCH_PROPOSED,
+    OUTCOME_ALERTED,
+    OUTCOME_HELD_DIGEST,
     OUTCOME_SUPPRESSED_BASELINE,
+    SOURCE_KIND_MAILBOX,
     Signal,
     WatchlistDecline,
     WatchlistItem,
@@ -47,25 +48,12 @@ from openexecutive.monitoring.models import (
     is_valid_origin,
     is_valid_outcome,
 )
+from openexecutive.utils import db
 
 logger = logging.getLogger(__name__)
 
 
-@contextmanager
-def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
-    conn.row_factory = sqlite3.Row
-    # SQLite ships with foreign-key enforcement OFF by default. Without
-    # this PRAGMA the FK on external_signals.watchlist_id is just
-    # documentation; with it, inserting a signal for a deleted/unknown
-    # watchlist fails loudly. Per-connection setting — must run on every
-    # acquisition.
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_get_conn = db.opener(_resolve_db_path, foreign_keys=True)
 
 
 def initialize_db(db_path: Path | None = None) -> None:
@@ -198,6 +186,15 @@ def initialize_db(db_path: Path | None = None) -> None:
         # research_proposed). Pre-existing rows are 'manual': nothing the
         # research policy owns predates the column.
         _ensure_column(conn, "watchlist", "origin", "TEXT NOT NULL DEFAULT 'manual'")
+        # The headline links a page_watch page carried at its last poll
+        # (JSON list of {"text", "url"}), so a change can be reported as the
+        # new headlines it added. '[]' on rows from before the column: the
+        # next poll records the links without reporting any as new.
+        _ensure_column(conn, "page_watch_state", "links_json", "TEXT NOT NULL DEFAULT '[]'")
+        # The goal a watch is for, and what its last check found in words.
+        _ensure_column(conn, "watchlist", "goal_id", "INTEGER")
+        _ensure_column(conn, "watchlist", "last_check_note", "TEXT NOT NULL DEFAULT ''")
+        _migrate_floor_to_trigger(conn)
 
 
 def _migrate_baselined_at(conn: sqlite3.Connection) -> None:
@@ -278,6 +275,44 @@ def _migrate_vendor_status_rekey(conn: sqlite3.Connection) -> None:
         raise
 
 
+_MIGRATION_FLOOR_TO_TRIGGER = "severity_floor_to_only_big"
+
+
+def _migrate_floor_to_trigger(conn: sqlite3.Connection) -> None:
+    """One-time: the severity floor stops being a filter.
+
+    A floor of high or urgent was a person's "only big things" (the too-noisy
+    remedies wrote it), so it becomes ``only_big`` in the trigger, where the
+    "Tells you when" sentence says it. Every other floor was a default nobody
+    chose and is dropped. All floors are reset to low so nothing reads as a
+    setting that no longer does anything.
+
+    Stocks are left out of the ``only_big`` step: a stock's bar is its percent
+    (``abs_change_pct_gte``), the too-noisy remedy for a stock doubled that
+    percent, and ``only_big`` is ignored on a stock.
+    """
+    already = conn.execute(
+        "SELECT 1 FROM monitoring_migrations WHERE name = ?",
+        (_MIGRATION_FLOOR_TO_TRIGGER,),
+    ).fetchone()
+    if already is not None:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if _apply_once(conn, _MIGRATION_FLOOR_TO_TRIGGER):
+            conn.execute(
+                "UPDATE watchlist SET trigger_json = json_set("
+                "CASE WHEN json_valid(trigger_json) THEN trigger_json ELSE '{}' END, "
+                "'$.only_big', json('true')) "
+                "WHERE severity_floor IN ('high', 'urgent') AND signal_type != 'stock'"
+            )
+            conn.execute("UPDATE watchlist SET severity_floor = 'low' WHERE severity_floor != 'low'")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def _ensure_column(
     conn: sqlite3.Connection, table: str, column: str, decl: str
 ) -> bool:
@@ -340,6 +375,7 @@ def insert_watchlist_item(
     enabled: bool = True,
     notes: str = "",
     origin: str = ORIGIN_MANUAL,
+    goal_id: int | None = None,
     db_path: Path | None = None,
 ) -> int:
     """Insert a new watchlist row. Returns its id.
@@ -358,8 +394,8 @@ def insert_watchlist_item(
             "(slug, signal_type, target, config_json, trigger_json, cadence, "
             "severity_floor, severity_ceiling, route_to_specialist, "
             "route_to_department, route_to_person_id, mode, enabled, "
-            "created_at, notes, origin) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, notes, origin, goal_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 slug,
                 signal_type,
@@ -379,6 +415,7 @@ def insert_watchlist_item(
                 now,
                 notes,
                 origin,
+                goal_id,
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -414,8 +451,16 @@ def list_watchlist(
     *,
     enabled_only: bool = False,
     signal_type: str | None = None,
+    for_person: int | None = None,
+    every_watch: bool = False,
     db_path: Path | None = None,
 ) -> list[WatchlistItem]:
+    """The watches, oldest first. An email watch is its owner's alone
+    (``monitoring.mailbox``), so it is listed only ``for_person`` its owner,
+    or with ``every_watch`` (the scan that checks them); every other watch
+    is the company's and always listed."""
+    from openexecutive.monitoring import mailbox
+
     resolved = _resolve_db_path(db_path)
     if not resolved.exists():
         return []
@@ -432,7 +477,8 @@ def list_watchlist(
             f"SELECT * FROM watchlist {where} ORDER BY id",
             params,
         ).fetchall()
-    return [_row_to_watchlist(row) for row in rows]
+    items = [_row_to_watchlist(row) for row in rows]
+    return items if every_watch else [i for i in items if mailbox.shown_to(i, for_person)]
 
 
 def mark_polled(
@@ -444,6 +490,17 @@ def mark_polled(
         conn.execute(
             "UPDATE watchlist SET last_polled_at = ? WHERE id = ?",
             (at.isoformat(), item_id),
+        )
+
+
+def set_last_check_note(
+    item_id: int, note: str, db_path: Path | None = None,
+) -> None:
+    """Record what the last check found, in plain words."""
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE watchlist SET last_check_note = ? WHERE id = ?",
+            (note[:300], item_id),
         )
 
 
@@ -507,8 +564,28 @@ _ALLOWED_UPDATE_COLUMNS: frozenset[str] = frozenset({
     "notes",
     "config_json",
     "route_to_specialist",
+    "route_to_person_id",
+    "goal_id",
     "origin",
 })
+
+
+def set_watchlist_notes_if(
+    item_id: int,
+    expected: str,
+    notes: str,
+    *,
+    db_path: Path | None = None,
+) -> bool:
+    """Set one watch's notes only while they still read ``expected``
+    (compare-and-set), so a reply never overwrites a change made since it
+    was read. False when the notes changed or the row is gone."""
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE watchlist SET notes = ? WHERE id = ? AND notes = ?",
+            (notes, item_id, expected),
+        )
+        return cursor.rowcount > 0
 
 
 def update_watchlist_fields(
@@ -536,11 +613,28 @@ def update_watchlist_fields(
     params: list[Any] = list(fields.values())
     params.append(item_id)
     with _get_conn(db_path) as conn:
+        if fields.get("enabled"):
+            _email_watch_reads_from_now(conn, item_id)
         cursor = conn.execute(
             f"UPDATE watchlist SET {sets} WHERE id = ?",
             params,
         )
         return int(cursor.rowcount)
+
+
+def _email_watch_reads_from_now(conn: sqlite3.Connection, item_id: int) -> None:
+    """When an email watch that was off is turned back on, it reads from
+    now: the person turned it off, so the mail that came meanwhile is not
+    news. (A watch that was on but couldn't read, its inbox disconnected,
+    still catches up: only turning it off moves this.)"""
+    from openexecutive.monitoring.mailbox import READ_FROM_KEY, READ_THROUGH_KEY
+
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "UPDATE watchlist SET config_json = json_set(config_json, ?, ?, ?, ?) "
+        "WHERE id = ? AND enabled = 0 AND signal_type = ?",
+        (f"$.{READ_THROUGH_KEY}", now, f"$.{READ_FROM_KEY}", now, item_id, SOURCE_KIND_MAILBOX),
+    )
 
 
 def remove_watchlist_config_key(
@@ -559,6 +653,51 @@ def remove_watchlist_config_key(
             (f"$.{key}", item_id),
         )
         return int(cursor.rowcount)
+
+
+def set_watchlist_config_key(
+    item_id: int, key: str, value: Any, *, db_path: Path | None = None
+) -> int:
+    """Set one top-level key in a watchlist row's ``config_json`` in place
+    (SQLite ``json_set``), the counterpart of ``remove_watchlist_config_key``.
+    ``value`` is stored as JSON. Returns the rowcount."""
+    if not key.isidentifier():
+        raise ValueError(f"Cannot set config key {key!r}")
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE watchlist SET config_json = json_set(config_json, ?, json(?)) WHERE id = ?",
+            (f"$.{key}", json.dumps(value), item_id),
+        )
+        return int(cursor.rowcount)
+
+
+def recent_alert_statuses(
+    watchlist_id: int,
+    *,
+    after_alert_id: int = 0,
+    limit: int = 8,
+    db_path: Path | None = None,
+) -> list[tuple[int, str]]:
+    """``(alert_id, status)`` of the newest alerts this watch raised, newest
+    first, counting only alerts with an id above ``after_alert_id``. One row
+    per alert, however many signals it absorbed. Empty when the alerts table
+    is missing."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    try:
+        with _get_conn(db_path) as conn:
+            rows = conn.execute(
+                "SELECT a.id AS id, a.status AS status FROM alerts a "
+                "WHERE a.id IN (SELECT promoted_alert_id FROM external_signals "
+                "WHERE watchlist_id = ? AND promoted_alert_id IS NOT NULL) "
+                "AND a.id > ? ORDER BY a.id DESC LIMIT ?",
+                (watchlist_id, after_alert_id, limit),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        logger.debug("recent_alert_statuses: alerts table unavailable", exc_info=True)
+        return []
+    return [(int(r["id"]), str(r["status"])) for r in rows]
 
 
 def delete_watchlist_item(item_id: int, db_path: Path | None = None) -> bool:
@@ -585,6 +724,8 @@ def set_enabled(
     db_path: Path | None = None,
 ) -> bool:
     with _get_conn(db_path) as conn:
+        if enabled:
+            _email_watch_reads_from_now(conn, item_id)
         cursor = conn.execute(
             "UPDATE watchlist SET enabled = ? WHERE id = ?",
             (1 if enabled else 0, item_id),
@@ -654,10 +795,12 @@ def delete_pending_suggestion(item_id: int, db_path: Path | None = None) -> bool
 
 def quiet_pending_suggestion(item_id: int, db_path: Path | None = None) -> bool:
     """The too_noisy remedy: a pending suggestion goes live as a research
-    watch with a high severity floor. Conditional on it still being pending."""
+    watch that only tells the person about big changes (``only_big`` in its
+    trigger). Conditional on it still being pending."""
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
-            "UPDATE watchlist SET mode = ?, origin = ?, enabled = 1, severity_floor = 'high' "
+            "UPDATE watchlist SET mode = ?, origin = ?, enabled = 1, "
+            "trigger_json = json_set(trigger_json, '$.only_big', json('true')) "
             "WHERE id = ? AND origin = ? AND mode = ?",
             (MODE_ACTIVE, ORIGIN_RESEARCH, item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
         )
@@ -944,6 +1087,18 @@ def mark_signal_processed(
         )
 
 
+def set_signal_severity(
+    signal_id: int, severity: str, *, db_path: Path | None = None,
+) -> None:
+    """Overwrite a signal's recorded severity (after relevance grading)."""
+    AlertSeverity(severity)  # reject a value the column must never hold
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE external_signals SET severity_hint = ? WHERE id = ?",
+            (severity, signal_id),
+        )
+
+
 def get_page_watch_state(
     slug: str, db_path: Path | None = None
 ) -> dict[str, Any] | None:
@@ -953,11 +1108,19 @@ def get_page_watch_state(
         return None
     with _get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT slug, content_hash, text_snapshot, updated_at "
+            "SELECT slug, content_hash, text_snapshot, links_json, updated_at "
             "FROM page_watch_state WHERE slug = ?",
             (slug,),
         ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    state = dict(row)
+    try:
+        links = json.loads(state.pop("links_json", None) or "[]")
+    except ValueError:
+        links = []
+    state["links"] = links if isinstance(links, list) else []
+    return state
 
 
 def upsert_page_watch_state(
@@ -965,18 +1128,24 @@ def upsert_page_watch_state(
     content_hash: str,
     text_snapshot: str,
     *,
+    links: list[dict[str, str]] | None = None,
     db_path: Path | None = None,
 ) -> None:
     """Insert or replace the page_watch baseline for a slug."""
     with _get_conn(db_path) as conn:
         conn.execute(
-            "INSERT INTO page_watch_state (slug, content_hash, text_snapshot, updated_at) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO page_watch_state "
+            "(slug, content_hash, text_snapshot, links_json, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(slug) DO UPDATE SET "
             "content_hash = excluded.content_hash, "
             "text_snapshot = excluded.text_snapshot, "
+            "links_json = excluded.links_json, "
             "updated_at = excluded.updated_at",
-            (slug, content_hash, text_snapshot, datetime.now(UTC).isoformat()),
+            (
+                slug, content_hash, text_snapshot, json.dumps(links or []),
+                datetime.now(UTC).isoformat(),
+            ),
         )
 
 
@@ -1007,12 +1176,13 @@ def list_recent_signals(
     db_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Read recent signals — used by the reflection context extension in PR-C
-    and by the audit/debug endpoints."""
+    and by the audit/debug endpoints. The company's only: an email watch's
+    signals are its owner's (``monitoring.mailbox``)."""
     resolved = _resolve_db_path(db_path)
     if not resolved.exists():
         return []
-    clauses: list[str] = []
-    params: list[Any] = []
+    clauses: list[str] = ["source_kind != ?"]
+    params: list[Any] = [SOURCE_KIND_MAILBOX]
     if since is not None:
         clauses.append("captured_at >= ?")
         params.append(since.isoformat())
@@ -1031,10 +1201,39 @@ def list_recent_signals(
     return [_row_to_signal_dict(row) for row in rows]
 
 
+def last_told_by_watch(db_path: Path | None = None) -> dict[int, dict[str, Any]]:
+    """``{watchlist id: newest signal it told the person about}``: the row's
+    ``captured_at``, ``normalized_summary`` and ``provenance_url``. One query
+    for the whole list."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return {}
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT s.watchlist_id, s.captured_at, s.processed_at, s.normalized_summary, "
+            "s.provenance_url FROM external_signals s JOIN ("
+            "SELECT watchlist_id, MAX(id) AS id FROM external_signals "
+            "WHERE processed_outcome = ? GROUP BY watchlist_id"
+            ") newest ON newest.id = s.id",
+            (OUTCOME_ALERTED,),
+        ).fetchall()
+    return {int(row["watchlist_id"]): dict(row) for row in rows}
+
+
+def watches_for_goals(db_path: Path | None = None) -> dict[int, list[WatchlistItem]]:
+    """``{goal id: its watches}``, suggestions left out."""
+    out: dict[int, list[WatchlistItem]] = {}
+    for item in list_watchlist(db_path=db_path):
+        if item.goal_id is not None and item.origin != ORIGIN_RESEARCH_PROPOSED:
+            out.setdefault(item.goal_id, []).append(item)
+    return out
+
+
 def list_signals_for_watchlist(
     watchlist_id: int,
     *,
     limit: int = 50,
+    told_only: bool = False,
     db_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Recent signals for one monitor, newest first.
@@ -1050,10 +1249,54 @@ def list_signals_for_watchlist(
         rows = conn.execute(
             "SELECT * FROM external_signals "
             "WHERE watchlist_id = ? "
-            "ORDER BY captured_at DESC LIMIT ?",
+            + ("AND processed_outcome = 'alerted' " if told_only else "")
+            + "ORDER BY captured_at DESC LIMIT ?",
             (watchlist_id, limit),
         ).fetchall()
     return [_row_to_signal_dict(row) for row in rows]
+
+
+def recorded_dedup_keys(keys: list[str], *, db_path: Path | None = None) -> set[str]:
+    """Which of ``keys`` are already in ``external_signals``."""
+    if not keys or not _resolve_db_path(db_path).exists():
+        return set()
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT dedup_key FROM external_signals WHERE dedup_key IN ({','.join('?' * len(keys))})",
+            keys,
+        ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def list_held_signals(
+    watchlist_id: int, db_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Signals of one watch held for its daily digest, oldest first."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM external_signals "
+            "WHERE watchlist_id = ? AND processed_outcome = ? "
+            "ORDER BY captured_at ASC, id ASC",
+            (watchlist_id, OUTCOME_HELD_DIGEST),
+        ).fetchall()
+    return [_row_to_signal_dict(row) for row in rows]
+
+
+def watchlist_ids_with_held_signals(db_path: Path | None = None) -> list[int]:
+    """Watches that have at least one signal waiting for their digest."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT watchlist_id FROM external_signals "
+            "WHERE processed_outcome = ?",
+            (OUTCOME_HELD_DIGEST,),
+        ).fetchall()
+    return [int(r[0]) for r in rows]
 
 
 # Re-export for callers that prefer ``store.DB_PATH`` over importing from
@@ -1068,6 +1311,7 @@ __all__ = [
     "initialize_db",
     "insert_signal",
     "insert_watchlist_item",
+    "list_held_signals",
     "list_recent_signals",
     "list_signals_for_watchlist",
     "list_watchlist",
@@ -1075,9 +1319,16 @@ __all__ = [
     "mark_polled",
     "get_page_watch_state",
     "mark_signal_processed",
+    "recent_alert_statuses",
     "remove_watchlist_config_key",
+    "last_told_by_watch",
     "set_enabled",
+    "set_last_check_note",
+    "set_signal_severity",
+    "watches_for_goals",
+    "set_watchlist_config_key",
     "update_signal_enrichment",
     "update_watchlist_fields",
     "upsert_page_watch_state",
+    "watchlist_ids_with_held_signals",
 ]

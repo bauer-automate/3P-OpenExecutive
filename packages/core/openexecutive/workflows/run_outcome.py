@@ -45,6 +45,21 @@ _MAX_LINE = 160
 _TITLE_NOISE = re.compile(r"\s*(\(.*\)|\d{4}-\d{2}-\d{2}|\d{4}-W\d{2})\s*$")
 
 
+# What a run's log title says about how it started, never shown to anyone.
+HOW_IT_STARTED: tuple[str, ...] = (
+    "(periodic)", "(post-onboarding auto-fire)", "(chat-tool fire)",
+)
+
+
+def shown_title(title: str) -> str:
+    """A run's title as people read it: without the note on how it started
+    ("Post-mortem (chat-tool fire)" reads "Post-mortem")."""
+    for note in HOW_IT_STARTED:
+        if title.endswith(note):
+            return title[: -len(note)].rstrip() or title
+    return title
+
+
 def has_write_up(artifact: str | None) -> bool:
     """Whether the run kept a write-up worth opening."""
     return (artifact or "").strip() not in _EMPTY_ARTIFACTS
@@ -88,8 +103,8 @@ def outcome_line(run: dict[str, Any]) -> str | None:
     if name == "department_check_in":
         return _check_in_line(artifact)
     if name == "weekly_review":
-        return _weekly_line(artifact) or _first_sentence(artifact)
-    return _first_sentence(artifact)
+        return _weekly_line(artifact) or first_sentence(artifact)
+    return first_sentence(artifact)
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +114,21 @@ def outcome_line(run: dict[str, Any]) -> str | None:
 
 def _research_line(artifact: str) -> str:
     """`executive_research._render_artifact`: findings, then what it did."""
-    found = re.search(r"_(\d+) finding\(s\) after dedup", artifact)
+    found = re.search(r"_(\d+) (?:updates? reviewed|finding\(s\) after dedup)", artifact)
     looked = int(found.group(1)) if found else 0
-    messages = flagged = other = 0
+    messages = flagged = other = held = 0
+    for line in _section(artifact, "What I did"):
+        if not line.startswith("- "):
+            continue
+        if line.startswith("- Waiting for your OK"):
+            held += 1
+        elif line.startswith(("- Messaged", "- Posted to")):
+            messages += 1
+        elif line.startswith("- Flagged for you"):
+            flagged += 1
+        else:
+            other += 1
+    # Runs written before the write-up named what it did in words.
     for line in _section(artifact, "Actions routed"):
         if not line.startswith("- ✓"):
             continue
@@ -123,6 +150,7 @@ def _research_line(artifact: str) -> str:
             _count(messages, "sent {n} message", "sent {n} messages"),
             _count(flagged, "flagged {n} thing for you", "flagged {n} things for you"),
             _count(other, "took {n} other step", "took {n} other steps"),
+            _count(held, "left {n} step for your OK", "left {n} steps for your OK"),
             _count(watching, "started watching {n} thing", "started watching {n} things"),
             _count(suggested, "suggested {n} thing to watch", "suggested {n} things to watch"),
         ) if part
@@ -152,7 +180,7 @@ def _weekly_line(artifact: str) -> str | None:
     return None
 
 
-def _first_sentence(artifact: str) -> str | None:
+def first_sentence(artifact: str) -> str | None:
     """The first line of prose in a write-up, without its Markdown."""
     for raw in artifact.splitlines():
         line = raw.strip()

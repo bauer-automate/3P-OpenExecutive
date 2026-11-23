@@ -123,7 +123,10 @@ def test_noted_today_block_recaps_today_and_what_is_due_tomorrow(roster: SimpleN
 
 
 def test_only_an_owner_with_the_switch_on_keeps_notes_for_a_brief(roster: SimpleNamespace) -> None:
-    assert hb.owner_keeping_notes() is None
+    # On for the owner until they turn it off.
+    owner = hb.owner_keeping_notes()
+    assert owner is not None and owner.id == roster.owner
+    h.set_person_settings(roster.owner, by="test", reply_notes=False)
     _keep(roster.teammate)
     assert hb.owner_keeping_notes() is None
     _keep(roster.owner)
@@ -196,6 +199,7 @@ def test_no_notes_in_the_brief_with_the_owners_switch_off(
     roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _capture(monkeypatch)
+    h.set_person_settings(roster.owner, by="test", reply_notes=False)
     _note(roster.owner, "the price list goes to Dana", due=TODAY)
     events = asyncio.run(_brief(delivered=True))
     assert "FROM YOUR NOTES" not in str(calls[-1]["rendered_context"])
@@ -269,6 +273,112 @@ def test_the_digest_recaps_the_owners_notes_only_when_it_is_theirs(
     assert _result(mine)["private_to_principal"] is True
 
 
+def test_the_digest_reads_the_owners_lessons_only_when_it_is_theirs(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive import providers
+    from openexecutive.briefing import grounding
+    from openexecutive.memory import lessons
+
+    provider = _Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _m: provider)
+    monkeypatch.setattr("openexecutive.agents.utility_fast.get_fast_model", lambda: "claude-test")
+
+    async def _ground(text: str, **_kw: Any) -> tuple[str, None]:
+        return text, None
+
+    monkeypatch.setattr(grounding, "ground_brief", _ground)
+    monkeypatch.setattr(lessons, "with_owner_lessons", lambda text, **_kw: text + "\nOWNER LESSONS")
+
+    asyncio.run(_digest(False))
+    assert "OWNER LESSONS" not in provider.calls[-1]["messages"][0]["content"]
+    asyncio.run(_digest(True))
+    assert "OWNER LESSONS" in provider.calls[-1]["messages"][0]["content"]
+
+
+def test_the_digest_reads_the_owners_own_chats_today_only_when_it_is_theirs(
+    db: Path, roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What moved today is mostly said in chat: the digest written for the
+    owner alone carries their own conversations with the Executive (their
+    words and its replies), never a teammate's, and a shared run carries
+    none. Without it the digest reported only its own briefs."""
+    import functools
+
+    from openexecutive import providers
+    from openexecutive.briefing import grounding
+    from openexecutive.memory import session_store
+
+    provider = _Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _m: provider)
+    monkeypatch.setattr("openexecutive.agents.utility_fast.get_fast_model", lambda: "claude-test")
+
+    async def _ground(text: str, **_kw: Any) -> tuple[str, None]:
+        return text, None
+
+    monkeypatch.setattr(grounding, "ground_brief", _ground)
+    monkeypatch.setattr(
+        session_store, "own_conversation_since",
+        functools.partial(session_store.own_conversation_since, db_path=db),
+    )
+    stamp = NOW.isoformat()
+    session_store.create_session("s-owner", "Maple Court offers", stamp, roster.owner, db_path=db)
+    session_store.create_session("s-ben", "Ben's chat", stamp, roster.teammate, db_path=db)
+    session_store.save_message("s-owner", "user", "Where did the top offer land?", db_path=db)
+    session_store.save_message(
+        "s-owner", "assistant", "Harbor Partners came up to $4.5M; final numbers Monday.", db_path=db,
+    )
+    session_store.save_message("s-ben", "user", "Ben's private question", db_path=db)
+
+    shared = asyncio.run(_digest(False))
+    assert "TODAY WITH YOU" not in provider.calls[-1]["messages"][0]["content"]
+    assert _result(shared)["private_to_principal"] is False
+
+    mine = asyncio.run(_digest(True))
+    content = provider.calls[-1]["messages"][0]["content"]
+    assert "TODAY WITH YOU" in content
+    assert "the reader: Where did the top offer land?" in content
+    assert "the Executive: Harbor Partners came up to $4.5M" in content
+    assert "Ben's private question" not in content
+    assert _result(mine)["private_to_principal"] is True
+
+
+def test_the_digest_follows_a_leave_out_quietly_and_leads_with_the_day(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subject the owner asked to keep out of their briefs reaches the
+    digest written for them alone as a leave-out (never a shared run), and the prompt says to leave it out without
+    announcing it, never report its own briefs, and skip empty sections."""
+    from openexecutive import providers
+    from openexecutive.briefing import brief_requests, grounding
+    from openexecutive.workflows.end_of_day_digest import (
+        _EOD_DIGEST_SOLO_SYSTEM,
+        _EOD_DIGEST_SYSTEM,
+    )
+
+    provider = _Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _m: provider)
+    monkeypatch.setattr("openexecutive.agents.utility_fast.get_fast_model", lambda: "claude-test")
+
+    async def _ground(text: str, **_kw: Any) -> tuple[str, None]:
+        return text, None
+
+    monkeypatch.setattr(grounding, "ground_brief", _ground)
+    monkeypatch.setattr(
+        brief_requests, "render_parts",
+        lambda **_kw: ("", brief_requests.LEAVE_OUT_HEADER + "\n- the lender's silence"),
+    )
+    asyncio.run(_digest(False))
+    assert "the lender's silence" not in provider.calls[-1]["messages"][0]["content"]
+    asyncio.run(_digest(True))
+    assert "- the lender's silence" in provider.calls[-1]["messages"][0]["content"]
+    for prompt in (_EOD_DIGEST_SYSTEM, _EOD_DIGEST_SOLO_SYSTEM):
+        assert "TODAY WITH YOU" in prompt
+        assert "Never report a brief, digest or reflection you sent" in prompt
+        assert "just leave it out" in prompt
+        assert "never a line saying a section is empty" in prompt
+
+
 # --------------------------------------------------------------------------- #
 # Reminders
 # --------------------------------------------------------------------------- #
@@ -314,6 +424,7 @@ def test_no_reminder_for_chat_promises_other_days_or_the_switch_off(
     _note(roster.owner, "the deck goes to Sam", due=TODAY + timedelta(days=1))
     _note(roster.owner, "the venue is booked", kind="shared", due=TODAY)
     _note(roster.teammate, "the venue deposit goes in", due=TODAY)
+    h.set_person_settings(roster.teammate, by="test", reply_notes=False)
     assert asyncio.run(hr.remind_due(NOW)) == 0 and sends == []
 
 
@@ -339,8 +450,9 @@ def test_a_failed_send_is_not_repeated_the_same_day(
 def test_the_senders_rows_are_the_persons_own_and_off_the_activity_rail(
     roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, db: Path,
 ) -> None:
-    from openexecutive.audit import context as audit_context
     import sqlite3
+
+    from openexecutive.audit import context as audit_context
     from openexecutive.orchestrator import schedule_tools
     from openexecutive.scheduler import runner
 

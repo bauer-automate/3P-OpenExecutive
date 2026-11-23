@@ -89,13 +89,13 @@ class _Provider:
             return SimpleNamespace(content=[SimpleNamespace(
                 type="tool_use", id="g0", name=cr.GRADE_TOOL["name"], input={"grades": self.grades},
             )])
-        self.calls.append(kw)
+        self.calls.append({**kw, "messages": list(kw["messages"])})
         uses = self.script.pop(0) if self.script else []
         content = [
             SimpleNamespace(type="tool_use", id=f"tu{i}", name=name, input=args)
             for i, (name, args) in enumerate(uses)
         ] or [SimpleNamespace(type="text", text="nothing")]
-        return SimpleNamespace(content=content)
+        return SimpleNamespace(content=content, stop_reason="tool_use" if uses else "end_turn")
 
 
 @pytest.fixture
@@ -250,6 +250,51 @@ def test_it_closes_a_loop_the_person_said_is_done(db: Path, roster: SimpleNamesp
     _review(db)
     assert get_open_loop(loop_id) is None  # closed
     assert _tool_results(provider)[0]["status"] == "closed"
+
+
+def test_a_fact_is_saved_once_a_review(db: Path, roster: SimpleNamespace, provider: _Provider) -> None:
+    _record(roster.principal)
+    fact = {"subject": "Vendor email", "statement": "The vendor email was sent already.",
+            "source_quote": "I sent the vendor email already"}
+    provider.script = [[("remember_fact", fact), ("remember_fact", {**fact, "subject": " vendor  EMAIL"})]]
+    _review(db)
+    first, second = _tool_results(provider)
+    assert first["status"] == "ok"
+    assert second["status"] == "noop" and "already saved" in second["detail"]
+
+
+def test_the_review_ends_once_it_has_made_its_changes(db: Path, roster: SimpleNamespace,
+                                                     provider: _Provider) -> None:
+    _record(roster.principal)
+    fact = {"statement": "The vendor email was sent already.", "source_quote": "I sent the vendor email already"}
+    provider.script = [
+        [("remember_fact", {**fact, "subject": f"Vendor email {i}"}) for i in range(cr.MAX_CHANGES)],
+        [("remember_fact", {**fact, "subject": "One more"})],
+    ]
+    _review(db)
+    assert len(provider.calls) == 1
+
+
+def test_a_review_that_fails_part_way_still_lists_its_changes(db: Path, roster: SimpleNamespace,
+                                                              provider: _Provider) -> None:
+    _record(roster.principal)
+    fact = {"subject": "Vendor email", "statement": "The vendor email was sent already.",
+            "source_quote": "I sent the vendor email already"}
+    provider.script = [[("remember_fact", fact)]]
+    calls = {"n": 0}
+    create = provider.messages_create
+
+    async def _then_fail(**kw: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] > 2:  # the grading call, the change, then the provider goes down
+            raise RuntimeError("provider down")
+        return await create(**kw)
+
+    provider.messages_create = _then_fail  # type: ignore[method-assign]
+    _review(db)
+    events = audit_logger.get_audit_logger().query(event_type="chat_review", all_owners=True)
+    failed = [e for e in events if "FAILED" in e.summary]
+    assert failed and failed[0].details["changes"] == ["remember_fact"]
 
 
 def test_a_change_without_their_words_is_refused(db: Path, roster: SimpleNamespace,
@@ -463,7 +508,7 @@ def test_it_grades_each_turn_and_keeps_what_they_wanted(db: Path, roster: Simple
     _record(roster.principal, text=ASK, reply="I'll keep an eye on it.", at=NOW)
     _record(roster.principal, text=AGAIN, reply="Sorry, creating it now.", at=NOW + timedelta(minutes=2))
     provider.grades = [
-        {"turn": 1, "verdict": "miss", "kind": "company",
+        {"turn": 1, "verdict": "miss", "kind": "company", "cause": "do_it",
          "wanted": "The alert created in the turn, not a promise to watch.",
          "quote": "did you set up that alert"},
         {"turn": 2, "verdict": "fine"},
@@ -473,7 +518,7 @@ def test_it_grades_each_turn_and_keeps_what_they_wanted(db: Path, roster: Simple
     assert provider.grade_calls[0]["tool_choice"] == {"type": "tool", "name": "grade_turns"}
     assert "[1] SIGNALS: none" in _grade_content(provider)
     first, second = _turns(db)
-    assert first["verdict"] == "miss" and first["kind"] == "company"
+    assert first["verdict"] == "miss" and first["kind"] == "company" and first["cause"] == "do_it"
     assert first["wanted"] == "The alert created in the turn, not a promise to watch."
     assert first["graded_at"] is not None and json.loads(first["signals"]) == []
     assert second["verdict"] == "fine" and second["wanted"] is None
@@ -493,6 +538,20 @@ def test_a_miss_without_their_words_is_unclear(db: Path, roster: SimpleNamespace
     [row] = _turns(db)
     assert row["verdict"] == "unclear" and row["wanted"] is None and row["kind"] is None
     assert cr.weekly_rates(person_id=None, db_path=db) == [{"week": "2026-W42", "graded": 1, "misses": 0}]
+
+
+def test_a_cause_from_the_other_kind_is_dropped(db: Path, roster: SimpleNamespace, provider: _Provider) -> None:
+    _record(roster.principal, text=ASK, reply="I'll keep an eye on it.", at=NOW)
+    _record(roster.principal, text=AGAIN, reply="Sorry, creating it now.", at=NOW + timedelta(minutes=2))
+    provider.grades = [
+        {"turn": 1, "verdict": "miss", "kind": "product", "cause": "term",
+         "wanted": "The alert created.", "quote": "did you set up that alert"},
+        {"turn": 2, "verdict": "fine", "cause": "tool"},
+    ]
+    _review(db)
+    first, second = _turns(db)
+    assert first["verdict"] == "miss" and first["kind"] == "product" and first["cause"] is None
+    assert second["verdict"] == "fine" and second["cause"] is None
 
 
 def test_a_skipped_or_odd_grade_is_unclear(db: Path, roster: SimpleNamespace, provider: _Provider) -> None:
@@ -531,7 +590,7 @@ def test_the_signals_the_product_recorded_reach_the_grader(db: Path, roster: Sim
     _review(db)
     content = _grade_content(provider)
     assert ("[1] SIGNALS: thumbs down: it never made the alert; stopped the reply; "
-            "the reply claimed a change no tool made; tool create_alert failed") in content
+            "the reply claimed a change no tool made, and was sent back once to make it or say so; tool create_alert failed") in content
     assert "[2] SIGNALS: took the turn back to ask again" in content
     first, second = _turns(db)
     assert first["message_id"] == mid and second["message_id"] is None
@@ -579,13 +638,80 @@ def test_a_deleted_chat_takes_its_turns_with_it(db: Path, roster: SimpleNamespac
     assert _turns(db) == []
 
 
-def test_a_chat_that_read_its_owners_mail_is_not_kept(db: Path, roster: SimpleNamespace) -> None:
+def test_a_chat_that_read_its_owners_mail_is_kept_without_the_mail(db: Path, roster: SimpleNamespace) -> None:
+    """A chat that read the owner's mail is reviewed, but its tools are kept
+    by name only: their results are other people's mail."""
     from openexecutive.memory.session_store import create_session, mark_mail_private
 
     create_session("s-1", "Mail", NOW.isoformat(), roster.principal.id, db_path=db)
     mark_mail_private("s-1", roster.principal.id, db_path=db)
-    assert _record(roster.principal, text=ASK, reply="Your inbox has two from Dana.") is None
-    assert _turns(db) == []
+    calls = [("search_gmail", "From Dana: the counter is 5k over"), ("create_alert", '{"error": "off"}')]
+    assert cr.record_turn(ASK, "Dana came up 5k.", session=_web(roster.principal.id),
+                          person_id=roster.principal.id, calls=calls, now=NOW) is not None
+    # The turn that read the mail itself, before the chat is marked.
+    assert cr.record_turn(AGAIN, "Two from Dana.", session=_web(roster.principal.id, session_id="s-2"),
+                          person_id=roster.principal.id, calls=calls, mail=True, now=NOW) is not None
+    for row in _turns(db):
+        assert json.loads(row["calls"]) == [{"tool": "search_gmail", "result": ""},
+                                            {"tool": "create_alert", "result": "error"}]
+        assert cr._failed_calls(row) == ["create_alert"]
+
+
+def test_the_review_of_a_chat_that_read_mail_writes_only_its_persons_rows(
+    db: Path, roster: SimpleNamespace, provider: _Provider
+) -> None:
+    from openexecutive.memory.session_store import create_session
+
+    create_session("s-1", "Offer", NOW.isoformat(), roster.teammate.id, db_path=db)
+    cr.record_turn(ASK, "Dana came up 5k.", session=_web(roster.teammate.id), person_id=roster.teammate.id,
+                   calls=[], mail=True, now=NOW)
+    provider.grades = [{"turn": 1, "verdict": "fine"}]
+    _review(db)
+    [row] = _turns(db)
+    assert row["mail"] == 1
+    events = audit_logger.get_audit_logger().query(event_type="chat_review", all_owners=True)
+    review = [e for e in events if "conversation review for person" in e.summary]
+    assert review and all(e.private and e.private_to_person == roster.teammate.id for e in review)
+
+
+def test_a_chat_that_read_mail_keeps_no_fact(roster: SimpleNamespace) -> None:
+    names = {t["name"] for t in cr._tools_for(roster.principal, mail=True)[0]}
+    assert "remember_fact" not in names and "close_open_loop" in names
+    assert "remember_fact" in {t["name"] for t in cr._tools_for(roster.principal)[0]}
+
+
+def test_a_miss_the_product_recorded_needs_no_quote(db: Path, roster: SimpleNamespace,
+                                                    provider: _Provider) -> None:
+    from openexecutive.audit import log_event
+    from openexecutive.audit.context import set_turn
+
+    with set_turn(session_id="s-1", turn_id="turn-1"):
+        _record(roster.principal, text=ASK, reply="I've cancelled it.")
+    log_event("claim_check", "Reply claimed a change no tool made", session_id="s-1", turn_id="turn-1",
+              actor="executive")
+    _record(roster.principal, text=AGAIN, reply="Done.", at=NOW + timedelta(minutes=1))
+    provider.grades = [
+        {"turn": 1, "verdict": "miss", "kind": "company", "wanted": "The alert actually cancelled."},
+        {"turn": 2, "verdict": "miss", "wanted": "Something else."},
+    ]
+    _review(db)
+    first, second = _turns(db)
+    assert first["verdict"] == "miss" and first["wanted"] == "The alert actually cancelled."
+    assert second["verdict"] == "unclear"  # no signal and no quote
+
+
+def test_a_typed_thumbs_down_counts_as_one(db: Path, roster: SimpleNamespace, provider: _Provider) -> None:
+    _record(roster.principal, text=ASK, reply="I'll keep an eye on it.", at=NOW)
+    _record(roster.principal, text="Thumbs down.", reply="Sorry about that.", at=NOW + timedelta(minutes=1))
+    _record(roster.principal, text="[Voice note, transcribed]\n👍", reply="Glad it helped.",
+            at=NOW + timedelta(minutes=2))
+    _record(roster.principal, text="thumbs down on the weather", reply="Noted.", at=NOW + timedelta(minutes=3))
+    provider.grades = [{"turn": i, "verdict": "fine"} for i in range(1, 5)]
+    _review(db)
+    content = _grade_content(provider)
+    assert "[1] SIGNALS: thumbs down" in content
+    assert "[2] SIGNALS: thumbs up" in content
+    assert "[3] SIGNALS: none" in content
 
 
 def test_a_miss_outlives_the_week_and_a_fine_turn_does_not(db: Path, roster: SimpleNamespace,
@@ -636,9 +762,33 @@ def test_misses_are_listed_per_person_and_forgotten_by_their_owner(db: Path, ros
     assert [m["person_name"] for m in everyone] == ["Olivia Owner"]
     miss = everyone[0]
     assert miss["message"] == ASK and miss["wanted"] == "The alert created." and miss["kind"] == "company"
+    assert miss["cause"] is None
     assert miss["session_id"] == "s-1" and miss["tools"] == [] and miss["signals"] == []
     assert cr.list_misses(person_id=roster.teammate.id, db_path=db) == []
     assert not cr.forget_miss(miss["id"], caller_person_id=roster.teammate.id, db_path=db)
     assert not cr.forget_miss(miss["id"] + 50, caller_person_id=roster.principal.id, db_path=db)
     assert cr.forget_miss(miss["id"], caller_person_id=roster.principal.id, db_path=db)
     assert cr.list_misses(person_id=None, db_path=db) == []
+
+
+def test_a_short_quote_backs_a_fix_when_it_names_the_thing() -> None:
+    """Two of their words are enough, and one word in common (by stem) ties
+    the change to them; a change about something else is still refused."""
+    ok = {"source_quote": "drop invoices", "item": "the overdue invoice reminder"}
+    assert cr._target_refusal("leave_out_of_brief", ok, "drop invoices") is None
+    one_word = {"source_quote": "invoices", "item": "the overdue invoice reminder"}
+    assert "at least" in (cr._target_refusal("leave_out_of_brief", one_word, "invoices") or "")
+    elsewhere = {"source_quote": "drop invoices", "item": "the hiring plan"}
+    assert cr._target_refusal("leave_out_of_brief", elsewhere, "drop invoices") == (
+        "what this changes isn't named in their own words")
+
+
+@pytest.mark.parametrize("quote", ["ok thanks", "sounds good", "do it", "not now", "great, thanks"])
+@pytest.mark.parametrize(("tool", "tool_input"), [
+    ("leave_out_of_brief", {"item": "sounds good report"}),
+    ("remember_fact", {"subject": "thanks", "statement": "Send thanks notes to the team"}),
+    ("learn_reply_style", {"rule": "Say thanks and keep it good and short"}),
+])
+def test_a_filler_reply_backs_no_fix(quote: str, tool: str, tool_input: dict[str, str]) -> None:
+    assert cr._target_refusal(tool, {**tool_input, "source_quote": quote}, quote) == (
+        "what this changes isn't named in their own words")

@@ -145,7 +145,7 @@ async def test_happy_path_calls_tools_and_reports(
     assert [k for k, _ in out] == ["progress", "progress", "output"]
     report = out[-1][1]
     assert report.startswith("Added 1 bill (Acme, $10) to Bill tracker.")
-    assert f"`{READ}` — ok" in report and f"`{APPEND}` — ok" in report
+    assert "- Sheets: read values — ok" in report and "- Sheets: append rows — ok" in report
     assert [c["name"] for c in gateway.calls] == [READ, APPEND]
     assert gateway.calls[1]["arguments"] == {"rows": [["Acme", "10"]]}
 
@@ -196,7 +196,7 @@ async def test_tool_outside_the_allowlist_is_refused(
     assert gateway.calls == []  # never reached the gateway
     result = provider.calls[1]["messages"][-1]["content"][0]
     assert result["is_error"] is True and "not one of this step's tools" in result["content"]
-    assert "`gmail__send_message` — refused: not allowed" in out[-1][1]
+    assert "- Gmail: send message — refused: not allowed" in out[-1][1]
     assert audit[0]["details"]["outcome"] == "refused: not allowed"
 
 
@@ -234,7 +234,7 @@ async def test_tool_errors_go_back_to_the_model(
     _install(monkeypatch, provider)
     out = await _run(_step())
     assert provider.calls[1]["messages"][-1]["content"][0]["is_error"] is True
-    assert f"`{APPEND}` — error" in out[-1][1]
+    assert "- Sheets: append rows — error" in out[-1][1]
 
 
 @pytest.mark.asyncio
@@ -247,12 +247,12 @@ async def test_builtin_tools_run_locally(
         seen.append(tool_input)
         return "Invoice total 42"
 
-    monkeypatch.setattr(tc, "builtin_handler", lambda name: _fake_read if name == "oe__read_file" else None)
+    monkeypatch.setattr(tc, "builtin_handler", lambda name: _fake_read if name == "oe__read_document" else None)
     provider = _ScriptedProvider(
-        [_resp(_use("oe__read_file", {"path": "/x/bill.pdf"}, "tu_1")), _resp(_text("Read it."))]
+        [_resp(_use("oe__read_document", {"path": "/x/bill.pdf"}, "tu_1")), _resp(_text("Read it."))]
     )
     _install(monkeypatch, provider)
-    await _run(_step(tools=["oe__read_file"]))
+    await _run(_step(tools=["oe__read_document"]))
     assert seen == [{"path": "/x/bill.pdf"}]
     assert gateway.calls == []
 
@@ -336,7 +336,7 @@ async def test_running_out_of_turns_is_a_failure_that_lists_what_was_done(
     _install(monkeypatch, provider)
     out = await _run(step)
     assert out[-1][0] == "error"
-    assert "turn limit" in out[-1][1] and f"{READ} (ok)" in out[-1][1]
+    assert "turn limit" in out[-1][1] and "Sheets: read values (ok)" in out[-1][1]
 
 
 # --- engine wiring -----------------------------------------------------------
@@ -370,9 +370,9 @@ async def test_workflow_with_action_step_produces_an_artifact(
     types = [e.type for e in events]
     assert "progress" in types and "error" not in types
     progress = next(e for e in events if e.type == "progress")
-    assert progress.step_id == "file_bills" and APPEND in (progress.summary or "")
+    assert progress.step_id == "file_bills" and "Sheets" in (progress.summary or "") and APPEND not in (progress.summary or "")
     artifact = next(e for e in events if e.type == "artifact").content or ""
-    assert "Filed 1 bill." in artifact and f"`{APPEND}` — ok" in artifact
+    assert "Filed 1 bill." in artifact and "Sheets: append rows — ok" in artifact
 
 
 @pytest.mark.asyncio
@@ -548,3 +548,108 @@ async def test_write_calls_audit_their_targets_but_never_content(
     assert "targets" not in read_row["details"]  # read-only tool: nothing logged
     assert write_row["details"]["targets"] == {"spreadsheet_id": "sheet-XYZ"}
     assert "Acme" not in json.dumps(write_row)
+
+
+def test_openrouter_reasoning_survives_the_assistant_turn() -> None:
+    """Gemini's thought signature (OpenRouter reasoning_details) is kept for
+    the next request, or the tool call after it is rejected."""
+    from openexecutive.providers.translator import from_openai_response
+
+    details = [
+        {
+            "type": "reasoning.encrypted",
+            "data": "SIG",
+            "id": "tool_1",
+            "format": "google-gemini-v1",
+            "index": 0,
+        }
+    ]
+    reply = from_openai_response(
+        {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "tool_1",
+                                "function": {"name": "sheets__read_values", "arguments": "{}"},
+                            }
+                        ],
+                        "reasoning_details": details,
+                    },
+                }
+            ]
+        }
+    )
+    blocks = [act._block_to_dict(b) for b in reply.content]
+    assert blocks[0] is not None and blocks[0]["type"] == "tool_use"
+    assert blocks[-1] == {"type": "openrouter_reasoning", "reasoning_details": details}
+
+
+def test_progress_says_what_a_tool_is_doing_in_plain_words() -> None:
+    from openexecutive.workflows.action_step import progress_line
+
+    assert progress_line("google_workspace__search_gmail_messages", {"query": "invoice"}) == (
+        'Searching my email for "invoice"…'
+    )
+    assert progress_line("oe__send_telegram_message", {"text": "hi"}) == "Sending a Telegram message…"
+    assert progress_line("hubspot__create_contact", {"name": "Ada"}) == "Creating contact: Ada · Hubspot…"
+    assert progress_line("run_script", {}) == "Running a script…"
+    # A bad URL from the model still gives a line, never an error.
+    assert progress_line("oe__browser_navigate", {"url": "http://[bad"}).endswith("…")
+    long = progress_line("hubspot__create_contact", {"name": "Ada Lovelace " * 8})
+    assert long.startswith("Creating contact: Ada") and long.endswith("… · Hubspot…") and len(long) <= 81
+    for line in (progress_line("acme__get_x", None), progress_line("oe__whatever_tool", {})):
+        assert "__" not in line and line.endswith("…")
+
+
+async def test_reading_a_long_result_in_parts_leaves_turns_for_the_action(
+    monkeypatch: pytest.MonkeyPatch, gateway: _FakeGateway, audit: list[dict[str, Any]]
+) -> None:
+    """Next parts run no tool, so they don't use up the step's turns: a step
+    allowed one call reads a long sheet to the end and still files the row."""
+    from openexecutive.providers.feature_gate import ReadingLimits
+
+    monkeypatch.setattr(act, "reading_limits_for", lambda _m="": ReadingLimits(per_read=2_000, per_turn=100_000))
+    gateway.replies[READ] = "r" * 9_000
+    parts = [_resp(_use(READ, {"range": "A:B"}, f"tu_{n}")) for n in range(6)]
+    provider = _ScriptedProvider([
+        *parts,
+        _resp(_use(APPEND, {"values": [["x"]]}, "tu_add")),
+        _resp(_text("Filed it.")),
+    ])
+    _install(monkeypatch, provider)
+
+    out = await _run(_step(max_tool_calls=2))
+
+    assert [c["name"] for c in gateway.calls] == [READ, APPEND]
+    assert "[LAST PART" in str(provider.calls[6]["messages"][-1]["content"])
+    assert out[-1][0] == "output"
+
+
+async def test_a_long_result_is_read_in_parts_without_running_again(
+    monkeypatch: pytest.MonkeyPatch, gateway: _FakeGateway, audit: list[dict[str, Any]]
+) -> None:
+    """A step reads through the same shared reader as the Executive: a long
+    result comes in parts, and repeating the call brings the next part
+    without calling the tool again."""
+    from openexecutive.providers.feature_gate import ReadingLimits
+
+    monkeypatch.setattr(act, "reading_limits_for", lambda _m="": ReadingLimits(per_read=2_000, per_turn=100_000))
+    gateway.replies[READ] = "r" * 3_000
+    provider = _ScriptedProvider([
+        _resp(_use(READ, {"range": "A:B"}, "tu_1")),
+        _resp(_use(READ, {"range": "A:B"}, "tu_2")),
+        _resp(_text("Read it all.")),
+    ])
+    _install(monkeypatch, provider)
+
+    out = await _run(_step())
+
+    assert len(gateway.calls) == 1
+    first = provider.calls[1]["messages"][-1]["content"][0]["content"]
+    second = provider.calls[2]["messages"][-1]["content"][0]["content"]
+    assert "exactly the same input" in first and len(first) <= 2_000
+    assert "[LAST PART" in second
+    assert out[-1][0] == "output"

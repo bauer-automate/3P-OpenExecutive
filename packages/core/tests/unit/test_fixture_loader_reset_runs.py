@@ -15,13 +15,12 @@ wipe tuple and that the deletion actually works against the live schemas.
 """
 from __future__ import annotations
 
-import inspect
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from openexecutive.cli.fixture_loader import _delete_all_rows, reset_all_state
+from openexecutive.cli.fixture_loader import _delete_all_rows
 
 
 @pytest.fixture
@@ -88,29 +87,15 @@ def test_reset_clears_workflow_runs_audit_log_and_eval_runs(
         assert conn.execute("SELECT COUNT(*) FROM eval_runs").fetchone()[0] == 0
 
 
-def test_reset_all_state_wipe_list_includes_run_history_tables() -> None:
-    """Guard against silently dropping a table from the wipe list.
+def test_reset_all_state_keeps_none_of_the_run_history_or_act_as_me() -> None:
+    """A reset empties every table but RESET_KEEPS, so run, audit and eval
+    history, the decision ledger and every Act as me table go, except the
+    marker of its one-time upgrades."""
+    from openexecutive.cli.fixture_loader import RESET_KEEPS
+    from openexecutive.delegation.schema import TABLES as DELEGATION_TABLES
+    from openexecutive.delegation.schema import UPGRADES_TABLE
 
-    ``reset_all_state`` is a long async function with side effects (ChromaDB,
-    Honcho, file I/O) that makes it expensive to invoke from a unit test.
-    To make sure a future refactor doesn't quietly drop one of the run/audit
-    table names from the tuple passed to ``_delete_all_rows``, assert their
-    presence in the function's source.
-    """
-    src = inspect.getsource(reset_all_state)
-    for table in ("workflow_runs", "audit_log", "eval_runs"):
-        assert f'"{table}"' in src, (
-            f"reset_all_state no longer mentions {table!r} — the demo-page "
-            "reset will stop clearing it and previously-run jobs/audit/eval "
-            "rows will reappear after reset."
-        )
-
-
-def test_reset_all_state_wipes_the_decision_ledger_and_act_as_me() -> None:
-    """A reset box has proposed nothing, and keeps nobody's Act as me state.
-    Act as me's tables come from its own list, so a new one is wiped too."""
-    src = inspect.getsource(reset_all_state)
-    for table in ("decision_instances", "decision_class_state"):
-        assert f'"{table}"' in src
-    assert "*DELEGATION_TABLES" in src
+    for table in ("workflow_runs", "audit_log", "eval_runs", "decision_instances",
+                  "decision_class_state", *DELEGATION_TABLES):
+        assert (table in RESET_KEEPS) == (table == UPGRADES_TABLE)
 

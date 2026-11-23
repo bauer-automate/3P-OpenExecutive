@@ -4,8 +4,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Generator
-from contextlib import contextmanager
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +13,8 @@ from openexecutive.alerts.models import (
     Alert,
     MuteTopic,
 )
+from openexecutive.utils import db
+from openexecutive.utils.text_search import words_clause
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +30,7 @@ def _resolve_db_path(db_path: Path | None) -> Path:
     return db_path if db_path is not None else DB_PATH
 
 
-@contextmanager
-def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_get_conn = db.opener(_resolve_db_path, foreign_keys=True)
 
 
 def initialize_db(db_path: Path | None = None) -> None:
@@ -98,6 +90,14 @@ def initialize_db(db_path: Path | None = None) -> None:
             # conversation published it (orchestrator/artifact_records.py).
             # NULL on a draft = the principal's.
             ("owner_person_id", "INTEGER"),
+            # What the card needs from its reader (Alert.needs).
+            ("needs", "TEXT NOT NULL DEFAULT ''"),
+            ("question", "TEXT NOT NULL DEFAULT ''"),
+            ("choices", "TEXT NOT NULL DEFAULT '[]'"),
+            # The step Approve does, in a few words for its button ("Send
+            # the reply"). Written with ``suggested_action`` and cleared when
+            # that changes without one, so it never names an older step.
+            ("action_label", "TEXT NOT NULL DEFAULT ''"),
         ):
             if col not in existing:
                 try:
@@ -135,6 +135,21 @@ def initialize_db(db_path: Path | None = None) -> None:
         from openexecutive.alerts.approvals import ensure_schema as ensure_approvals_schema
 
         ensure_approvals_schema(conn)
+        # Plans changed from a reply on the card (alerts/replan.py).
+        from openexecutive.alerts.replan import ensure_schema as ensure_replan_schema
+
+        ensure_replan_schema(conn)
+
+
+# An Approve button's words: a few, on one line.
+ACTION_LABEL_MAX = 40
+
+
+def clean_label(text: str) -> str:
+    """``text`` as a button's words: one line, no end stop, at most
+    ``ACTION_LABEL_MAX`` characters, else "" (the card keeps Approve)."""
+    label = " ".join(str(text or "").split()).rstrip(".!")
+    return label if 0 < len(label) <= ACTION_LABEL_MAX else ""
 
 
 def _now() -> str:
@@ -146,6 +161,7 @@ def _row_to_alert(row: sqlite3.Row) -> Alert:
     d["topic_tags"] = json.loads(d.get("topic_tags") or "[]")
     d["channels_attempted"] = json.loads(d.get("channels_attempted") or "[]")
     d["channels_delivered"] = json.loads(d.get("channels_delivered") or "[]")
+    d["choices"] = json.loads(d.get("choices") or "[]")
     return Alert(**d)
 
 
@@ -165,10 +181,22 @@ def insert_alert(
     artifact_link_label: str | None = None,
     supersedes_id: str | None = None,
     owner_person_id: int | None = None,
+    needs: str = "",
+    question: str = "",
+    choices: list[str] | None = None,
+    action_label: str = "",
     db_path: Path | None = None,
 ) -> int | None:
-    """Insert a new alert. Returns alert id, or None if a duplicate was skipped."""
+    """Insert a new alert. Returns alert id, or None if a duplicate was skipped.
+    Every card then goes through the one card-per-topic check
+    (``alerts.one_card.place``): it may join an open card on its topic, and a
+    card that joined is closed and never sent (``dispatcher.dispatch_all``)."""
     tags = json.dumps(topic_tags or [])
+    # (source, external_id) names one upstream event, so a replay of it is
+    # skipped. A card with no upstream id (one the Executive raised outside
+    # a mail thread) is no replay of anything: it gets an id of its own, or
+    # every such card after the first from that source would be skipped.
+    external_id = str(external_id or "").strip() or f"card:{uuid.uuid4().hex}"
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
             """
@@ -176,8 +204,8 @@ def insert_alert(
                 (external_id, source, severity, headline, body, suggested_action,
                  topic_tags, dedup_key, status, created_at, routed_to_person_id,
                  artifact_format, artifact_url, artifact_link_label, supersedes_id,
-                 owner_person_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?)
+                 owner_person_id, needs, question, choices, action_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unread', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 external_id,
@@ -195,11 +223,21 @@ def insert_alert(
                 artifact_link_label,
                 supersedes_id,
                 owner_person_id,
+                needs,
+                question,
+                json.dumps(choices or []),
+                clean_label(action_label) if suggested_action.strip() else "",
             ),
         )
         if cursor.rowcount == 0:
             return None
-        return cursor.lastrowid
+        alert_id = cursor.lastrowid
+    if alert_id is not None:
+        # One card per topic, whatever wrote it (alerts.one_card).
+        from openexecutive.alerts import one_card
+
+        one_card.place(alert_id, db_path=db_path)
+    return alert_id
 
 
 def update_delivery(
@@ -312,6 +350,7 @@ def list_artifact_alerts(
     *,
     owner_person_id: int | None,
     include_unowned: bool = False,
+    search: str = "",
 ) -> list[Alert]:
     """Alerts authored via `draft_artifact` (source='artifact'), newest first.
 
@@ -327,6 +366,9 @@ def list_artifact_alerts(
     `archived` selects which slice to return: the default (False) lists only
     active artifacts (`archived_at IS NULL`); True lists only archived ones,
     so the gallery's Active / Archived views are clean swaps, not supersets.
+
+    `search`, when set, keeps only those whose title, text or link name
+    contains every word of it (any case, any order; `utils.text_search`).
     """
     if not _resolve_db_path(db_path).exists():
         return []
@@ -342,11 +384,15 @@ def list_artifact_alerts(
     archived_clause = (
         "AND archived_at IS NOT NULL" if archived else "AND archived_at IS NULL"
     )
+    search_clause, search_params = words_clause(
+        ("headline", "body", "COALESCE(artifact_link_label, '')"), search
+    )
+    params.extend(search_params)
     params.append(limit)
     with _get_conn(db_path) as conn:
         rows = conn.execute(
             f"SELECT * FROM alerts WHERE source = 'artifact' {archived_clause} "
-            f"AND ({' OR '.join(owners)}) "
+            f"AND ({' OR '.join(owners)}) {search_clause}"
             "ORDER BY created_at DESC LIMIT ?",
             params,
         ).fetchall()
@@ -359,6 +405,30 @@ def set_status(alert_id: int, status: str, db_path: Path | None = None) -> bool:
             "UPDATE alerts SET status = ? WHERE id = ?", (status, alert_id)
         )
         return cursor.rowcount > 0
+
+
+def set_status_if_open(alert_id: int, status: str, db_path: Path | None = None) -> bool:
+    """Move an alert to ``status`` only while it is still open (``unread`` or
+    ``read``). False when it is missing or was answered meanwhile."""
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET status = ? WHERE id = ? AND status IN ('unread', 'read')",
+            (status, alert_id),
+        )
+        return cursor.rowcount > 0
+
+
+def close_open_by_source(source: str, status: str, db_path: Path | None = None) -> int:
+    """Move every still-open (``unread`` or ``read``) alert of ``source`` to
+    ``status``. How many."""
+    if not _resolve_db_path(db_path).exists():
+        return 0
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET status = ? WHERE source = ? AND status IN ('unread', 'read')",
+            (status, source),
+        )
+        return cursor.rowcount
 
 
 def set_snoozed_until(
@@ -386,15 +456,44 @@ _BULK_MAX_IDS = 5000
 _REOPENABLE_STATUSES = ("resolved", "expired", "dismissed")
 
 
+_FOLLOW_UP_MAX = 4000
+_THEN = "\n\nThen: "
+_FOLLOW_UP_KEEP = 500
+
+
+def _with_follow_up(existing: str, follow_up: str) -> str:
+    """The card's text with ``follow_up`` added last. Past ``_FOLLOW_UP_MAX``
+    the oldest follow-ups go first; the first ask and the newest always stay."""
+    first, *later = (existing or "").split(_THEN)
+    later.append(follow_up)
+    while len(later) > 1 and len(first) + sum(len(_THEN) + len(t) for t in later) > _FOLLOW_UP_MAX:
+        later.pop(0)
+    # The newest follow-up always shows: past the cap it is cut to the room
+    # left, and the first ask gives up its end only to leave it some room.
+    room = _FOLLOW_UP_MAX - len(first) - len(_THEN)
+    if room < _FOLLOW_UP_KEEP:
+        first = first[: _FOLLOW_UP_MAX - len(_THEN) - _FOLLOW_UP_KEEP]
+        room = _FOLLOW_UP_KEEP
+    later[-1] = later[-1][:room]
+    return "".join([first, *(_THEN + t for t in later)]).strip()
+
+
 def coalesce_alert(
     *,
     source: str,
     dedup_key: str,
     severity: str,
     body: str,
+    append: bool = False,
+    needs: str = "",
+    question: str = "",
+    choices: list[str] | None = None,
     db_path: Path | None = None,
 ) -> tuple[int, bool] | None:
     """Fold a repeat of an open alert into the existing row.
+
+    A repeat that says what it needs (``needs``) replaces the
+    card's ask with its own, so the card asks the newest question.
 
     When an ``unread`` alert with the same ``(source, dedup_key)`` exists,
     bump ``occurrence_count`` and ``last_seen_at``, refresh ``body`` (the
@@ -415,7 +514,7 @@ def coalesce_alert(
         # miss the row (read-then-update race) or overwrite each other's body.
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT id, severity FROM alerts "
+            "SELECT id, severity, body, needs FROM alerts "
             "WHERE source = ? AND dedup_key = ? AND status = 'unread' "
             "ORDER BY created_at DESC LIMIT 1",
             (source, dedup_key),
@@ -426,12 +525,24 @@ def coalesce_alert(
         new_rank = SEVERITY_RANK.get(severity, 0)
         raised = new_rank > current_rank
         effective = severity if raised else str(row["severity"])
+        if append:
+            # A follow-up adds to what was asked first (``AlertEvent.follow_up``),
+            # newest last.
+            body = _with_follow_up(str(row["body"] or ""), body)
         conn.execute(
             "UPDATE alerts SET last_seen_at = ?, "
             "occurrence_count = COALESCE(occurrence_count, 1) + 1, "
             "body = ?, severity = ? WHERE id = ?",
             (_now(), body, effective, int(row["id"])),
         )
+        if needs in ("answer", "choice") and str(row["needs"] or "") in ("answer", "choice"):
+            # Only a card that already asks takes a newer question: a repeat
+            # never turns a held action, an OK, an FYI or a plain card into
+            # a question box, nor drops a question that is still open.
+            conn.execute(
+                "UPDATE alerts SET needs = ?, question = ?, choices = ? WHERE id = ?",
+                (needs, question, json.dumps(choices or []), int(row["id"])),
+            )
     return int(row["id"]), raised
 
 
@@ -521,9 +632,14 @@ def update_alert_content(
     headline: str | None = None,
     body: str | None = None,
     severity: str | None = None,
+    suggested_action: str | None = None,
+    action_label: str | None = None,
     db_path: Path | None = None,
 ) -> bool:
-    """Rewrite headline / body / severity in place (a ``changed`` verdict)."""
+    """Rewrite headline / body / severity / suggested_action in place (a
+    ``changed`` verdict, or a document's why once it found its use). A new
+    ``suggested_action`` takes ``action_label`` with it, or clears the old
+    one: a button never names a step the card no longer does."""
     sets: list[str] = []
     params: list[object] = []
     if headline is not None:
@@ -535,6 +651,11 @@ def update_alert_content(
     if severity is not None:
         sets.append("severity = ?")
         params.append(severity)
+    if suggested_action is not None:
+        sets.append("suggested_action = ?")
+        params.append(suggested_action)
+        sets.append("action_label = ?")
+        params.append(clean_label(action_label or "") if suggested_action.strip() else "")
     if not sets or not _resolve_db_path(db_path).exists():
         return False
     params.append(alert_id)
@@ -762,7 +883,13 @@ def delete_alert(alert_id: int, db_path: Path | None = None) -> bool:
         return False
     with _get_conn(db_path) as conn:
         cursor = conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+    if deleted:
+        # What was said on it goes with it.
+        from openexecutive.alerts import card_talk
+
+        card_talk.forget(alert_id, db_path=db_path)
+    return deleted
 
 
 # --- Mute topics ---

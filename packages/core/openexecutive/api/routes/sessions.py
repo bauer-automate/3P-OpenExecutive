@@ -147,6 +147,11 @@ class ChatTopic(BaseModel):
     # one chat, and the tidy never merges it away.
     kept: bool = False
     pinned_at: str | None = None
+    # The broader matter it shares with related topics (one property, deal
+    # or client): the Chats page shows them under one heading.
+    area: str | None = None
+    # When its newest chat was last active.
+    updated_at: str | None = None
 
 
 class ChatTopics(BaseModel):
@@ -165,6 +170,15 @@ class TopicUpdate(BaseModel):
 
 class TopicMerge(BaseModel):
     into_id: int
+
+
+class AreaRename(BaseModel):
+    area: str = Field(min_length=1, max_length=chat_topics.MAX_TOPIC_CHARS)
+    name: str = Field(min_length=1, max_length=chat_topics.MAX_TOPIC_CHARS)
+
+
+class AreaUngroup(BaseModel):
+    area: str = Field(min_length=1, max_length=chat_topics.MAX_TOPIC_CHARS)
 
 
 def _require_caller(request: Request) -> int:
@@ -194,7 +208,9 @@ async def get_topics(request: Request) -> ChatTopics:
     topics = await asyncio.to_thread(chat_topics.list_topics, caller)
     organizing = topic_model.backfill_running(caller)
     if not organizing:
-        waiting: bool = await asyncio.to_thread(chat_topics.has_untagged, caller)
+        waiting: bool = await asyncio.to_thread(chat_topics.has_untagged, caller) or await asyncio.to_thread(
+            chat_topics.needs_areas, caller
+        )
         if waiting:
             organizing = topic_model.start_backfill(caller)
     return ChatTopics(topics=[ChatTopic(**t) for t in topics], organizing=organizing)
@@ -216,6 +232,25 @@ def update_topic(topic_id: int, body: TopicUpdate, request: Request) -> ChatTopi
         if t["id"] == topic_id:
             return ChatTopic(**t)
     raise HTTPException(status_code=404, detail="Topic not found")
+
+
+@router.post("/sessions/topic-areas/rename", status_code=status.HTTP_204_NO_CONTENT)
+def rename_area(body: AreaRename, request: Request) -> Response:
+    """Rename one of the caller's areas. The name of another of their areas
+    joins the two."""
+    caller = _require_caller(request)
+    if not chat_topics.rename_area(caller, body.area, _topic_name(body.name)):
+        raise HTTPException(status_code=404, detail="Area not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/sessions/topic-areas/ungroup", status_code=status.HTTP_204_NO_CONTENT)
+def ungroup_area(body: AreaUngroup, request: Request) -> Response:
+    """Drop one of the caller's areas: its topics stand on their own."""
+    caller = _require_caller(request)
+    if not chat_topics.ungroup_area(caller, body.area):
+        raise HTTPException(status_code=404, detail="Area not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/sessions/topics/{topic_id}/merge", status_code=status.HTTP_204_NO_CONTENT)
@@ -284,8 +319,12 @@ def get_session(session_id: str, request: Request) -> SessionSummary:
 @router.get("/sessions/{session_id:session}/messages")
 def get_session_messages(session_id: str, request: Request) -> list[dict]:
     """The chat's messages. In a shared chat each person's message also says
-    who wrote it (``sender_person_id``, ``sender_name``)."""
-    _, member = _require_chat_access(request, session_id)
+    who wrote it (``sender_person_id``, ``sender_name``). The last reply
+    carries ``held_steps`` while what its turn held for an outside read still
+    waits on the caller's go (``outside_content.pending_held``), and with
+    them ``flags``, what the content check flagged in it, as their reason
+    (``outside_content.pending_flags``)."""
+    caller, member = _require_chat_access(request, session_id)
     meta = get_session_metadata(session_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -303,6 +342,22 @@ def get_session_messages(session_id: str, request: Request) -> list[dict]:
         if member:
             # The owner's ratings are theirs.
             msg.pop("feedback", None)
+    if messages and messages[-1].get("role") == "assistant" and not member:
+        from types import SimpleNamespace
+
+        from openexecutive.orchestrator.outside_content import pending_flags, pending_held
+
+        # A chat shared since its turn held nothing that a go would still
+        # release (``outside_content._held_key``), so it shows no buttons.
+        held = pending_held(
+            SimpleNamespace(session_id=session_id, caller_person_id=caller, shared_chat=bool(people))
+        )
+        if held:
+            messages[-1]["held_steps"] = list(held)
+            # The flags are the held steps' reason, so only with them.
+            flags = pending_flags(SimpleNamespace(session_id=session_id, caller_person_id=caller))
+            if flags:
+                messages[-1]["flags"] = list(flags)
     return messages
 
 
@@ -678,13 +733,14 @@ def post_message_feedback(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# (session_id, last assistant message id) -> (monotonic ts, suggestion).
+# (session_id, last assistant message id, reader in a shared chat) ->
+# (monotonic ts, suggestion).
 # Keyed on the reply being followed up on, so reopening a session or
 # remounting the composer does not re-bill the fast model; a new reply is a
 # new key. Single-process, like `_suggested_prompts_cache`.
 _FOLLOWUP_TTL_S = 3600
 _FOLLOWUP_CACHE_MAX = 512
-_followup_cache: dict[tuple[str, int], tuple[float, str]] = {}
+_followup_cache: dict[tuple[str, int, int | None, tuple[int, ...]], tuple[float, str]] = {}
 
 
 @router.get("/sessions/{session_id:session}/followup")
@@ -696,20 +752,27 @@ async def get_followup_suggestion(session_id: str, request: Request) -> dict[str
     composer then falls back to its static placeholder. Only someone in the
     chat may ask: the suggestion paraphrases the conversation.
     """
-    _require_chat_access(request, session_id)
+    caller, _ = _require_chat_access(request, session_id)
 
-    messages = load_messages(session_id)
+    # In a shared chat the suggestion is the reader's own next message, so
+    # it knows who is in it and who is asking (and is kept per reader).
+    people = chat_people(session_id)
+    names = {pid: name for pid, name, _ in people}
+    owner_id = next((pid for pid, _, is_owner in people if is_owner), None)
+    messages = load_messages(session_id, with_senders=bool(names))
     last = messages[-1] if messages else None
     if last is None or last.get("role") != "assistant" or not last.get("id"):
         return {"suggestion": None}
 
-    key = (session_id, int(last["id"]))
+    # Who is in the chat is part of the key: sharing or removing someone
+    # changes who the suggestion may name, with no new reply.
+    key = (session_id, int(last["id"]), caller if names else None, tuple(sorted(names)))
     now = time.monotonic()
     hit = _followup_cache.get(key)
     if hit is not None and (now - hit[0]) < _FOLLOWUP_TTL_S:
         return {"suggestion": hit[1]}
 
-    transcript = chat_route._build_followup_transcript(messages)
+    transcript = chat_route._build_followup_transcript(messages, names, caller, owner_id)
     suggestion = await chat_route._generate_followup_via_llm(transcript)
     if suggestion is not None:
         # Failures are not cached: a transient blip should not pin the

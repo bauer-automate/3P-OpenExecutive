@@ -10,7 +10,7 @@
 # version — bump them together.
 FROM node:20-bookworm-slim AS ms365-build
 RUN npm install -g --omit=optional --no-audit --no-fund \
-    "@softeria/ms-365-mcp-server@0.154.2"
+    "@softeria/ms-365-mcp-server@0.183.0"
 
 # Python job sandbox (workflows/python_job.py): Pyodide (Python in
 # WebAssembly) run by Deno, which grants it read access to /opt/pysandbox only:
@@ -139,8 +139,14 @@ RUN uv pip install --system "fastembed==0.8.1" \
 # The pin is deliberate — a new workspace-mcp can rename tools/args that the
 # gateway's egress gates key on (_GATED_GMAIL_TOOLS / _GATED_CALENDAR_TOOLS /
 # Drive share gate in orchestrator/mcp_gateway.py). Bump together with those gates.
+# docker/workspace-mcp-patch.py lets modify_doc_text append without an
+# index; it fails the build if the pinned code moved.
+COPY docker/workspace-mcp-patch.py /tmp/workspace-mcp-patch.py
 RUN uv venv /opt/workspace-mcp \
-    && uv pip install --python /opt/workspace-mcp/bin/python "workspace-mcp==2.1.0" \
+    && uv pip install --python /opt/workspace-mcp/bin/python "workspace-mcp==2.4.2" \
+    && /opt/workspace-mcp/bin/python -I /tmp/workspace-mcp-patch.py \
+        "$(/opt/workspace-mcp/bin/python -I -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/gdocs/docs_tools.py" \
+    && rm /tmp/workspace-mcp-patch.py \
     && /opt/workspace-mcp/bin/workspace-mcp --tool-tier complete --help >/dev/null 2>&1
 COPY docker/workspace-mcp-launch.sh /usr/local/bin/workspace-mcp-launch.sh
 RUN chmod +x /usr/local/bin/workspace-mcp-launch.sh

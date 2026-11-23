@@ -3,7 +3,7 @@ speaker's own notes (``memory.history``).
 
 A note is private to its person, so the tool joins the toolkit only on a turn
 where that person is speaking, verified (``memory.history_chat.verified_speaker``),
-in a conversation nobody else can read (``history_chat.private_chat``: the web
+in a conversation nobody else can read (``delegation.settings.private_conversation``: the web
 chat signed in, a Slack or Discord DM, a private Telegram chat, or one its
 adapter marked private), and only once they turned on "Keep track of what
 happens". Act as me isn't needed: any team member on the People list may
@@ -15,8 +15,8 @@ surface again and returns that speaker's notes alone.
 Notes are their person's alone, so before returning any, as with Act as
 me, the conversation is marked theirs alone (``session_store.mark_mail_private``:
 for a team member's, the principal can't open it either) and the turn writes
-only private rows and teaches no memory from then on (``touched_mail``), as
-does every later turn in it.
+only private rows and teaches only their own private memory from then on
+(``touched_mail``), as does every later turn in it.
 
 What comes back is history to cite, never instructions: each note's date,
 who it was with, what happened, and the person's own words it rests on, in a
@@ -67,7 +67,9 @@ HISTORY_TOOL_NAMES: frozenset[str] = frozenset(t["name"] for t in HISTORY_TOOLS)
 
 
 def _error(message: str) -> str:
-    return json.dumps({"error": message})
+    # Only this tool's own words: status "unavailable" keeps them out of the
+    # content check (outside_content.without_own_words).
+    return json.dumps({"error": message, "status": "unavailable"})
 
 
 def recall_person(session: Any) -> Any:
@@ -75,9 +77,9 @@ def recall_person(session: Any) -> Any:
     verified, in a conversation private to them, on an interactive turn, with
     "Keep track of what happens" on. Never raises."""
     try:
-        from openexecutive.delegation.settings import turn_delegation
+        from openexecutive.delegation.settings import private_conversation, turn_delegation
         from openexecutive.memory.history import can_keep_notes, person_settings
-        from openexecutive.memory.history_chat import private_chat, verified_speaker
+        from openexecutive.memory.history_chat import verified_speaker
         from openexecutive.people.store import get_person
 
         pinned = turn_delegation(session)
@@ -86,7 +88,7 @@ def recall_person(session: Any) -> Any:
         person = get_person(pinned.person_id)
         if person is None or not can_keep_notes(person) or not verified_speaker(session, person):
             return None
-        if not private_chat(session):
+        if not private_conversation(session):
             return None
         if not person_settings(person.id).reply_notes:
             return None
@@ -98,8 +100,8 @@ def recall_person(session: Any) -> Any:
 
 def _keep_private(session: Any, person: Any) -> bool:
     """Keep the turn the speaker's before their notes enter it: from now on
-    its rows are private to them and it teaches no memory (``touched_mail``,
-    as when Act as me reads their mailbox). The conversation also becomes
+    its rows are private to them and it teaches only their own private memory
+    (``touched_mail``, as when Act as me reads their mailbox). The conversation also becomes
     theirs alone (``mark_mail_private``), so every later turn in it is
     private the same way and a follow-up restating a note stays private too
     (the lockdown, ``read_mail``, is this turn's alone). False
@@ -111,6 +113,7 @@ def _keep_private(session: Any, person: Any) -> bool:
     if pinned is None:
         return False
     pinned.touched_mail = pinned.read_mail = True
+    pinned.mail_vetted = False  # re-vetted only by the loop's check_mail_read
     session_id = getattr(session, "session_id", None)
     if not session_id:
         return False
@@ -137,7 +140,7 @@ def render_notes(notes: list[Any]) -> str:
         where = clean(note.channel, 40)
         line = f"[{note.occurred_at[:10]}] {where}, with {who}: " if who else f"[{note.occurred_at[:10]}] {where}: "
         if note.correction:
-            line += f"{clean(note.correction, 400)} (as you corrected it)"
+            line += f"{clean(note.corrected, 400)} (as you corrected it)"
         else:
             # Their own words first; the summary is only how it was noted.
             line += f'your words: "{clean(note.quote, 400)}" (noted as: {clean(note.summary, 400)})'

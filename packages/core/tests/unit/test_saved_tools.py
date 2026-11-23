@@ -134,7 +134,7 @@ async def test_a_script_that_works_is_saved_with_the_tools_it_called() -> None:
     assert not is_error and body["result"] == 3
     assert body["saved"] == {
         "name": "count_files", "version": 1, "uses_tools": [LIST], "enabled": True,
-        "workflows": "off until the owner turns it on in Settings → Advanced → Custom tools",
+        "workflows": "off until the owner turns it on in Settings → Advanced → Tools I built",
     }
     kept = saved_tools.get("count_files")
     assert kept is not None and kept.script == COUNT_SCRIPT and kept.origin == "chat"
@@ -324,7 +324,7 @@ async def test_someone_elses_turn_cannot_run_a_saved_tool() -> None:
     calls = _Calls()
     body, is_error = await _tool({"tool": "count_files", "inputs": {"folder": "x"}}, call=calls,
                                  may_save=False, may_run_saved=False)
-    assert is_error and "principal's own turns" in body["error"] and calls.made == []
+    assert is_error and "someone on the team" in body["error"] and calls.made == []
 
 
 def test_descriptions_are_one_line_of_printable_text() -> None:

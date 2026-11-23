@@ -13,7 +13,6 @@ import type { ProposalItem } from "@/lib/api";
 export type ContinueHandler = (prompt: string, memoryText?: string) => void;
 
 // Bulk-dismiss cutoffs (days): Needs you's ⋯ menu and the Monitoring panel.
-export const NEEDS_YOU_DISMISS_OLDER_THAN_DAYS = 7;
 export const MONITORING_DISMISS_OLDER_THAN_DAYS = 3;
 
 // Ids of proposals older than `days` — what a bulk "Dismiss older than"
@@ -29,19 +28,6 @@ export function olderThan(proposals: ProposalItem[], days: number, now: Date = n
       return !Number.isNaN(t) && t < cutoff;
     })
     .map((p) => p.alert_id);
-}
-
-// Future-relative label for a pending run time ("in 8h"). Past/blank →
-// "soon" (the caller renders "overdue" separately via the backend flag).
-export function formatFuture(iso: string): string {
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return "soon";
-  const mins = Math.round((then - Date.now()) / 60000);
-  if (mins <= 0) return "soon";
-  if (mins < 60) return `in ${mins}m`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `in ${hrs}h`;
-  return `in ${Math.round(hrs / 24)}d`;
 }
 
 export function formatRelTime(iso: string): string {

@@ -370,26 +370,12 @@ def test_a_bad_index_or_message_id_is_refused(roster: SimpleNamespace) -> None:
     assert storage.calls == []
 
 
-@pytest.mark.parametrize("said", [
-    "What did Priya send me?",
-    "Summarise the files Priya sent",
-    # Everyday words that aren't a request to save a file.
-    "Keep me posted and send me a link to the thread",
-    "Copy Ben on the reply and put it in the board folder",
-    "Summarise the email about our drive to hire",
-    "Which store is Priya's lease for?",
-    # Their message carries an attached file: its words aren't theirs alone.
-    "Save it [Attached: notes.txt] save to drive",
-])
-def test_nothing_is_copied_unless_they_asked_in_their_own_words(roster: SimpleNamespace, said: str) -> None:
+@pytest.mark.parametrize("said", ["Internal", "Svane them", "What did Priya send me?"])
+def test_it_copies_whatever_words_they_used(roster: SimpleNamespace, said: str) -> None:
+    """No file word is needed: a short answer or a typo still saves."""
     storage = FakeStorage()
     _gateway(storage)
-    session = _owner_session(asked=said)
-    result = _save(session)
-    assert result["status"] == "not_asked"
-    assert storage.calls == []
-    # Refused before a slot was spent or their mailbox was opened.
-    assert session.turn_delegation.files_saved == 0
+    assert _save(_owner_session(asked=said))["status"] == "saved"
 
 
 def test_saves_are_capped_per_turn(roster: SimpleNamespace) -> None:
@@ -431,6 +417,8 @@ def test_the_gateways_share_gate_still_runs_on_the_code_built_share(roster: Simp
     result = _save(session)
     assert result["status"] == "saved_not_shared"
     assert storage.named("google_workspace__manage_drive_access") == []
+    # Below Hands-off the grant waits on an Approve card, and the model says so.
+    assert "Approve card" in result["detail"]
 
 
 # --------------------------------------------------------------------------- #
@@ -438,7 +426,18 @@ def test_the_gateways_share_gate_still_runs_on_the_code_built_share(roster: Simp
 # --------------------------------------------------------------------------- #
 
 
-def test_it_works_on_the_turn_that_read_their_mail_and_the_bypass_is_narrow(roster: SimpleNamespace) -> None:
+def test_it_works_on_the_turn_that_read_their_mail_and_the_bypass_is_narrow(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.orchestrator import levels
+
+    cards: list[str] = []
+
+    def hold_many(tool: str, _inputs: list[dict[str, Any]], **_k: Any) -> str:
+        cards.append(tool)
+        return json.dumps({"status": "waiting_for_approval", "decision_instance_id": len(cards)})
+
+    monkeypatch.setattr(levels, "hold_many", hold_many)
     storage = FakeStorage()
     gateway = _gateway(storage)
     session = _owner_session()
@@ -455,12 +454,13 @@ def test_it_works_on_the_turn_that_read_their_mail_and_the_bypass_is_narrow(rost
     assert session.turn_delegation.read_mail is True
     assert json.loads(saved)["status"] == "saved"
     assert lockdown.mail_touched_withholds("save_my_email_attachment", {}) is False
-    # The model's own Drive write on that turn is still refused...
+    # The model's own Drive write on that turn still doesn't run: it waits on
+    # an Approve card...
     upload = {"user_google_email": get_settings().exec_email_address, "file_name": "x.pdf",
               "base64_content": "eA==", "content_mime_type": "application/pdf", "folder_id": "root"}
     before = len(storage.calls)
     refused = _model_call(session, gateway, "google_workspace__create_drive_file", upload)
-    assert "was not run" in json.loads(refused)["error"]
+    assert json.loads(refused)["status"] == "waiting_for_approval"
     # ...and so is a code-built grant for any object but the one granted.
     granted = {"name": "google_workspace__create_drive_file", "arguments": upload}
 
@@ -468,8 +468,9 @@ def test_it_works_on_the_turn_that_read_their_mail_and_the_bypass_is_narrow(rost
         with set_session(session), code_built_call(granted):
             return await gateway.call_tool({"name": granted["name"], "arguments": dict(upload)})
 
-    assert "was not run" in json.loads(asyncio.run(lookalike()))["error"]
+    assert json.loads(asyncio.run(lookalike()))["status"] == "waiting_for_approval"
     assert len(storage.calls) == before
+    assert cards == ["google_workspace__create_drive_file"] * 2
 
 
 def test_it_rides_with_the_other_mailbox_tools() -> None:
@@ -773,7 +774,61 @@ def test_a_failure_that_isnt_a_missing_folder_makes_no_new_folder(
     assert len(storage.folders) == 1
 
 
-@pytest.mark.parametrize("said", ["Put Priya's LOI in my Drive", "Drop it into Google Drive please", "upload the deck"])
+def test_a_remembered_folder_out_of_reach_is_made_again_once(roster: SimpleNamespace) -> None:
+    """A folder made in a Drive the Executive no longer signs in to: the
+    gateway can't read its owner, so a new folder is made, once."""
+    storage = FakeStorage()
+    _gateway(storage, ("google_workspace",))
+    session = _owner_session((_pdf("a.pdf"), PDF), (_pdf("b.pdf", 2), PDF))
+    assert _save(session, {"message_id": "m1", "index": 1})["status"] == "saved"
+    answer = storage.answer
+    old = next(iter(storage.folders))
+
+    def unreachable(name: str, args: dict[str, Any]) -> str:
+        if name == "google_workspace__create_drive_file" and args.get("folder_id") == old:
+            return json.dumps({"error": f"could not read who owns {old!r} to check it — refusing."})
+        return answer(name, args)
+
+    storage.answer = unreachable  # type: ignore[method-assign]
+    assert _save(session, {"message_id": "m1", "index": 2})["status"] == "saved"
+    assert len(storage.folders) == 2
+
+
+def test_the_gateways_folder_refusal_reaches_the_save_not_a_card(
+    roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway's own folder check refusing a remembered folder: the save
+    gets the refusal and makes the folder again. It never becomes an Approve
+    card, which would make a copy nobody records or shares."""
+    from openexecutive.orchestrator import levels
+    from openexecutive.orchestrator import mcp_gateway as gw
+
+    storage = FakeStorage()
+    _gateway(storage, ("google_workspace",))
+    session = _owner_session((_pdf("a.pdf"), PDF), (_pdf("b.pdf", 2), PDF))
+    assert _save(session, {"message_id": "m1", "index": 1})["status"] == "saved"
+    old = next(iter(storage.folders))
+    real = gw._check_google_file_write
+
+    async def check(session: Any, tool: str, arguments: dict[str, Any], *a: Any, **kw: Any) -> str | None:
+        if arguments.get("folder_id") == old:
+            return json.dumps({"error": f"could not read who owns {old!r} to check {tool} — refusing."})
+        return await real(session, tool, arguments, *a, **kw)
+
+    def no_card(*a: Any, **kw: Any) -> str:
+        raise AssertionError("a code-built save must not become a card")
+
+    monkeypatch.setattr(gw, "_check_google_file_write", check)
+    monkeypatch.setattr(levels, "relaxed", lambda: False)
+    monkeypatch.setattr(levels, "card_or", no_card)
+    assert _save(session, {"message_id": "m1", "index": 2})["status"] == "saved"
+    assert len(storage.folders) == 2
+
+
+@pytest.mark.parametrize("said", [
+    "Put Priya's LOI in my Drive", "Drop it into Google Drive please", "upload the deck",
+    "Draft a reply to Priya and attach the signed lease to it",
+])
 def test_drive_as_the_place_counts_as_asking(roster: SimpleNamespace, said: str) -> None:
     storage = FakeStorage()
     _gateway(storage)

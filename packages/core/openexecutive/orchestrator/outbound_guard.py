@@ -34,9 +34,10 @@ is no new table. The guard is *fail-open*: any internal lookup failure returns
 ``None`` (allow), because an anti-spam helper must never turn a working send
 into a dropped message or a crash.
 
-Scope note: the send handlers are the same tools the Executive uses for both
-autonomous proactive DMs and sends a human explicitly asked for, so the guard
-applies to both — by design. Suppression is non-destructive: it returns a
+Scope note: a send someone on the team asked for in the turn, on a surface
+that verified who they are, skips the guard (``schedule_tools._guard_outbound``):
+Approvals already decided it. The guard covers the Executive's own outreach and
+turns nobody on the team started. Suppression is non-destructive: it returns a
 reason the Executive reads, so a genuinely-wanted resend can be reworded, or
 held / ``schedule_followup``-ed for the recipient's next window. Operators who
 want to send identical/off-hours messages can widen the knobs or set
@@ -132,8 +133,13 @@ def check_outbound_allowed(
     text: str,
     *,
     now: datetime | None = None,
+    availability: bool = True,
 ) -> str | None:
     """Return a refusal reason if this proactive DM should be suppressed, else None.
+
+    The duplicate and rate checks stop a runaway loop whoever started the
+    turn. ``availability`` False skips quiet hours / availability, for a send
+    a person asked for in the turn.
 
     `channel` is one of the scheduled-action channels (``telegram``,
     ``slack_dm``, ``discord_dm``, ``email``); `channel_ref` is the *final*
@@ -143,13 +149,13 @@ def check_outbound_allowed(
     returns ``None`` so the guard can never turn a working send into a crash.
     """
     try:
-        return _evaluate(channel, channel_ref, text, now or datetime.now(UTC))
+        return _evaluate(channel, channel_ref, text, now or datetime.now(UTC), availability=availability)
     except Exception:
         logger.exception("outbound_guard: unexpected failure; failing open")
         return None
 
 
-def _evaluate(channel: str, channel_ref: str, text: str, now: datetime) -> str | None:
+def _evaluate(channel: str, channel_ref: str, text: str, now: datetime, *, availability: bool = True) -> str | None:
     from openexecutive.config import get_settings
 
     settings = get_settings()
@@ -194,7 +200,7 @@ def _evaluate(channel: str, channel_ref: str, text: str, now: datetime) -> str |
         )
 
     # 3. Quiet hours / availability.
-    if settings.outbound_respect_quiet_hours:
+    if availability and settings.outbound_respect_quiet_hours:
         reason = _availability_reason(channel, channel_ref, now)
         if reason is not None:
             return reason

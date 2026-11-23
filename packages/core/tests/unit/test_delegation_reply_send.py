@@ -212,6 +212,48 @@ def test_a_newer_message_needs_a_second_yes(owner: Any, models: dict[str, Any]) 
     assert mailbox.sent == ["d1"]
 
 
+def test_a_draft_brought_up_to_date_asks_again_unless_that_version_was_shown(
+    owner: Any, models: dict[str, Any],
+) -> None:
+    from openexecutive.delegation import card_drafts
+    from openexecutive.delegation.answers import CAUGHT_UP_KEY
+
+    mailbox, card = _card(owner)
+    models["rewritten"] = {"body": "Hi Dana,\n\nMonday works.", "note": "Dana offered Monday."}
+    mailbox.add(_msg("m2", "t1", minutes_ago=-5, text="Actually, Monday works too."))
+    asyncio.run(inbox.reconcile(owner, mailbox, now=NOW + timedelta(minutes=30), own={OWNER, *mailbox.aliases}))
+    card = ledger.get_decision_instance(card.id)
+    caught_up = inbox.card_payload(card)[CAUGHT_UP_KEY]
+    # Rewritten on its own after the card was shown: a second yes.
+    first = _refused(card, mailbox, owner, confirm={"seen_caught_up_at": "an older version"})
+    assert first.code == "confirm" and first.extra["reasons"] == ["thread_moved_on"]
+    # The card that was tapped showed this version: it goes.
+    _send(card, mailbox, owner, confirm={"seen_caught_up_at": caught_up})
+    assert mailbox.sent == ["d1"]
+    # The Executive's own rewrite isn't the person's change.
+    assert card_drafts.EDITED_ON_CARD not in inbox.card_payload(card)
+    assert "edited_in_gmail" not in inbox.ledger_flags(owner.id, ["m1"])["m1"]
+    assert _status(card) == "approved_unchanged"
+
+
+def test_a_reply_changed_from_chat_asks_again_unless_that_version_was_shown(
+    owner: Any, models: dict[str, Any],
+) -> None:
+    from openexecutive.delegation import card_drafts
+
+    mailbox, card = _card(owner)
+    asyncio.run(card_drafts.from_chat(card, owner, mailbox, words="Hi Dana,\n\nMonday works.", to=[DANA], cc=[]))
+    card = ledger.get_decision_instance(card.id)
+    shown = card_drafts.version(inbox.card_payload(card))
+    # A card shown before (a chat app's Send, a page not reloaded): a second yes.
+    for confirm in ({}, {"seen_caught_up_at": ""}):
+        first = _refused(card, mailbox, owner, confirm=confirm)
+        assert first.code == "confirm" and first.extra["reasons"] == ["changed_in_chat"]
+    assert mailbox.sent == []
+    _send(card, mailbox, owner, confirm={"seen_caught_up_at": shown})
+    assert mailbox.sent == ["d1"]
+
+
 def test_a_draft_gone_or_answered_closes_the_card(owner: Any, models: dict[str, Any]) -> None:
     mailbox, card = _card(owner)
     del mailbox.drafts["d1"]
@@ -412,16 +454,37 @@ def _importers(module: str) -> set[str]:
     return set(_index()[1].get(module, set()))
 
 
-def test_only_the_send_path_sends_and_only_the_approve_route_and_the_watcher_reach_it() -> None:
-    """Two doors and no more: the person's tap (the approve route) and Handle
-    it for me (the inbox watcher, under the person's own switch)."""
+def test_only_the_send_path_sends_and_only_its_four_doors_reach_it() -> None:
+    """Four doors and no more: the person's tap on a card (the approve
+    route), Handle it for me (the inbox watcher, under the person's own
+    switch), a workflow its creator saved to send as them
+    (``oe__send_email_as_me``), and the person's tap under a chat draft (the
+    chat draft send route)."""
     assert _uses("send_draft") == {"delegation/reply_send.py"}
     assert _uses("send_approved_reply") == {"api/routes/decisions.py"}
     assert _uses("send_on_its_own") == {"delegation/inbox.py"}
-    # card_drafts and the edit route use its refusals and caller check only.
+    assert _uses("send_for_workflow") == {"delegation/workflow_email.py"}
+    assert _uses("send_chat_draft") == {"api/routes/delegation.py"}
+    assert _uses("handle_send_email_as_me") == {"workflows/tool_catalog.py"}
+    # card_drafts, answers, the chat draft card, the edit routes, the
+    # inbox's work on a card (card_work, update_reply_card) and a chat reply
+    # put onto a waiting card (ghostwrite_email) and the card's From choice
+    # (send_from, which sends from the Executive's own mailbox, and a chat
+    # app's tap on it, channel_cards) use its refusals and caller check only.
     assert _importers("openexecutive.delegation.reply_send") == {
         "api/routes/decisions.py", "api/routes/delegation.py", "delegation/inbox.py", "delegation/card_drafts.py",
+        "delegation/answers.py", "delegation/workflow_email.py", "delegation/chat_draft_card.py",
+        "delegation/card_work.py", "orchestrator/reply_card_tools.py", "orchestrator/delegation_tools.py",
+        "delegation/send_from.py", "integrations/channel_cards.py",
     }
+    assert _importers("openexecutive.delegation.reply_send.SendRefused") >= {"delegation/answers.py"}
+    for only_refuses in (
+        "delegation/answers.py", "delegation/chat_draft_card.py", "orchestrator/reply_card_tools.py",
+        "orchestrator/delegation_tools.py", "delegation/send_from.py", "integrations/channel_cards.py",
+    ):
+        assert not ({"send_draft", "send_approved_reply", "send_on_its_own", "send_for_workflow", "send_chat_draft"} & {
+            n for n, files in _index()[0].items() if only_refuses in files
+        })
 
 
 def test_only_dismiss_deletes_a_draft() -> None:
@@ -429,9 +492,13 @@ def test_only_dismiss_deletes_a_draft() -> None:
     has just made, when that draft's card couldn't be made (a follow-up's
     too), or an unedited follow-up nobody needs once the thread is answered,
     and a reply kept on its card takes back the draft it made for a send that
-    was refused before anything went."""
+    was refused before anything went. A chat draft that a redraft or the
+    Executive's own send replaced goes too, when unedited (redrafts), and so
+    does an unedited chat draft its person deletes on its card
+    (chat_draft_card.discard, from DELETE /delegation/drafts/{row} only)."""
     assert _uses("delete_draft") == {
         "delegation/replies.py", "delegation/inbox.py", "delegation/follow_ups.py", "delegation/card_drafts.py",
+        "delegation/redrafts.py", "delegation/chat_draft_card.py",
     }
     assert _importers("openexecutive.delegation.replies") == {"api/routes/decisions.py", "api/routes/delegation.py"}
 
@@ -482,10 +549,13 @@ def _noted(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     return calls
 
 
-def test_a_sent_reply_is_not_noted_unless_they_turned_it_on(
+def test_a_sent_reply_is_not_noted_once_they_turned_it_off(
     owner: Any, models: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from openexecutive.memory.history import set_person_settings
+
     calls = _noted(monkeypatch)
+    set_person_settings(owner.id, by="test", reply_notes=False)
     mailbox, card = _card(owner)
     _send(card, mailbox, owner)
     assert calls == []
@@ -516,3 +586,32 @@ def test_a_failure_to_start_noting_never_touches_the_send(
     monkeypatch.setattr(history, "person_settings", broken)
     mailbox, card = _card(owner)
     assert _send(card, mailbox, owner) == "sent-d1"
+
+
+# ── "Send to them on its own next time" (In training) ────────────────────────
+
+
+def test_send_with_allow_lets_that_sender_go_on_its_own(owner: Any, models: dict[str, Any]) -> None:
+    from openexecutive.delegation import training
+
+    training.set_(owner.id, {training.TRAINING: True}, updated_by="test")
+    mailbox, card = _card(owner)
+    asyncio.run(send_approved_reply(
+        card, caller=LOCAL, resolver=owner.id, allow=True, gmail=mailbox, now=NOW + timedelta(minutes=30),
+    ))
+    assert mailbox.sent == ["d1"] and _status(card) != ledger.STATUS_PROPOSED
+    allowed = training.allowed_person(owner.id, DANA)
+    assert allowed is not None and allowed.person_id == owner.id
+    assert [training.setting_of(a.key) for a in training.learned(owner.id)] == [training.TRAINING]
+
+
+def test_allow_is_refused_out_of_training_before_anything_is_sent(owner: Any, models: dict[str, Any]) -> None:
+    from openexecutive.delegation import training
+
+    mailbox, card = _card(owner)
+    with pytest.raises(SendRefused) as err:
+        asyncio.run(send_approved_reply(
+            card, caller=LOCAL, resolver=owner.id, allow=True, gmail=mailbox, now=NOW + timedelta(minutes=30),
+        ))
+    assert err.value.code == "cant_allow" and mailbox.sent == []
+    assert training.allowed_person(owner.id, DANA) is None and _status(card) == ledger.STATUS_PROPOSED

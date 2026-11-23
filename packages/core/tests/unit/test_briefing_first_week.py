@@ -46,7 +46,12 @@ def setup(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ],
     )
     monkeypatch.setattr("openexecutive.people.store.find_principal_person", lambda *a, **k: state.principal)
+    state.loose_goals = []
     monkeypatch.setattr("openexecutive.departments.store.list_departments", lambda *a, **k: state.departments)
+    monkeypatch.setattr(
+        "openexecutive.departments.store.list_all_goals",
+        lambda *a, **k: [g for d in state.departments for g in d.goals] + state.loose_goals,
+    )
     return state
 
 
@@ -376,6 +381,28 @@ def test_card_drops_the_ask_once_a_goal_is_set_and_hides_with_nothing_to_say(car
     assert first_week.first_week_card(NOW) is None
 
 
+def test_card_drops_the_ask_for_a_goal_with_no_area(card: SimpleNamespace) -> None:
+    card.loose_goals = [_goal(9, "", "Sign 3 pilots by December")]
+    out = first_week.first_week_card(NOW)
+    assert out is not None and not out.needs_goal
+
+
+def test_shared_block_lists_a_goal_with_no_area(setup: SimpleNamespace) -> None:
+    setup.loose_goals = [_goal(9, "", "Sign 3 pilots by December")]
+    lines, _, keys = first_week._goal_lines()
+    assert lines[-1] == "- Sign 3 pilots by December (Q4 2026)"
+    assert any(k.startswith("goal:9:") for k in keys)
+
+
+def test_shared_block_leaves_out_done_goals(setup: SimpleNamespace) -> None:
+    done = _goal(8, "sales", "Ship the pricing page").model_copy(update={"status": "done"})
+    setup.departments[0].goals.append(done)
+    setup.loose_goals = [_goal(9, "", "Sign 3 pilots").model_copy(update={"status": "done"})]
+    lines, _, keys = first_week._goal_lines()
+    assert not any("pricing page" in line or "3 pilots" in line for line in lines)
+    assert not any(k.startswith(("goal:8:", "goal:9:")) for k in keys)
+
+
 def test_card_without_findings_still_asks_for_a_goal(card: SimpleNamespace) -> None:
     card.artifact = "# Executive research\n\nNo findings surfaced this run."
     out = first_week.first_week_card(NOW)
@@ -454,3 +481,18 @@ def test_today_serves_the_card_to_the_principal(monkeypatch: pytest.MonkeyPatch)
     assert out is not None and out.needs_goal and out.findings[0].title == "Rival"
     monkeypatch.setattr("openexecutive.briefing.first_week.first_week_card", lambda now=None: None)
     assert today_route._first_week_card() is None
+
+
+def test_artifact_findings_read_back_from_runs_written_before() -> None:
+    from openexecutive.workflows.executive_research import parse_artifact_findings
+
+    artifact = (
+        "# Executive research\n\n## Findings reviewed\n_1 finding(s) after dedup._\n\n"
+        "- [high | medium] (cso) **Rival cut prices** — Rival cut its plan to $49.\n"
+    )
+    assert parse_artifact_findings(artifact) == [
+        {
+            "severity": "high", "confidence": "medium", "specialist": "cso",
+            "title": "Rival cut prices", "summary": "Rival cut its plan to $49.",
+        }
+    ]

@@ -17,6 +17,12 @@ checked when it is proposed and again when it is carried out:
 - ``message``: a direct message to someone on the roster (``message_person``).
 - ``add_contact``: a new contact for the principal; their cards only, since
   contacts are the principal's.
+- ``drive_files``: rename and/or move up to ``DRIVE_FILES_MAX`` Google Drive
+  files (``MCPGateway.tapped_drive_change``); the principal's cards only. For
+  a change the Drive gate won't make on the model's say-so (a file that isn't
+  the company's own, or a turn that read outside content): the tap is the
+  approval, so only the folder it goes to is checked. It always waits for
+  the tap.
 
 **Whose it is.** A card is a ``delegation_actions`` decision for the person
 who was speaking, theirs alone (``approver_only``: not even the principal sees
@@ -27,20 +33,19 @@ exactly as stored, with no model call: claimed first, so it runs once.
 **Limits.** ``CARDS_PER_TURN`` a turn and ``OPEN_CARDS_MAX`` waiting a
 person; a card is dropped after ``CARD_TTL``.
 
-**In training.** With Act as me's Suggested actions in training
-(``delegation.training``), a card adds **Approve + allow**: it does the
-actions on the person's tap, as Approve does, and from then on a message to
-that person, or a meeting with exactly those people, is allowed. A card whose
-every action is allowed is carried out as soon as it is proposed
-(``run_on_its_own``), with no tap, but only when plain code finds nothing
-against it (``on_its_own_refusal``): still in training, Act as me on, a server
-that can tie the switch to the person, nothing sensitive, no link or amount,
-a short message, and fewer than ``ON_ITS_OWN_PER_DAY`` actions today. A new
-contact always waits. Anything refused waits on its card as before. An
-invite carried out on its own is never booked as already approved: the
-meeting gate decides as for any meeting nobody tapped (a time chosen from
-someone's mail must not land on a calendar unasked), so it may go to the
-approver as a proposal.
+**On their own.** With Handle it for me on and Approvals above Careful, a
+card is carried out as soon as it is proposed (``run_on_its_own``), with no
+tap, when plain code finds nothing against it (``on_its_own_refusal``): Act
+as me on, and a server that can tie the switch to the person. On Balanced
+it also reaches nobody new:
+a new contact, or anyone whose roster entry is under ``SETTLED_AFTER`` old,
+waits on its card (``_known_people_refusal``), so someone added or planted
+lately is never reached without a tap, and a Drive change or a save into a
+shared folder waits too. On Hands-off those checks lift. Anything refused waits on its card as before. An invite carried
+out on its own is never booked as already approved: the meeting gate
+decides as for any meeting nobody tapped, so it may go to the approver as a
+proposal. A card another AI app asked for names the app (``via``) on every
+row about it.
 """
 from __future__ import annotations
 
@@ -57,7 +62,16 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DECISION_CLASS = "delegation_actions"
-KINDS: tuple[str, ...] = ("invite", "message", "add_contact")
+KINDS: tuple[str, ...] = ("invite", "message", "add_contact", "drive_files", "save_files")
+# Kinds that wait for the person's tap below Hands-off.
+TAP_ONLY_KINDS = frozenset({"add_contact", "drive_files", "save_files"})
+HANDLE_MAX = 300
+# Most people outside the team a save_files card lists; a folder open to
+# more gets no card (the tap compares against every one shown).
+OUTSIDE_MAX = 50
+DRIVE_FILES_MAX = 25
+FILE_NAME_MAX = 200
+_DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 MAX_ACTIONS = 5
 CARDS_PER_TURN = 3
 OPEN_CARDS_MAX = 25
@@ -69,10 +83,9 @@ NAME_MAX = 120
 WHY_MAX = 300
 MAX_ATTENDEES = 20
 HORIZON = timedelta(days=366)
-# Carried out on their own, in training: at most this many actions a day, and
-# a message no longer than this.
-ON_ITS_OWN_PER_DAY = 10
-ON_ITS_OWN_MESSAGE_MAX = 1200
+# Below Hands-off, a card reaches no one on its own whose roster entry is
+# newer than this: it waits for a tap.
+SETTLED_AFTER = timedelta(days=7)
 
 _EMAIL_RE = re.compile(r"^[^@\s<>,;\"']+@[^@\s<>,;\"']+\.[^@\s<>,;\"']+$")
 
@@ -103,8 +116,7 @@ class ActionCard:
     created_at: str
     why: str
     actions: list[CardAction] = field(default_factory=list)
-    # Approve + allow: Suggested actions is in training and something on the
-    # card can be allowed that isn't yet (delegation.training).
+    # In training: "Do this on its own next time" (delegation.training).
     can_allow: bool = False
 
 
@@ -246,6 +258,196 @@ def _check_contact(action: dict[str, Any], speaker: Any) -> dict[str, Any] | str
     }
 
 
+def _check_drive_files(action: dict[str, Any], speaker: Any) -> dict[str, Any] | str:
+    if not speaker.is_principal:
+        return "drive_files: the Executive's Drive is the owner's; only they can change it."
+    raw = action.get("files")
+    if not isinstance(raw, list) or not raw:
+        return "drive_files: pass `files`, each with a `file_id` and the new `name` if it is renamed."
+    if len(raw) > DRIVE_FILES_MAX:
+        return f"drive_files: at most {DRIVE_FILES_MAX} files on one action."
+    move_to = str(action.get("move_to") or "").strip()
+    if move_to and not _DRIVE_ID_RE.match(move_to):
+        return "drive_files: `move_to` must be a Drive folder id."
+    files: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return "drive_files: each file is an object with `file_id` and an optional `name`."
+        file_id = str(entry.get("file_id") or "").strip()
+        if not _DRIVE_ID_RE.match(file_id):
+            return "drive_files: each `file_id` must be a Drive file id."
+        name = _one_line(entry.get("name"), FILE_NAME_MAX + 1)
+        if len(name) > FILE_NAME_MAX:
+            return f"drive_files: keep each `name` to {FILE_NAME_MAX} characters."
+        if not name and not move_to:
+            return "drive_files: give each file a new `name`, or pass `move_to`."
+        if file_id == move_to:
+            return "drive_files: a folder can't be moved into itself."
+        if any(f["file_id"] == file_id for f in files):
+            continue
+        files.append({"file_id": file_id, "name": name})
+    renamed = sum(1 for f in files if f["name"])
+    count = f"{len(files)} file" + ("" if len(files) == 1 else "s")
+    if renamed and move_to:
+        summary = f"Rename and move {count} in Drive"
+    elif move_to:
+        summary = f"Move {count} in Drive"
+    else:
+        summary = f"Rename {count} in Drive"
+    lines = [f"{f['file_id']} → {f['name']}" for f in files if f["name"]]
+    return {
+        "kind": "drive_files", "input": {"files": files, "move_to": move_to},
+        "summary": summary, "text": "\n".join(lines),
+    }
+
+
+def _check_save_files(action: dict[str, Any], speaker: Any) -> dict[str, Any] | str:
+    if not speaker.is_principal:
+        return "save_files: the Executive's Drive is the owner's; only they can save into it."
+    folder = str(action.get("folder") or "").strip()
+    if not _DRIVE_ID_RE.match(folder):
+        return "save_files: `folder` must be a Drive folder id."
+    raw = action.get("files")
+    if not isinstance(raw, list) or not raw:
+        return "save_files: pass `files`, each with the file's handle as `file` and the `name` to save under."
+    if len(raw) > DRIVE_FILES_MAX:
+        return f"save_files: at most {DRIVE_FILES_MAX} files on one action."
+    files: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return "save_files: each file is an object with `file` (its handle) and an optional `name`."
+        handle = str(entry.get("file") or "").strip()
+        if not handle or len(handle) > HANDLE_MAX:
+            return "save_files: each file needs its handle as `file`."
+        name = _one_line(entry.get("name"), FILE_NAME_MAX + 1)
+        if len(name) > FILE_NAME_MAX:
+            return f"save_files: keep each `name` to {FILE_NAME_MAX} characters."
+        if any(f["file"] == handle for f in files):
+            continue
+        # Set by describe_save_files when the card is made: the name the
+        # file is kept under for the conversation.
+        files.append({"file": handle, "name": name, "kept": _one_line(entry.get("kept"), FILE_NAME_MAX),
+                      "sha256": sha if re.fullmatch(r"[0-9a-f]{64}", sha := str(entry.get("sha256") or "")) else ""})
+    count = f"{len(files)} file" + ("" if len(files) == 1 else "s")
+    return {
+        "kind": "save_files",
+        "input": {
+            "folder": folder, "files": files, "session_id": _one_line(action.get("session_id"), 200),
+            # Who else can open the folder, as the card showed it (set by
+            # describe_save_files); the tap approves only that audience.
+            "outside": [_one_line(w, 80) for w in (action.get("outside") or [])[:OUTSIDE_MAX] if isinstance(w, str)]
+            if isinstance(action.get("outside"), list) else [],
+        },
+        "summary": f"Save {count} to Drive", "text": "\n".join(f["name"] or f["file"] for f in files),
+    }
+
+
+async def describe_save_files(actions: list[dict[str, Any]], session_id: str | None) -> str | None:
+    """Make checked ``save_files`` actions ready for a tap: each file read now
+    and kept for this conversation (``conversation_files``), its name fixed,
+    and the folder's name and who outside the team can open it put on the
+    card. None when ready, else why the card can't be made."""
+    from openexecutive.orchestrator import conversation_files, file_refs, file_tools
+    from openexecutive.orchestrator import mail_file_save as save
+    from openexecutive.orchestrator.drive_attach import INFO_TOOL
+    from openexecutive.orchestrator.mcp_gateway import ensure_active_gateway
+
+    saves = [a for a in actions if a.get("kind") == "save_files"]
+    if not saves:
+        return None
+    if not session_id:
+        return "save_files: this chat can't hold the files for a card."
+    gateway = await ensure_active_gateway()
+    if gateway is None or save.storage_for(gateway) != save.GOOGLE:
+        return "save_files: Google Drive isn't connected right now."
+    account = save._exec_account()
+    for action in saves:
+        stored = action["input"]
+        folder = stored["folder"]
+        for f in stored["files"]:
+            f["kept"] = f["sha256"] = ""  # set below, never taken from the proposal
+        info = await save._call(gateway, INFO_TOOL, {"user_google_email": account, "file_id": folder})
+        if save._failed(info):
+            return f"save_files: couldn't open that folder: {save._why(info)}"
+        refused, outside = file_tools.folder_check(info, folder, account, file_tools._team_emails())
+        if refused is not None:
+            return f"save_files: {refused}."
+        if not outside:
+            return "save_files: only the team can open that folder, so save_file saves into it now; no card needed."
+        if len(outside) > OUTSIDE_MAX:
+            return f"save_files: more than {OUTSIDE_MAX} people outside the team can open that folder, too many to show on a card."
+        try:
+            names = await gateway.drive_item_names([folder])
+        except Exception:
+            logger.warning("action_cards: couldn't read the folder's name", exc_info=True)
+            names = {}
+        folder_name = _one_line(str(names.get(folder) or ""), FILE_NAME_MAX)
+        if not folder_name:
+            return "save_files: couldn't read that folder's name in Drive, so it can't be shown on a card."
+        for f in stored["files"]:
+            try:
+                got = await file_refs.resolve([f["file"]])
+            except file_refs.RefError as exc:
+                return f"save_files: {exc}"
+            if not got.items:
+                return f"save_files: {f['file']} is too large to save."
+            item = got.items[0]
+            f["name"] = file_tools._named(f["name"] or None, item.name)
+            # Kept by name: two files under one name would keep only the last.
+            if any(o is not f and o.get("name", "").casefold() == f["name"].casefold() and o.get("kept")
+                   for o in stored["files"]):
+                return f"save_files: two files would both be saved as {f['name']}. Give them different names."
+            kept = conversation_files.keep(session_id, {f["name"]: item.data}, from_mail=file_refs.turn_used_mail_files())
+            if not kept:
+                return f"save_files: couldn't hold {f['name']} for the card. Try again."
+            if any(o is not f and o.get("kept") == kept[0] for o in stored["files"]):
+                return f"save_files: two files would both be saved as {f['name']}. Give them different names."
+            f["kept"] = kept[0]
+            # The bytes the card was made for: a later file kept under the
+            # same name in this chat must not be what the tap saves.
+            f["sha256"] = hashlib.sha256(item.data).hexdigest()
+        stored["session_id"] = session_id
+        stored["outside"] = outside
+        count = f"{len(stored['files'])} file" + ("" if len(stored["files"]) == 1 else "s")
+        action["summary"] = f"Save {count} to {folder_name}"
+        shown = ", ".join(outside[:10]) + (f" and {len(outside) - 10} more" if len(outside) > 10 else "")
+        action["text"] = "\n".join([*(f["name"] for f in stored["files"]), f"Also open to: {shown}"])
+    return None
+
+
+async def describe_drive_files(actions: list[dict[str, Any]]) -> str | None:
+    """Put each Drive file's current name, and the folder's, on checked
+    ``drive_files`` actions, for the card to show. A card never shows bare
+    ids: when a name can't be read, why the card can't be made."""
+    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+
+    drive = [a for a in actions if a.get("kind") == "drive_files"]
+    if not drive:
+        return None
+    gateway = get_active_gateway()
+    if gateway is None:
+        return "drive_files: Google Drive isn't connected right now."
+    for action in drive:
+        stored = action["input"]
+        ids = [f["file_id"] for f in stored["files"]] + ([stored["move_to"]] if stored["move_to"] else [])
+        try:
+            names = await gateway.drive_item_names(ids[:DRIVE_FILES_MAX + 1])
+        except Exception:
+            logger.warning("action_cards: couldn't read the Drive names", exc_info=True)
+            return "drive_files: couldn't read the names in Drive right now. Try again."
+        for i in ids:
+            if not names.get(i):
+                return f"drive_files: couldn't find {i} in Drive, so it can't be shown on a card. Check the id."
+
+        shown = {i: _one_line(str(names[i]), FILE_NAME_MAX) for i in ids}
+        action["text"] = "\n".join(
+            f"{shown[f['file_id']]} → {f['name']}" if f["name"] else shown[f["file_id"]] for f in stored["files"]
+        )
+        if stored["move_to"]:
+            action["summary"] = f"{action['summary']}, to {shown[stored['move_to']]}"
+    return None
+
+
 def check(actions: Any, speaker: Any, *, now: datetime) -> list[dict[str, Any]] | str:
     """``actions`` as they will be stored, or why they can't be."""
     if not isinstance(actions, list) or not actions:
@@ -264,6 +466,10 @@ def check(actions: Any, speaker: Any, *, now: datetime) -> list[dict[str, Any]] 
             checked = _check_invite(action, speaker, now)
         elif kind == "add_contact":
             checked = _check_contact(action, speaker)
+        elif kind == "drive_files":
+            checked = _check_drive_files(action, speaker)
+        elif kind == "save_files":
+            checked = _check_save_files(action, speaker)
         else:
             return f"`kind` must be one of {', '.join(KINDS)}."
         if isinstance(checked, str):
@@ -301,11 +507,12 @@ def open_cards(person_id: int, *, now: datetime | None = None) -> list[Any]:
 
 def propose(
     speaker: Any, actions: list[dict[str, Any]], why: str, *, session_id: str | None, on_its_own: bool = False,
+    follow_handle_it: bool = False, via: str | None = None,
 ) -> int:
     """Store a card for ``speaker`` (``actions`` already ``check``ed); returns
     its decision id. The same actions still waiting are that card.
     ``on_its_own`` marks it for ``run_on_its_own`` (``on_its_own_refusal``
-    found nothing against it)."""
+    found nothing against it); ``via`` names the AI app that asked for it."""
     from openexecutive.memory.decision_ledger import create_decision_instance
 
     digest = hashlib.sha256(
@@ -320,6 +527,8 @@ def propose(
         "private": True,
         "person_id": speaker.id, "why": _one_line(why, WHY_MAX), "digest": digest, "actions": actions,
     }
+    if via:
+        payload["via"] = _one_line(via, NAME_MAX)
     return create_decision_instance(
         decision_class=DECISION_CLASS,
         department="executive",
@@ -332,22 +541,11 @@ def propose(
     )
 
 
-def can_allow(person_id: int, actions: list[Any], *, in_training: bool) -> bool:
-    """Whether Approve + allow has something to allow on a card."""
-    from openexecutive.delegation import training
-
-    return in_training and any(
-        isinstance(a, dict) and training.action_key(person_id, a) is not None
-        and training.allowed_action(person_id, a) is None
-        for a in actions
-    )
-
-
 def cards(person: Any) -> list[ActionCard]:
     """``person``'s waiting cards, for ``GET /delegation/actions``."""
     from openexecutive.delegation import training
 
-    in_training = training.get(person.id).actions
+    trained = training.in_training(person.id)
     out: list[ActionCard] = []
     for card in open_cards(person.id):
         payload = _payload(card)
@@ -361,15 +559,31 @@ def cards(person: Any) -> list[ActionCard]:
                            text=str(a.get("text") or ""))
                 for i, a in enumerate(actions) if isinstance(a, dict)
             ],
-            can_allow=can_allow(person.id, actions, in_training=in_training),
+            can_allow=trained and bool(_addresses(actions))
+            and training.all_allowed(person.id, _addresses(actions)) is None,
         ))
+    return out
+
+
+def _addresses(actions: list[Any]) -> list[str]:
+    """The email addresses of everyone a card's messages and invites reach
+    (what one "on its own next time" allows); "" for anyone without one."""
+    from openexecutive.people.store import get_person
+
+    out: list[str] = []
+    for person_id in _recipients([a for a in actions if isinstance(a, dict)]):
+        try:
+            person = get_person(int(person_id))
+        except (TypeError, ValueError):
+            person = None
+        out.append(str(person.email or "").strip().lower() if person is not None else "")
     return out
 
 
 def on_its_own_refusal(person: Any, actions: list[dict[str, Any]], *, now: datetime) -> str | None:
     """Why a card of ``actions`` may not be carried out on its own (a short
-    code), or None when it may. Plain code only; never raises (an error
-    refuses)."""
+    code), or None when it may: Handle it for me and Approvals decide. Plain
+    code only; never raises (an error refuses)."""
     try:
         return _on_its_own_refusal(person, actions, now)
     except Exception:
@@ -377,45 +591,102 @@ def on_its_own_refusal(person: Any, actions: list[dict[str, Any]], *, now: datet
         return "uncountable"
 
 
-def _on_its_own_refusal(person: Any, actions: list[dict[str, Any]], now: datetime) -> str | None:
-    from openexecutive.delegation import handle_it, training
-    from openexecutive.delegation.settings import can_delegate, is_enabled
-    from openexecutive.memory.decision_ledger import STATUS_EXECUTED, list_instances
+def hands_off() -> bool:
+    """Whether Approvals is on Hands-off. Unreadable is not."""
+    try:
+        from openexecutive.orchestrator import outside_mode
 
-    if person is None or person.id is None or not training.get(person.id).actions:
-        return "training_off"
-    if not can_delegate(person) or not is_enabled(person.id):
-        return "act_as_me_off"
-    if not handle_it.signing_ok():
-        return "signing_off"
-    if not actions or any(training.allowed_action(person.id, a) is None for a in actions):
-        return "not_allowed"
-    for action in actions:
-        given = action.get("input")
-        stored: dict[str, Any] = given if isinstance(given, dict) else {}
-        texts = [str(stored.get(k) or "") for k in ("text", "title", "description")]
-        if handle_it.sensitive(*texts):
-            return "sensitive"
-        if any(handle_it._LINK_RE.search(t) for t in texts):
-            return "link"
-        if any(handle_it._AMOUNT_RE.search(t) for t in texts):
-            return "amount"
-        if len(str(stored.get("text") or "")) > ON_ITS_OWN_MESSAGE_MAX:
-            return "long"
-    day = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    done_today = list_instances(
-        DECISION_CLASS, status=STATUS_EXECUTED, approver_person_id=person.id,
-        resolved_since=day.isoformat(), limit=1000,
-    )
-    done = sum(len(_payload(card).get("actions") or []) for card in done_today)
-    if done + len(actions) > ON_ITS_OWN_PER_DAY:
-        return "daily_limit"
+        return outside_mode.get_mode() == outside_mode.TRUST
+    except Exception:
+        return False
+
+
+def _known_people_refusal(person: Any, actions: list[dict[str, Any]], now: datetime) -> str | None:
+    """Below Hands-off, a card carried out on its own reaches only people
+    settled on the roster: a new contact, or anyone added lately, waits for
+    a tap."""
+    if any(a.get("kind") == "add_contact" for a in actions):
+        return "new_contact"
+    if any(a.get("kind") in TAP_ONLY_KINDS for a in actions):
+        return "tap_only"
+    if not all(_settled(pid, person.id, now) for pid in _recipients(actions)):
+        return "new_person"
     return None
 
 
-# One card carried out on its own at a time, so two turns can't both pass
-# the daily limit before either is counted.
+def _recipients(actions: list[dict[str, Any]]) -> list[Any]:
+    """Everyone a card's messages and invites reach, by roster id."""
+    out: list[Any] = []
+    for action in actions:
+        given = action.get("input")
+        stored: dict[str, Any] = given if isinstance(given, dict) else {}
+        if action.get("kind") == "message":
+            out.append(stored.get("person_id"))
+        elif action.get("kind") == "invite":
+            ids = stored.get("attendee_person_ids")
+            out.extend(ids if isinstance(ids, list) else [None])
+    return out
+
+
+def _settled(person_id: Any, speaker_id: int, now: datetime) -> bool:
+    """Whether a card may reach ``person_id`` with no tap below Hands-off: the speaker, or someone on the roster they know (team or contact)
+    whose entry is older than ``SETTLED_AFTER``, so nobody added or planted
+    lately is reached on its own. Fails closed."""
+    from openexecutive.people.store import get_person
+
+    pid = _int(person_id)
+    if pid is None:
+        return False
+    if pid == speaker_id:
+        return True
+    found = get_person(pid)
+    if found is None or found.archived or found.kind not in ("team", "contact"):
+        return False
+    try:
+        created = datetime.fromisoformat(str(found.created_at or ""))
+    except ValueError:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return now - created >= SETTLED_AFTER
+
+
+def _on_its_own_refusal(person: Any, actions: list[dict[str, Any]], now: datetime) -> str | None:
+    from openexecutive.delegation import handle_it
+    from openexecutive.delegation.settings import can_delegate, is_enabled
+
+    if person is None or person.id is None:
+        return "handle_it_off"
+    if not can_delegate(person) or not is_enabled(person.id):
+        return "act_as_me_off"
+    if not handle_it.get(person.id).enabled:
+        return "handle_it_off"
+    if handle_it.approvals_hold():
+        return "level"
+    if not handle_it.signing_ok():
+        return "signing_off"
+    if not actions:
+        return "not_allowed"
+    # In training, only people they allowed, every one on the card;
+    # otherwise, below Hands-off, nobody new.
+    held = handle_it.training_hold(person.id, _addresses(actions) or [""])
+    if held is not None:
+        return held
+    if not handle_it.in_training(person.id) and not hands_off():
+        refused = _known_people_refusal(person, actions, now)
+        if refused is not None:
+            return refused
+    return None
+
+
+# One card carried out on its own at a time.
 _ON_ITS_OWN_LOCK = asyncio.Lock()
+
+
+def _via(payload: dict[str, Any]) -> dict[str, str]:
+    """``{"via": app}`` for a card another AI app asked for, else empty."""
+    via = payload.get("via")
+    return {"via": via} if isinstance(via, str) and via else {}
 
 
 def audit(event: str, summary: str, details: dict[str, Any]) -> None:
@@ -436,7 +707,7 @@ def _result(raw: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-async def _do(action: dict[str, Any], person: Any, *, tapped: bool = True) -> dict[str, str]:
+async def _do(action: dict[str, Any], person: Any, *, tapped: bool = False) -> dict[str, str]:
     """Carry out one stored action, checked again first. Never raises.
     ``tapped``: the person approved this very card, so an invite is booked
     as approved by them; on its own, the meeting gate decides."""
@@ -484,18 +755,86 @@ async def _do(action: dict[str, Any], person: Any, *, tapped: bool = True) -> di
             )
             people_registry.invalidate()
             return {"status": "done", "detail": "Added."}
+        if kind == "drive_files":
+            return await _do_drive_files(tool_input, tapped=tapped)
+        if kind == "save_files":
+            return await _do_save_files(tool_input, tapped=tapped)
     except Exception:
         logger.exception("action_cards: a %s action failed", kind)
         return {"status": "failed", "detail": "Something went wrong, so it may not have happened. Check before trying again."}
     return {"status": "failed", "detail": "Unknown action."}
 
 
+async def _do_drive_files(stored: dict[str, Any], *, tapped: bool) -> dict[str, str]:
+    """Rename and/or move each file on a ``drive_files`` action, one by one."""
+    from openexecutive.orchestrator.mcp_gateway import ensure_active_gateway
+
+    if not tapped:
+        return {"status": "failed", "detail": "A Drive change waits for a tap."}
+    gateway = await ensure_active_gateway()
+    if gateway is None:
+        return {"status": "failed", "detail": "Google Drive isn't connected right now."}
+    failed: list[str] = []
+    files = stored["files"]
+    for f in files:
+        error = await gateway.tapped_drive_change(f["file_id"], name=f["name"], move_to=stored["move_to"])
+        if error is not None:
+            failed.append(f"{f['name'] or f['file_id']}: {error}")
+    if not failed:
+        return {"status": "done", "detail": f"Done for {len(files)} file" + ("" if len(files) == 1 else "s") + "."}
+    detail = f"{len(files) - len(failed)} of {len(files)} done. " + "; ".join(failed[:3])
+    return {"status": "failed", "detail": detail[:300]}
+
+
+async def _do_save_files(stored: dict[str, Any], *, tapped: bool) -> dict[str, str]:
+    """Save each file on a ``save_files`` action into its folder, one by one,
+    from the copy kept when the card was made. Only on the person's tap:
+    the folder is still checked (``file_tools.folder_check``), but people
+    outside the team being able to open it is what they approved."""
+    from openexecutive.orchestrator import conversation_files, file_refs, file_tools
+    from openexecutive.orchestrator import mail_file_save as save
+    from openexecutive.orchestrator.mcp_gateway import ensure_active_gateway
+
+    if not tapped:
+        return {"status": "failed", "detail": "Saving into a folder shared outside the team waits for a tap."}
+    gateway = await ensure_active_gateway()
+    if gateway is None or save.storage_for(gateway) != save.GOOGLE:
+        return {"status": "failed", "detail": "Google Drive isn't connected right now."}
+    files = stored["files"]
+    failed: list[str] = []
+    for f in files:
+        data = conversation_files.get(stored["session_id"] or None, f["kept"]) if f["kept"] else None
+        if data is None:
+            failed.append(f"{f['name']}: no longer kept; ask again in the chat")
+            continue
+        if not f.get("sha256") or hashlib.sha256(data).hexdigest() != f["sha256"]:
+            failed.append(f"{f['name']}: changed since the card was made; ask again in the chat")
+            continue
+        item = file_refs.FileItem(name=f["name"], mime=file_refs.guess_mime(f["name"]), data=data, ref=f["file"])
+        try:
+            async with save._lock():
+                await file_tools._google(
+                    gateway, item, stored["folder"], f["name"], tapped=True, shown=stored.get("outside") or [],
+                )
+        except save.SaveFailed as exc:
+            failed.append(f"{f['name']}: {exc.detail}")
+        except Exception:
+            # Per file, so the files already saved are still reported as saved.
+            logger.warning("action_cards: saving %s failed", f["name"], exc_info=True)
+            failed.append(f"{f['name']}: something went wrong, so it may not have saved")
+    if not failed:
+        return {"status": "done", "detail": f"Saved {len(files)} file" + ("" if len(files) == 1 else "s") + "."}
+    detail = f"{len(files) - len(failed)} of {len(files)} saved. " + "; ".join(failed[:3])
+    return {"status": "failed", "detail": detail[:300]}
+
+
 async def approve(
     instance: Any, *, caller: Any, resolver: int | None, only: Any = None, allow: bool = False,
 ) -> list[dict[str, Any]]:
     """Carry out ``instance``'s actions (those in ``only`` when given) for
-    its person, once. ``allow`` is Approve + allow (in training): allow each
-    one that happened from now on. Raises ``ApproveRefused``."""
+    its person, once. ``allow`` is "on its own next time" (in training):
+    everyone the chosen actions reach is allowed from now on
+    (``training.allow_person``). Raises ``ApproveRefused``."""
     from openexecutive.delegation.gmail import normalize_email
     from openexecutive.delegation.settings import can_delegate, is_enabled
     from openexecutive.delegation.verified import NOT_YOURS, caller_refusal
@@ -521,7 +860,7 @@ async def approve(
             "Approving needs signed sign-ins on this server, so that nobody else can approve it for you.",
         )
     if not can_delegate(person) or not is_enabled(person.id):
-        raise ApproveRefused(409, "act_as_me_off", "Act as me is off, so this card can't be approved.")
+        raise ApproveRefused(409, "act_as_me_off", "As you is off, so this card can't be approved.")
     if not _live(instance, datetime.now(UTC)):
         raise ApproveRefused(409, "expired", "This card is more than a week old. Ask again if it still needs doing.")
     actions = [a for a in payload.get("actions") or [] if isinstance(a, dict)]
@@ -535,30 +874,58 @@ async def approve(
     if allow:
         from openexecutive.delegation import training
 
-        if not training.get(person.id).actions:
-            raise ApproveRefused(422, "cant_allow", "Approve + allow is for cards while Suggested actions is in training.")
-        keys = [found[0] for i in chosen if (found := training.action_key(person.id, actions[i])) is not None]
-        if not keys:
+        if not training.in_training(person.id):
+            raise ApproveRefused(422, "cant_allow", "Doing this on its own next time is for cards while In training is on.")
+        addresses = [a for a in _addresses([actions[i] for i in sorted(chosen)]) if a]
+        if not addresses:
             raise ApproveRefused(422, "cant_allow", "Nothing on this card can be allowed.")
-        if not all(training.room_for(person.id, k) for k in keys):
+        if not training.room_for_all(person.id, addresses):
             raise ApproveRefused(409, "learned_full", "It has learned as much as it can hold. Remove something first.")
     if not claim_for_execution(instance.id, resolver_person_id=resolver):
         raise ApproveRefused(409, "already_handled", "This card was already handled.")
-    results = await _carry_out(person, actions, chosen)
+    results = await _carry_out(person, actions, chosen, tapped=True)
     any_ok = any(r["status"] in ("done", "waiting") for r in results)
     status = (STATUS_APPROVED_UNCHANGED if len(chosen) == len(actions) else STATUS_APPROVED_WITH_EDIT) if any_ok else STATUS_FAILED
     finish_execution(instance.id, status, final_payload={**payload, "results": results})
     audit("delegation_actions_approved", f"Person {person.id} approved an action card", {
         "person_id": person.id, "decision_id": instance.id,
         "outcomes": [f"{actions[r['index']].get('kind')}:{r['status']}" for r in results],
+        **_via(payload),
     })
     if allow:
         _allow_done(person.id, actions, results, decision_id=instance.id)
     return results
 
 
+def _allow_done(person_id: int, actions: list[dict[str, Any]], results: list[dict[str, Any]], *, decision_id: int) -> None:
+    """"On its own next time", once the actions ran: everyone an action that
+    happened (or went to whoever approves meetings) reaches is allowed. A
+    failure never undoes them."""
+    from openexecutive.delegation import training
+    from openexecutive.people.store import get_person
+
+    allowed: list[int] = []
+    done = [actions[r["index"]] for r in results if r["status"] in ("done", "waiting")]
+    for target in _recipients(done):
+        try:
+            person = get_person(int(target))
+            found = training.allow_person(
+                person_id, str(person.email or "") if person else "", str(person.full_name or "") if person else "",
+                decision_id=decision_id,
+            )
+        except Exception:
+            logger.warning("action_cards: the actions ran, but allowing someone failed", exc_info=True)
+            continue
+        if found is not None:
+            allowed.append(found.id)
+    if allowed:
+        audit("delegation_actions_allowed", f"Person {person_id} allowed people in training", {
+            "person_id": person_id, "decision_id": decision_id, "allowed_ids": allowed,
+        })
+
+
 async def _carry_out(
-    person: Any, actions: list[dict[str, Any]], chosen: set[int], *, tapped: bool = True,
+    person: Any, actions: list[dict[str, Any]], chosen: set[int], *, tapped: bool,
 ) -> list[dict[str, Any]]:
     """Do the ``chosen`` actions for ``person``, once claimed."""
     from contextlib import nullcontext
@@ -583,28 +950,6 @@ async def _carry_out(
     finally:
         current_session.reset(token)
     return results
-
-
-def _allow_done(person_id: int, actions: list[dict[str, Any]], results: list[dict[str, Any]], *, decision_id: int) -> None:
-    """Approve + allow, once the actions ran: allow each one that happened
-    (or went to whoever approves meetings). A failure never undoes them."""
-    from openexecutive.delegation import training
-
-    allowed: list[int] = []
-    for result in results:
-        if result["status"] not in ("done", "waiting"):
-            continue
-        try:
-            found = training.allow_action(person_id, actions[result["index"]], decision_id=decision_id)
-        except Exception:
-            logger.warning("action_cards: the actions ran, but allowing one failed", exc_info=True)
-            continue
-        if found is not None:
-            allowed.append(found.id)
-    if allowed:
-        audit("delegation_actions_allowed", f"Person {person_id} allowed suggested actions in training", {
-            "person_id": person_id, "decision_id": decision_id, "allowed_ids": allowed,
-        })
 
 
 async def run_on_its_own(decision_id: int, person: Any, *, now: datetime | None = None) -> list[dict[str, Any]] | None:
@@ -634,6 +979,7 @@ async def run_on_its_own(decision_id: int, person: Any, *, now: datetime | None 
                 hand_back(decision_id, {**payload, "held_because": refused})
                 audit("delegation_actions_held", f"Left person {person.id}'s action card for them", {
                     "person_id": person.id, "decision_id": decision_id, "reason": refused,
+                    **_via(payload),
                 })
                 return None
             if not claim_for_execution(decision_id, resolver_person_id=None):
@@ -646,7 +992,6 @@ def _finish_on_its_own(
     person: Any, decision_id: int, payload: dict[str, Any], actions: list[dict[str, Any]],
     results: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    from openexecutive.delegation import training
     from openexecutive.memory.decision_ledger import (
         STATUS_EXECUTED,
         STATUS_FAILED,
@@ -658,13 +1003,10 @@ def _finish_on_its_own(
         decision_id, STATUS_EXECUTED if any_ok else STATUS_FAILED,
         final_payload={**payload, "results": results, "on_its_own": True},
     )
-    for action in actions:
-        allowance = training.allowed_action(person.id, action)
-        if allowance is not None:
-            training.used(allowance)
     audit("delegation_actions_handled", f"Carried out person {person.id}'s action card on its own", {
         "person_id": person.id, "decision_id": decision_id,
         "outcomes": [f"{actions[r['index']].get('kind')}:{r['status']}" for r in results],
+        **_via(payload),
     })
     return results
 

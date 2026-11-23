@@ -13,20 +13,51 @@ const DAYS: Record<string, string> = {
   sun: "Sunday",
 };
 
-/** Plain-words rendering of the cadence DSL (daily@HH:MM, weekly@DOW@HH:MM, quarterly@DD-HH:MM). */
+/** Plain-words rendering of the cadence DSL (daily@HH:MM, weekly@DOW@HH:MM,
+ * quarterly@DD-HH:MM), in the company's time zone, as it was saved. */
 export function describeCadence(cadence: string | null | undefined): string {
   if (!cadence) return "Only when you run it";
   const parts = cadence.split("@");
-  if (parts[0] === "daily" && parts[1]) return `Every day at ${parts[1]} UTC`;
+  if (parts[0] === "daily" && parts[1]) return `Every day at ${clock(parts[1]) ?? parts[1]}`;
   if (parts[0] === "weekly" && parts[1] && parts[2]) {
     const day = DAYS[parts[1].toLowerCase()] ?? parts[1];
-    return `Every ${day} at ${parts[2]} UTC`;
+    return `Every ${day} at ${clock(parts[2]) ?? parts[2]}`;
   }
   if (parts[0] === "quarterly" && parts[1]) {
     const [dd, time] = parts[1].split("-");
-    return `Quarterly on day ${Number(dd)} at ${time} UTC`;
+    return `Quarterly on day ${Number(dd)} at ${clock(time ?? "") ?? time}`;
   }
   return cadence;
+}
+
+/** "9:00 AM" for a valid "HH:MM" (24-hour), else null. */
+function clock(s: string): string | null {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return `${h % 12 || 12}:${m[2]} ${h < 12 ? "AM" : "PM"}`;
+}
+
+/**
+ * The cadence as the company's clock says it: "Mondays at 9:00 AM". A saved
+ * cadence is already in the company's time zone, so it reads as written;
+ * `timeZone` and `now` are kept for callers and ignored. Anything else falls
+ * back to `describeCadence`.
+ */
+export function describeCadenceLocal(
+  cadence: string | null | undefined,
+  _timeZone?: string,
+  _now?: Date,
+): string {
+  const parts = (cadence ?? "").trim().split("@");
+  if (parts[0] === "weekly" && parts.length === 3) {
+    const t = clock(parts[2]);
+    const day = DAYS[parts[1].toLowerCase()];
+    if (t && day) return `${day}s at ${t}`;
+  }
+  return describeCadence(cadence);
 }
 
 /** How to name people, specialists and tools — supplied by the page. */
@@ -34,6 +65,8 @@ export interface ChangeLabels {
   person: (id: number | null | undefined) => string;
   specialist: (key: string | undefined) => string;
   tool: (name: string) => string;
+  /** How to say a schedule; `describeCadence` when not given. */
+  cadence?: (cadence: string | null | undefined) => string;
 }
 
 const ON_TIMEOUT: Record<string, string> = {
@@ -181,6 +214,7 @@ export function describeChanges(
   labels: ChangeLabels
 ): string[] {
   const out: string[] = [];
+  const when = labels.cadence ?? describeCadence;
 
   if (before.title !== after.title) out.push(`Renamed “${before.title}” to “${after.title}”`);
   if ((before.description ?? "").trim() !== (after.description ?? "").trim())
@@ -195,8 +229,8 @@ export function describeChanges(
   if (ca !== cb) {
     out.push(
       cb
-        ? `Schedule: ${describeCadence(cb)}, sent to ${labels.person(after.cadence_person_id)} (was: ${describeCadence(ca)})`
-        : `Schedule: only when you run it (was: ${describeCadence(ca)})`
+        ? `Schedule: ${when(cb)}, sent to ${labels.person(after.cadence_person_id)} (was: ${when(ca)})`
+        : `Schedule: only when you run it (was: ${when(ca)})`
     );
   } else if (cb && before.cadence_person_id !== after.cadence_person_id) {
     out.push(
@@ -268,4 +302,36 @@ export function addedTools(before: DynamicWorkflowDef, after: DynamicWorkflowDef
   return Array.from(
     new Set(after.steps.flatMap((s) => (s.kind === "action" ? s.tools : [])))
   ).filter((t) => !had.has(t));
+}
+
+/**
+ * The stored name for a new workflow, made from its title: lowercase words
+ * joined by `_`, starting with a letter, 3-49 characters, never `quick_…`
+ * (kept for ready-made ones) and none of `taken`. The server's rule
+ * (workflows/dynamic_models.py `_NAME_RE`).
+ */
+export function workflowNameFromTitle(title: string, taken: ReadonlySet<string>): string {
+  let base = title
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!/^[a-z]/.test(base)) base = base ? `workflow_${base}` : "workflow";
+  if (base.startsWith("quick_")) base = `my_${base}`;
+  if (base.length < 3) base = `${base}_workflow`;
+  base = base.slice(0, 49).replace(/_+$/, "");
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const suffix = `_${n}`;
+    const name = base.slice(0, 49 - suffix.length).replace(/_+$/, "") + suffix;
+    if (!taken.has(name)) return name;
+  }
+}
+
+/** A step id not yet used in `ids`: `step_1`, `step_2`, … */
+export function newStepId(ids: readonly string[]): string {
+  for (let n = 1; ; n++) {
+    const id = `step_${n}`;
+    if (!ids.includes(id)) return id;
+  }
 }

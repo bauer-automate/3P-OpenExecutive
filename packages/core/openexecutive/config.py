@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     # the request carries an `anthropic-workspace-id` header (#128). A
     # workspace-scoped key needs no value here.
     anthropic_workspace_id: str | None = Field(None, alias="ANTHROPIC_WORKSPACE_ID")
+    # Pydantic Logfire write token. Unset (the default) leaves request tracing
+    # off entirely; see openexecutive.observability for what a trace records.
+    logfire_token: str | None = Field(None, alias="LOGFIRE_TOKEN")
 
     default_model: str = Field("claude-sonnet-5-5", alias="DEFAULT_MODEL")
     # The model the specialists with deep reasoning on by default (CFO, legal,
@@ -129,6 +132,13 @@ class Settings(BaseSettings):
     # off) instead of Opus is the dominant cost lever for the workflow.
     # Set RESEARCH_MODEL=claude-opus-5-5 to restore the prior behavior.
     research_model: str = Field("claude-sonnet-5-5", alias="RESEARCH_MODEL")
+    # The Executive's model for the one answer after someone pushes back on
+    # the last one (a thumbs down, "that's not what I asked", the same ask
+    # again, or a reply the claim check caught); the answer after that goes
+    # back to the normal model (orchestrator.pushback). Empty = off, every
+    # answer on the normal model. The Executive's Council card can set its
+    # own pick, which wins over this.
+    pushback_model: str = Field("", alias="PUSHBACK_MODEL")
 
     vector_store_path: Path = Field(_ROOT / "chroma_db", alias="VECTOR_STORE_PATH")
     company_profile_path: Path = Field(
@@ -158,6 +168,15 @@ class Settings(BaseSettings):
         None, ge=0.0, le=2.0, alias="KNOWLEDGE_BUILTIN_DISTANCE_THRESHOLD"
     )
     knowledge_builtin_n_results: int = Field(5, alias="KNOWLEDGE_BUILTIN_N_RESULTS")
+    # Whether the Executive's own chat turns (web chat, chat apps, email) get
+    # built-in playbook excerpts matched to the message. Off by
+    # default: on real turns most matches were unrelated (a procurement
+    # playbook for a pricing question, a board-meeting one for "when is the
+    # next daily meeting?"), and the good and bad matches score alike, so a
+    # stricter gate can't separate them. Company documents still come with
+    # every turn, and a specialist the Executive consults still reads its own
+    # domain's playbooks.
+    knowledge_chat_builtin: bool = Field(False, alias="KNOWLEDGE_CHAT_BUILTIN")
     knowledge_company_n_results: int = Field(3, alias="KNOWLEDGE_COMPANY_N_RESULTS")
     # Total characters of knowledge excerpts a chat turn carries (web chat,
     # Telegram, Discord, Google Chat). The closest matches are kept first.
@@ -219,6 +238,21 @@ class Settings(BaseSettings):
     openrouter_catalog_refresh_s: float = Field(
         _DEFAULT_OPENROUTER_CATALOG_REFRESH_S, alias="OPENROUTER_CATALOG_REFRESH_S"
     )
+
+    # ---- Speech to text (voice notes, the chat mic) ---------------------
+    # Any server with the standard POST /audio/transcriptions call (OpenAI,
+    # Groq, OpenRouter, a self-hosted Whisper server). Unset, it uses
+    # OpenRouter when OPENROUTER_API_KEY is set; with neither there is no
+    # transcription and voice notes get a line asking for text instead.
+    transcription_base_url: str | None = Field(None, alias="TRANSCRIPTION_BASE_URL")
+    transcription_api_key: str | None = Field(None, alias="TRANSCRIPTION_API_KEY")
+    # Blank: elevenlabs/scribe-v2 on OpenRouter, whisper-1 elsewhere.
+    transcription_model: str | None = Field(None, alias="TRANSCRIPTION_MODEL")
+    # Longest voice note transcribed, in seconds.
+    transcription_max_seconds: int = Field(300, alias="TRANSCRIPTION_MAX_SECONDS")
+    # Audio sent to the speech server per UTC day, in MB (0 = no limit). The
+    # servers bill by length, which a file can misstate; bytes it can't.
+    transcription_max_mb_per_day: int = Field(200, alias="TRANSCRIPTION_MAX_MB_PER_DAY")
 
     @field_validator("anthropic_workspace_id", mode="before")
     @classmethod
@@ -309,11 +343,28 @@ class Settings(BaseSettings):
     local_include_usage_accounting: bool = Field(
         False, alias="LOCAL_INCLUDE_USAGE_ACCOUNTING"
     )
+    # Ask a streaming OpenAI-compatible backend for the final usage chunk via
+    # `stream_options: {"include_usage": true}`. UNLIKE
+    # LOCAL_INCLUDE_USAGE_ACCOUNTING above, this IS part of the OpenAI request
+    # schema, so it defaults ON: without it the spec lets a backend omit usage
+    # from a stream entirely, and every streamed turn records 0 tokens in the
+    # `cache_event` audit row — which is most of what /audit/usage reports.
+    # Turn it off only for a strict backend that rejects the field.
+    local_stream_usage: bool = Field(True, alias="LOCAL_STREAM_USAGE")
     # Whether LOCAL_BASE_URL accepts PDFs as OpenAI `file` content parts —
     # true for OpenAI's own API (https://api.openai.com/v1), false for
     # Ollama / LM Studio / vLLM. Off, a PDF for a local model is OCR'd on
     # this server instead (knowledge/pdf_reader.py).
     local_pdf_input: bool = Field(False, alias="LOCAL_PDF_INPUT")
+    # The most a local request may ask the model to write (max_tokens). A
+    # server such as vLLM refuses a request whose prompt plus max_tokens is
+    # more than the model's context, and the Executive asks for up to 32,000.
+    # 0 = no cap.
+    local_max_output_tokens: int = Field(8192, ge=0, alias="LOCAL_MAX_OUTPUT_TOKENS")
+    # How many tokens the local server's model holds (its context window).
+    # A turn's reads fill a share of it (providers.feature_gate), so set it
+    # to what the server is started with.
+    local_context_tokens: int = Field(32_768, ge=4_096, alias="LOCAL_CONTEXT_TOKENS")
     # Optional `reasoning_effort` sent on every local request (e.g. "low").
     # Thinking-only models (GLM on Fireworks) otherwise spend the whole
     # max_tokens budget reasoning and return no tool call. Unset = not sent.
@@ -423,11 +474,12 @@ class Settings(BaseSettings):
     # Whole-turn wall-clock ceiling for a streaming chat turn. Raised from 120s
     # because deep multi-specialist turns were being cut off mid-answer. A
     # ceiling this high is only tolerable because the user can end a turn
-    # themselves — see POST /chat/stop in api/routes/chat.py.
-    chat_stream_timeout_s: float = Field(300.0, alias="CHAT_STREAM_TIMEOUT_S")
+    # themselves — see POST /chat/stop in api/routes/chat.py. Raised again to
+    # 600s: filing two emails' worth of attachments to Drive ran past 300s.
+    chat_stream_timeout_s: float = Field(600.0, alias="CHAT_STREAM_TIMEOUT_S")
 
     # Extra wall-clock allowance added to chat_stream_timeout_s when a request
-    # opts in to Committee review (so 360s in total at the defaults). Committee
+    # opts in to Committee review (so 660s in total at the defaults). Committee
     # adds three reviewer calls + one full-pass revision on top of the draft,
     # typically 5–12s.
     committee_extra_timeout_s: float = Field(60.0, alias="COMMITTEE_EXTRA_TIMEOUT_S")
@@ -473,6 +525,11 @@ class Settings(BaseSettings):
     # The other way to hear Slack: with this set and no SLACK_APP_TOKEN, Slack
     # posts events to POST /webhook/slack, signed with the app's signing secret.
     slack_signing_secret: str | None = Field(None, alias="SLACK_SIGNING_SECRET")
+    # Approve and Skip buttons on the cards a reply leaves in a Slack DM
+    # (integrations.channel_cards). Needs Interactivity turned on in the Slack
+    # app's settings (with SLACK_SIGNING_SECRET, its Request URL is
+    # /webhook/slack); off, a DM points to the web app instead.
+    slack_card_buttons: bool = Field(False, alias="SLACK_CARD_BUTTONS")
     # Company-wide broadcast channels — when set, OE can post to "the
     # whole team" on a given integration without picking a specific
     # human or department. Used by `send_company_broadcast`. Each is
@@ -486,6 +543,11 @@ class Settings(BaseSettings):
     )
     telegram_default_chat_id: str | None = Field(
         None, alias="TELEGRAM_DEFAULT_CHAT_ID"
+    )
+    # The Google Chat space company announcements go to ("spaces/AAAA..."),
+    # one the Chat app is a member of.
+    google_chat_default_space: str | None = Field(
+        None, alias="GOOGLE_CHAT_DEFAULT_SPACE"
     )
 
     # Required: the Executive's own mailbox address (Google Workspace or
@@ -564,7 +626,7 @@ class Settings(BaseSettings):
            direction this property exists to prevent. A parity test against
            the real script catches both.
         """
-        raw = (self.workspace_mcp_tools or "").strip()
+        raw = self._google_server_env("WORKSPACE_MCP_TOOLS", self.workspace_mcp_tools).strip()
         if not raw or raw.startswith("$"):
             return None
         names = [p for p in raw.replace(",", " ").split() if p]
@@ -576,8 +638,29 @@ class Settings(BaseSettings):
     def workspace_mcp_tier(self) -> str:
         """The tier the child runs at. An unresolved ``$VAR`` reads as the
         launcher's default, for the same reason as above."""
-        raw = (self.workspace_mcp_tool_tier or "").strip()
+        raw = self._google_server_env("WORKSPACE_MCP_TOOL_TIER", self.workspace_mcp_tool_tier).strip()
         return "complete" if not raw or raw.startswith("$") else raw
+
+    def google_service_on(self, service: str) -> bool:
+        """Whether the Google server loads ``service`` ("gmail", "calendar",
+        "drive", …) on this install."""
+        services = self.workspace_mcp_service_list
+        return services is None or service in services
+
+    def _google_server_env(self, key: str, process_value: str) -> str:
+        """What the Google server is really started with for ``key``.
+
+        The MCP config's ``google_workspace`` env block is what the child
+        gets: a literal there (``"gmail"``) wins over this process's own
+        variable, which only reaches the child through a ``"$KEY"``
+        placeholder. Reading only the process variable described every
+        service as loaded on an install whose config narrows it, so the
+        model called tools that were never there. Every reader (the prompt,
+        priming, the Setup page) comes through here."""
+        literal = server_env(self.mcp_servers_config_path, "google_workspace").get(key)
+        if literal is not None and not literal.strip().startswith("$"):
+            return literal
+        return process_value or ""
 
     # Roster requests (people.roster_requests): someone off the roster who
     # writes in is held for the principal to confirm, and told so — at most
@@ -679,22 +762,8 @@ class Settings(BaseSettings):
         return None if _blank_or_comment(v) else v
 
     # ---- Tool results ----
-    # Upper bound on a single tool result's characters before it enters the
-    # prompt. A circuit breaker against an unbounded result (a large document
-    # fetch) dominating a turn and then being re-sent on every remaining
-    # iteration of the tool loop. 20,000 characters (about 5,500 tokens) is
-    # well above a typical result; a longer one is cut with a marker that
-    # asks for a narrower request. Applies to every tool, not just MCP.
-    tool_result_max_chars: int = Field(
-        20_000, alias="TOOL_RESULT_MAX_CHARS", ge=1_000
-    )
-    # What all of one turn's tool results may add together, in characters
-    # (specialists' answers aside): each stays in the prompt for every later
-    # call of the turn. Past it a result shows its first 3,000 characters and
-    # says the turn has read enough. 0 turns it off.
-    tool_results_turn_max_chars: int = Field(
-        40_000, alias="TOOL_RESULTS_TURN_MAX_CHARS", ge=0
-    )
+    # How much a read may hold comes from the model (providers.registry.
+    # reading_limits_for), not from a setting.
     # Workflow action steps may also act through one short sandboxed script
     # (`run_script`, workflows/step_script.py) that calls the step's own tools
     # — each call through the same allowlist, budget, target check and audit.
@@ -848,7 +917,7 @@ class Settings(BaseSettings):
     mcp_servers_config_path: Path = Field(
         _ROOT / "company" / "mcp_servers.json", alias="MCP_SERVERS_CONFIG_PATH"
     )
-    # Directories a workflow action step's `oe__read_file` tool may read —
+    # Directories `read_document` (a workflow step's `oe__read_document`) may read —
     # where tools that download files (e.g. Gmail attachments via
     # workspace-mcp) save them. Comma-separated. Empty means workspace-mcp's
     # own default: $WORKSPACE_ATTACHMENT_DIR, else ~/.workspace-mcp/attachments.
@@ -864,21 +933,17 @@ class Settings(BaseSettings):
     _mcp_enabled_explicit: bool = PrivateAttr(default=False)
 
     # ---- Calendar booking (first-climb autonomy, Build 1) ------------------
-    # When true, the `create_calendar_event` / `cancel_calendar_event` tools
-    # are surfaced to the Executive and calendar operations route through the
-    # Google Workspace MCP (workspace-mcp at --tool-tier complete).
-    # Fail-soft: disabled when unconfigured. No hard validator — the project
-    # was burned by required-when-X validators crashing boot (honcho).
-    calendar_booking_enabled: bool = Field(False, alias="CALENDAR_BOOKING_ENABLED")
-    # Code-enforced caps applied regardless of trust-ledger promotion state.
+    # On by default: the `create_calendar_event` / `cancel_calendar_event`
+    # tools are surfaced to the Executive whenever the MCP gateway runs, and
+    # calendar operations route through the configured workspace backend.
+    # Approvals decides whether a booking goes or waits. Set false to take the
+    # tools away. No hard validator — the project was burned by
+    # required-when-X validators crashing boot (honcho).
+    calendar_booking_enabled: bool = Field(True, alias="CALENDAR_BOOKING_ENABLED")
+    # Outside these hours, or on a weekend, a booking waits on a card below
+    # Hands-off.
     calendar_business_hours_start: str = Field("09:00", alias="CALENDAR_BUSINESS_HOURS_START")
     calendar_business_hours_end: str = Field("18:00", alias="CALENDAR_BUSINESS_HOURS_END")
-    # Maximum days in the future an event can be booked.
-    calendar_horizon_days: int = Field(30, alias="CALENDAR_HORIZON_DAYS")
-    # Hard ceiling on bookings created per calendar-day for this class.
-    calendar_max_events_per_day: int = Field(10, alias="CALENDAR_MAX_EVENTS_PER_DAY")
-    # Maximum number of attendees per event (inclusive of organizer).
-    calendar_max_attendees: int = Field(8, alias="CALENDAR_MAX_ATTENDEES")
     # When true, every booking requests a video-meeting link — Google Meet
     # (add_google_meet on the manage_event MCP call) or Microsoft Teams
     # (isOnlineMeeting on the Graph event), per CALENDAR_PROVIDER. The model can
@@ -916,8 +981,11 @@ class Settings(BaseSettings):
     # for research (e.g. "skim Ford IR", "check Lucid news"). Set
     # ENABLE_WEB_SEARCH=false to opt out and avoid per-search charges.
     enable_web_search: bool = Field(True, alias="ENABLE_WEB_SEARCH")
-    # Cap on web searches per specialist/Executive turn. Each search is billed,
-    # so the fan-out cost scales with this (7 specialists x N searches). Most
+    # Cap on web searches per model request (one step of a specialist or
+    # Executive turn; each step gets a fresh count, and a chat turn whose
+    # last step hit the cap gets one more step to search again). Each
+    # search is billed, so the fan-out cost scales with this (7 specialists
+    # x N searches). Most
     # findings come from the first one or two searches; default 2 keeps the
     # bulk of the value at a fraction of the search spend. Raise via
     # WEB_SEARCH_MAX_USES for deeper digs.
@@ -1051,12 +1119,10 @@ class Settings(BaseSettings):
     # the alert text triage/review writes must name only people and figures
     # found in their own inputs or the company profile. "enforce" holds back
     # (briefs) or refuses (tools) what it can't ground, "report" only writes
-    # a `grounding` audit row, "off" skips the pass. Citations put [n] after
-    # each grounded figure in a brief, with a Sources list at the end.
+    # a `grounding` audit row, "off" skips the pass.
     grounding_checks: Literal["enforce", "report", "off"] = Field(
         "enforce", alias="GROUNDING_CHECKS"
     )
-    grounding_citations: bool = Field(True, alias="GROUNDING_CITATIONS")
 
     # Principal briefs: when nothing changed since the last delivered brief,
     # send a one-line "nothing new" instead of re-synthesising the same list.
@@ -1114,8 +1180,11 @@ class Settings(BaseSettings):
     # ROUTING_MODEL.
     chat_review_enabled: bool = Field(True, alias="CHAT_REVIEW_ENABLED")
     chat_review_quiet_minutes: int = Field(30, ge=1, alias="CHAT_REVIEW_QUIET_MINUTES")
-    chat_review_max_per_day: int = Field(10, ge=0, alias="CHAT_REVIEW_MAX_PER_DAY")
+    chat_review_max_per_day: int = Field(50, ge=0, alias="CHAT_REVIEW_MAX_PER_DAY")
     chat_review_model: str = Field("", alias="CHAT_REVIEW_MODEL")
+    # What it worked out (memory.worked_out): figures the Executive worked
+    # out, kept with their source for that person's later turns.
+    worked_out_enabled: bool = Field(True, alias="WORKED_OUT_ENABLED")
     # Replay of the misses (memory.replay): nightly, the turns the review
     # graded a miss run again with today's lessons and facts, in a dry run,
     # and a judge says whether they would now go right. At most MAX_CASES a
@@ -1132,7 +1201,7 @@ class Settings(BaseSettings):
     # cannot sit in /today (and the nudge queue) forever.
     attunement_loop_ttl_days: int = Field(21, alias="ATTUNEMENT_LOOP_TTL_DAYS")
     attunement_max_open_loops_per_person: int = Field(
-        15, alias="ATTUNEMENT_MAX_OPEN_LOOPS_PER_PERSON"
+        50, alias="ATTUNEMENT_MAX_OPEN_LOOPS_PER_PERSON"
     )
     # Tell a person, once, when someone else assigns them a task
     # (attunement/assignment_notice.py). Chasing it stays the nudge engine's.
@@ -1178,31 +1247,24 @@ class Settings(BaseSettings):
     # The model that learns "How I write" and writes drafts; unset = DEFAULT_MODEL.
     delegation_composer_model: str | None = Field(None, alias="DELEGATION_COMPOSER_MODEL")
     # Ceiling on drafts written as one person per UTC day (a cost guard),
-    # from chat and the inbox watcher together (delegation.caps).
+    # from chat, follow-ups and workflow sends (delegation.caps); the inbox
+    # watcher's replies neither count toward it nor are held by it.
     delegation_max_drafts_per_day: int = Field(
         50, alias="DELEGATION_MAX_DRAFTS_PER_DAY", ge=1, le=1000
     )
     # The inbox watcher (delegation.inbox): how often it checks a person's
-    # inbox while their "Draft replies to my inbox" switch is on, how many of
-    # the day's drafts it may write (within the limit above), and the model
-    # that decides whether an email needs a reply (unset = ROUTING_MODEL).
+    # inbox while their "Draft replies to my inbox" switch is on, and the
+    # model that decides whether an email needs a reply (unset = ROUTING_MODEL).
     delegation_inbox_poll_minutes: int = Field(
         5, alias="DELEGATION_INBOX_POLL_MINUTES", ge=1, le=1440
     )
-    delegation_inbox_max_drafts_per_day: int = Field(
-        20, alias="DELEGATION_INBOX_MAX_DRAFTS_PER_DAY", ge=1, le=1000
-    )
     delegation_classifier_model: str | None = Field(None, alias="DELEGATION_CLASSIFIER_MODEL")
-    # Handle it for me (delegation.handle_it): the most replies the inbox
-    # watcher may send on its own as one person per UTC day, within its
-    # drafts limit above. Past it, replies wait on cards as before.
-    delegation_handle_it_max_sends_per_day: int = Field(
-        20, alias="DELEGATION_HANDLE_IT_MAX_SENDS_PER_DAY", ge=1, le=500
+    # Workflows that send email as their creator (delegation.workflow_email,
+    # oe__send_email_as_me): the most such emails a day per person, within
+    # the drafts limit above. Past it the step is told to stop.
+    delegation_workflow_max_sends_per_day: int = Field(
+        20, alias="DELEGATION_WORKFLOW_MAX_SENDS_PER_DAY", ge=1, le=500
     )
-    # Whether the owner may let team members use Act as me for themselves
-    # (Delegate → Act as me → "Let team members use it", off until they turn
-    # it on). Off: the owner alone, as before (delegation.settings).
-    delegation_team_members: bool = Field(False, alias="DELEGATION_TEAM_MEMBERS")
 
     # External-condition monitoring — heartbeat that polls source adapters
     # (vendor_status in PR-A; RSS + stock in PR-B) and emits external_signals
@@ -1534,6 +1596,53 @@ class Settings(BaseSettings):
         and a read of this module.
         """
         return self.mcp_enabled and not self._mcp_enabled_explicit
+
+
+_mcp_config_cache: dict[Path, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+
+def mcp_config(config_path: Path) -> dict[str, Any]:
+    """The MCP config at ``config_path`` as read, or {} when it is absent,
+    unreadable or not a JSON object. Kept per file until it changes, so a
+    prompt build doesn't reread it. Never raises (see
+    ``mcp_config_file_present``). What the servers are really started with
+    is read from here, never from this process's own variables alone."""
+    import json
+
+    try:
+        stat = config_path.stat()
+    except (OSError, ValueError):
+        return {}
+    mtime = (stat.st_mtime_ns, stat.st_size)
+    cached = _mcp_config_cache.get(config_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    data: dict[str, Any] = {}
+    try:
+        if stat.st_size <= 1 << 20:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {}
+    except Exception:  # noqa: BLE001 - an operator-owned file read at prompt build; never crash on it
+        data = {}
+    _mcp_config_cache[config_path] = (mtime, data)
+    return data
+
+
+def server_env(config_path: Path, server: str) -> dict[str, str]:
+    """One server's ``env`` block in the MCP config, as strings; {} when
+    there is no such server."""
+    servers = mcp_config(config_path).get("mcpServers")
+    entry = servers.get(server) if isinstance(servers, dict) else None
+    env = entry.get("env") if isinstance(entry, dict) else None
+    return {str(k): v for k, v in env.items() if isinstance(v, str)} if isinstance(env, dict) else {}
+
+
+def denied_tool_patterns(config_path: Path) -> tuple[str, ...]:
+    """The tool-name globs the MCP config hides from the model."""
+    filters = mcp_config(config_path).get("filters")
+    access = filters.get("access_control") if isinstance(filters, dict) else None
+    deny = access.get("deny_patterns") if isinstance(access, dict) else None
+    return tuple(p for p in deny if isinstance(p, str)) if isinstance(deny, list) else ()
 
 
 def mcp_config_file_present(config_path: Path) -> bool:

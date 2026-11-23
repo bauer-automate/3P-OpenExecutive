@@ -6,6 +6,7 @@ import Link from "next/link";
 import Icon from "@/components/Icon";
 import { buttonClass } from "@/components/ui/Button";
 import ChatHistory, { ChatRow, type ChatsView } from "@/components/sessions/ChatHistory";
+import { ChannelLogo } from "@/components/sessions/ChannelLogo";
 import { useSessions } from "@/components/sessions/SessionsContext";
 import {
   listChatTopics,
@@ -21,6 +22,7 @@ import {
   filterSessions,
   type SessionChannel,
 } from "@/lib/sessionChannel";
+import { PageSpinner } from "@/components/ui/Spinner";
 
 type ChannelFilter = SessionChannel | "all";
 
@@ -171,13 +173,31 @@ export default function ChatsPage() {
   useEffect(() => {
     if (!channelShown) setChannel("all");
   }, [channelShown]);
-  const visible = useMemo(
-    () =>
-      shown
-        ? filterSessions(shown, { channel: activeChannel, query: "" })
-        : filterSessions(sessions, { channel: activeChannel, query }),
-    [shown, sessions, activeChannel, query],
-  );
+  // Chats under a topic (or area) whose name has the words, alongside the
+  // ones whose title or messages do.
+  const topicHits = useMemo(() => {
+    const q = trimmed.toLowerCase();
+    if (!q || topics.length === 0) return [];
+    const ids = new Set(
+      topics
+        .filter((t) => t.name.toLowerCase().includes(q) || (t.area ?? "").toLowerCase().includes(q))
+        .map((t) => t.id),
+    );
+    return sessions.filter((s) => s.topic_id != null && ids.has(s.topic_id));
+  }, [trimmed, topics, sessions]);
+  const visible = useMemo(() => {
+    const base = shown
+      ? filterSessions(shown, { channel: activeChannel, query: "" })
+      : filterSessions(sessions, { channel: activeChannel, query });
+    if (topicHits.length === 0) return base;
+    const have = new Set(base.map((s) => s.session_id));
+    const extra = filterSessions(topicHits, { channel: activeChannel, query: "" }).filter((s) => !have.has(s.session_id));
+    if (extra.length === 0) return base;
+    const order = new Map(sessions.map((s, i) => [s.session_id, i]));
+    return [...base, ...extra].sort(
+      (a, b) => (order.get(a.session_id) ?? 0) - (order.get(b.session_id) ?? 0),
+    );
+  }, [shown, sessions, activeChannel, query, topicHits]);
   const searching = trimmed.length > 0;
   const shownCounts = useMemo(() => (shown ? countByChannel(shown) : counts), [shown, counts]);
 
@@ -220,11 +240,26 @@ export default function ChatsPage() {
             </Link>
           </div>
 
-          <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-5">
+          <div className="relative mb-3">
+            <Icon
+              name="search"
+              size="w-4 h-4"
+              className="absolute left-3.5 top-1/2 -translate-y-1/2 text-fg-subtle pointer-events-none"
+            />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={view === "topic" ? "Search chats and topics" : "Search titles and messages"}
+              aria-label="Search conversations"
+              className="w-full h-11 rounded-xl bg-surface-elevated border border-line pl-10 pr-3 text-[15px] text-fg placeholder:text-fg-subtle focus:outline-none focus:border-accent/60 focus:ring-2 focus:ring-accent/20"
+            />
+          </div>
+          <div className="flex items-center gap-3 mb-5">
             <div
               role="tablist"
               aria-label="Filter by channel"
-              className="inline-flex flex-wrap items-center gap-1 p-1 rounded-xl ring-1 ring-line bg-surface-elevated"
+              className="flex-1 min-w-0 flex items-center gap-2 overflow-x-auto [scrollbar-width:none]"
             >
               {tabs.map((t) => {
                 const active = activeChannel === t;
@@ -237,10 +272,13 @@ export default function ChatsPage() {
                     role="tab"
                     aria-selected={active}
                     onClick={() => setChannel(t)}
-                    className={`min-h-[40px] px-4 text-[15px] font-medium rounded-lg transition cursor-pointer ${
-                      active ? "bg-accent/10 text-accent" : "text-fg-muted hover:text-fg hover:bg-surface-overlay"
+                    className={`flex-shrink-0 whitespace-nowrap min-h-[36px] px-3.5 text-sm font-medium rounded-full border transition cursor-pointer ${
+                      active
+                        ? "border-transparent bg-accent/10 text-accent"
+                        : "border-line text-fg-muted hover:text-fg hover:bg-surface-overlay"
                     }`}
                   >
+                    {t !== "all" && <ChannelLogo channel={t} className="w-4 h-4 mr-1.5 -mt-0.5 align-middle" />}
                     {t === "all" ? "All" : CHANNEL_LABELS[t]}
                     <span className="ml-1.5 text-fg-subtle">{count}</span>
                   </button>
@@ -250,7 +288,7 @@ export default function ChatsPage() {
             <div
               role="tablist"
               aria-label="Group chats by"
-              className="inline-flex items-center gap-1 p-1 rounded-xl ring-1 ring-line bg-surface-elevated sm:ml-auto"
+              className="flex-shrink-0 inline-flex items-center gap-1 p-1 rounded-full border border-line"
             >
               {(["date", "topic"] as const).map((v) => (
                 <button
@@ -259,7 +297,7 @@ export default function ChatsPage() {
                   role="tab"
                   aria-selected={view === v}
                   onClick={() => chooseView(v)}
-                  className={`min-h-[40px] px-4 text-[15px] font-medium rounded-lg transition cursor-pointer ${
+                  className={`min-h-[30px] px-3.5 text-sm font-medium rounded-full transition cursor-pointer ${
                     view === v ? "bg-accent/10 text-accent" : "text-fg-muted hover:text-fg hover:bg-surface-overlay"
                   }`}
                 >
@@ -267,25 +305,10 @@ export default function ChatsPage() {
                 </button>
               ))}
             </div>
-            <div className="relative sm:w-72">
-              <Icon
-                name="search"
-                size="w-4 h-4"
-                className="absolute left-3.5 top-1/2 -translate-y-1/2 text-fg-subtle pointer-events-none"
-              />
-              <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search titles and messages"
-                aria-label="Search conversations"
-                className="w-full h-11 rounded-xl bg-surface-elevated border border-line pl-10 pr-3 text-[15px] text-fg placeholder:text-fg-subtle focus:outline-none focus:border-accent/60 focus:ring-2 focus:ring-accent/20"
-              />
-            </div>
           </div>
 
           {!loaded ? (
-            <p className="px-1 py-6 text-[15px] text-fg-muted">Loading conversations…</p>
+            <PageSpinner label="Loading conversations" />
           ) : error && sessions.length === 0 ? (
             <p className="px-1 py-6 text-[15px] text-fg-muted">
               Couldn&apos;t load your conversations.{" "}

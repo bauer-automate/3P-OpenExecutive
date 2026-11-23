@@ -98,7 +98,8 @@ TOOL_DEFINITION: dict[str, Any] = {
         "Run Python with real libraries, on attached files or on data you have or "
         "make up, when a job needs more than your tools: split or merge PDFs and read their pages (pypdf), read or build "
         "spreadsheets (openpyxl, pandas), analyse data (pandas, numpy), draw charts "
-        "(matplotlib), work with images (Pillow), and make documents, from scratch "
+        "(matplotlib; whenever the person asks for a chart, graph or plot, draw it "
+        "here as a PNG, never as text bars or characters), work with images (Pillow), and make documents, from scratch "
         "or from files: Word (python-docx, imported as docx), PowerPoint "
         "(python-pptx, as pptx), laid-out PDFs (fpdf2, as fpdf), Excel with charts "
         "(openpyxl, xlsxwriter). These make files to download; for a Google Doc, "
@@ -107,8 +108,14 @@ TOOL_DEFINITION: dict[str, Any] = {
         "as given; write result files to /out and the person gets a download link "
         "for each. The value of the last expression and anything printed come back "
         "to you. The sandbox has no network and no other files; only the libraries "
-        "listed are installed. Pass files attached to the person's message by name "
-        "in attachment_files (the file itself, never retype its text), "
+        "listed are installed. Pass any file by its handle in files (the file "
+        "itself, never retype its text): mail:<message_id>#<n> for an attachment of "
+        "an email in their mailbox, drive:<file_id> for a Google Drive file, "
+        "file:<name> for a file sent in this chat (now or earlier) or made by an "
+        "earlier job. Each result file comes back with its handle, which "
+        "ghostwrite_email (files) and save_file take, so split, attach and save "
+        "in one go without asking them to send or download anything. Files "
+        "attached to the person's message also go by name in attachment_files, "
         "Knowledge-library files by name in knowledge_files, and other text you "
         "already have (data from a tool) in text_files. Each run starts fresh and "
         "takes a few seconds, so do the whole job in one call. To keep a job that "
@@ -129,6 +136,11 @@ TOOL_DEFINITION: dict[str, Any] = {
             "inputs": {
                 "type": "object",
                 "description": "Values for this run, read by the code as the dict `inputs`.",
+            },
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "File handles (mail:<message_id>#<n>, drive:<file_id>, file:<name>), copied to /in by name; a second file of a name already there comes in as \"<name> (2).<ext>\", in the order given.",
             },
             "attachment_files": {
                 "type": "array",
@@ -551,6 +563,22 @@ async def _gather_files(tool_input: dict[str, Any]) -> tuple[dict[str, bytes], l
         name = turn_files.safe_name(str(name))
         files[name] = data
         attached.append(name)
+    if tool_input.get("files"):
+        from openexecutive.orchestrator import file_refs
+
+        try:
+            handled = await file_refs.resolve(tool_input.get("files"), max_bytes=_MAX_INPUT_BYTES)
+        except file_refs.RefError as exc:
+            return _err(str(exc))
+        if handled.skipped:
+            return _err("too many or too large input files")
+        from openexecutive.orchestrator.mail_file_save import _free_name
+
+        for item in handled.items:
+            # Two emails' "invoice.pdf" are two inputs: the later one in the
+            # order given comes in as "invoice (2).pdf", as the tool says.
+            name = _free_name(turn_files.safe_name(item.name), {n.lower() for n in files})
+            files[name] = item.data
     for name in tool_input.get("knowledge_files") or []:
         path = _knowledge_file(str(name))
         if path is None:
@@ -589,7 +617,7 @@ async def handle_run_python_job(tool_input: dict[str, Any]) -> str:
     saved: Any = None
     if tool_name is not None:
         if not settings.saved_tools_enabled:
-            return _err("Custom tools are turned off")
+            return _err("Kept tools are turned off")
         if save_as is not None:
             return _err("save_as goes with new code, not a kept job")
         try:
@@ -656,7 +684,15 @@ async def handle_run_python_job(tool_input: dict[str, Any]) -> str:
             logger.warning("python job: run of %r not recorded", saved.name, exc_info=True)
         reply["saved_tool"] = {"name": saved.name, "version": saved.version}
     elif save_as is not None:
-        reply.update(_save(str(save_as), str(tool_input.get("description") or ""), code, ok))
+        if _read_outside_this_turn():
+            # A kept tool lasts and its description reaches later turns: not
+            # on a turn whose words may be someone else's.
+            reply["save_error"] = (
+                "not saved: this turn read their mail or something from outside the "
+                "team. The job itself ran; offer to keep it when they ask in a new message."
+            )
+        else:
+            reply.update(_save(str(save_as), str(tool_input.get("description") or ""), code, ok))
 
     peak_mb = usage.get("peak_mb")
     if peak_mb is None and isinstance(reported_rss, int) and 0 <= reported_rss < 2**20:
@@ -678,6 +714,20 @@ async def handle_run_python_job(tool_input: dict[str, Any]) -> str:
     return json.dumps(reply, ensure_ascii=False)
 
 
+def _read_outside_this_turn() -> bool:
+    """Whether this turn read the owner's mail or anything from outside the
+    team. Fails closed."""
+    from openexecutive.delegation.settings import turn_delegation
+    from openexecutive.orchestrator import outside_content
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    try:
+        pinned = turn_delegation(current_session.get())
+        return bool(getattr(pinned, "read_mail", False)) or outside_content.read_outside()
+    except Exception:
+        return True
+
+
 def _save(name: str, description: str, code: str, ok: bool) -> dict[str, Any]:
     """Keep a job that worked as a Custom tool of kind python. The tool is
     principal-only (PRINCIPAL_ONLY_TOOLS), so this is the principal's own turn,
@@ -687,7 +737,7 @@ def _save(name: str, description: str, code: str, ok: bool) -> dict[str, Any]:
     from openexecutive.workflows.step_script import _audit_save
 
     if not get_settings().saved_tools_enabled:
-        return {"save_error": "Custom tools are turned off"}
+        return {"save_error": "Kept tools are turned off"}
     if not ok:
         return {"save_error": "not saved: the job failed"}
     try:
@@ -720,20 +770,52 @@ def _meter(details: dict[str, Any]) -> None:
         logger.warning("python job: couldn't record its usage", exc_info=True)
 
 
+# An image the chat shows inline from its link (``show``).
+_IMAGE_NAME = re.compile(r"\.(png|jpe?g|gif|webp)$", re.I)
+
+
 async def _keep(files: dict[str, bytes]) -> dict[str, Any]:
-    """Store a job's result files and return their links for the reply."""
+    """Store a job's result files and return their links for the reply. They
+    are kept for the conversation too, so its later file tools find them by
+    handle (``conversation_files``)."""
+    from openexecutive.orchestrator import conversation_files
+    from openexecutive.orchestrator.schedule_tools import current_session
+
     job_id = uuid.uuid4().hex
     folder = jobs_dir() / job_id
     await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
     for name, data in files.items():
         await asyncio.to_thread((folder / name).write_bytes, data)
+    session_id = getattr(current_session.get(), "session_id", None)
+    from openexecutive.orchestrator.file_refs import turn_used_mail_files
+    from openexecutive.workflows.turn_files import safe_name
+
+    kept = set(await asyncio.to_thread(
+        functools.partial(
+            conversation_files.keep, str(session_id) if session_id else None, files,
+            from_mail=turn_used_mail_files(),
+        )
+    ))
+    def _entry(n: str, d: bytes) -> dict[str, Any]:
+        link = f"/api/backend/python-jobs/{job_id}/{urllib.parse.quote(n)}"
+        # The line to put in the answer, ready made: an image shows inline,
+        # any other file is a link that opens it.
+        show = f"![{n}]({link})" if _IMAGE_NAME.search(n) else f"[{n}]({link})"
+        return {
+            "name": n, "bytes": len(d), "link": link, "show": show,
+            **({"handle": f"file:{safe_name(n)}"} if safe_name(n) in kept else {}),
+        }
+
     return {
-        "files": [
-            {"name": n, "bytes": len(d),
-             "link": f"/api/backend/python-jobs/{job_id}/{urllib.parse.quote(n)}"}
-            for n, d in sorted(files.items())
-        ],
-        "note": "Give the person each file's link as a markdown link.",
+        "files": [_entry(n, d) for n, d in sorted(files.items())],
+        "note": (
+            "Put each file's `show` line in the answer exactly as it is: an image "
+            "appears in the chat and any other file opens from it. Never write a "
+            "handle (file:...) in the answer: it opens nothing for the reader. A "
+            "handle is only for your own tools: it attaches the file to a draft "
+            "(ghostwrite_email files) or saves it to a Drive folder (save_file); "
+            "do that yourself when they asked for it."
+        ),
     }
 
 

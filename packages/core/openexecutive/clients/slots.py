@@ -31,6 +31,7 @@ Invariants:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
@@ -42,15 +43,10 @@ from typing import Any
 from openexecutive.cli.fixture_loader import (
     _FIXTURE_OP_LOCK,
     _SAFE_NAME_RE,
+    forget_company_caches,
     get_fixture_status,
     snapshot_user_state,
 )
-from openexecutive.cli.fixture_loader import (
-    PER_CLIENT_CACHE_TABLES as _PER_CLIENT_CACHE_TABLES,
-)
-from openexecutive.delegation.schema import TABLES as DELEGATION_TABLES
-from openexecutive.memory.history_schema import TABLES as HISTORY_TABLES
-from openexecutive.orchestrator.take_the_lead import TABLES as TAKE_THE_LEAD_TABLES
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +59,11 @@ CLIENT_WORKSPACE_PREFIX = "openexec-client-"
 # Tables preserved verbatim across slot restores — operator-level state that
 # does not belong to any one client company. `executive_control` is the
 # global pause switch (scheduler/pause.py): activating a client must never
-# silently un-pause (or re-pause) the Executive.
-_GLOBAL_TABLES = ("generated_fixtures", "executive_control")
+# silently un-pause (or re-pause) the Executive. `eval_scenarios` are the
+# scenarios people wrote: the instance's, kept by a reset (RESET_KEEPS) too.
+# `install_owner` is who runs the install whichever company is live
+# (people/install_owner.py).
+_GLOBAL_TABLES = ("generated_fixtures", "executive_control", "eval_scenarios", "install_owner")
 
 # Engagement metadata lives in meta.json — deliberately OUTSIDE the swapped
 # client state, so the practice layer (cockpit, renewal awareness) can see
@@ -86,104 +85,12 @@ ENGAGEMENT_META_FIELDS: frozenset[str] = frozenset(
 
 ENGAGEMENT_STATUSES = ("active", "paused", "winding_down", "completed")
 
-# Per-client tables wiped when activating a *blank* slot (no state.db yet).
-# Ordered children-before-parents for PRAGMA foreign_keys=ON. Existence-guarded
-# at delete time, so stores that haven't initialized on this box are skipped.
-_BLANK_WIPE_TABLES = (
-    # Derived caches first — see PER_CLIENT_CACHE_TABLES for why they must be
-    # wiped by every company-swapping path, not just this one. Neither declares
-    # a foreign key, so head position is free.
-    #
-    # Do not assume person_insights' input_hash makes it self-guarding. The hash
-    # (people.insights.build_insight_input_hash) covers role, is_principal,
-    # status, awaiting_count, awaiting_reply_count, overdue, on_leave_until,
-    # reachable_now, authority_scope, department_slugs, the hour-bucketed
-    # soonest_sla_at / oldest_awaiting_reply_at / next_window_at /
-    # last_contact_at, and the UTC day — every one of them a per-person signal,
-    # and NOT the person's name, the person's id, or the company. The cache key
-    # is person_id, a reused autoincrement PK. So an outgoing principal and a
-    # freshly seeded incoming principal hash identically whenever those signals
-    # coincide: both principals, same role string, no awaiting work, no leave,
-    # same default departments, same UTC day. That is an ordinary steady state
-    # for a seeded slot, not a collision.
-    *_PER_CLIENT_CACHE_TABLES,
-    "chat_messages",
-    "sessions",
-    "decisions",
-    "initiatives",
-    "advice_given",
-    "scheduled_actions",
-    "voice_personas",
-    "alerts",
-    "mute_topics",
-    "user_preferences",
-    # Solo/team mode and the user's time zone (memory.workspace_settings) are
-    # per company, like user_preferences above: a blank client starts on the
-    # defaults (team, no zone) rather than inheriting the previous client's.
-    # Saved slots carry their own row in state.db.
-    "workspace_settings",
-    "workflow_runs",
-    "audit_log",
-    "eval_runs",
-    "external_signals",
-    "watchlist",
-    "page_watch_state",
-    "outbound_context",
-    # An in-progress setup interview: the previous client's unedited
-    # description and answers (financials included).
-    "onboarding_interviews",
-    # Attunement's daily model-call counter (open loops themselves live in
-    # scheduled_actions, and sender/feedback columns in chat_messages).
-    "attunement_usage",
-    "proactive_outcomes",
-    "attunement_profiles",
-    "attunement_profile_history",
-    # Act as me (delegation/): who has it on and each person's "How I write"
-    # — per company like the roster it is keyed on, so a blank client starts
-    # with it off and no profile. (Each person's own-Gmail credential is a
-    # file, not a table, and is re-checked against the roster on every use.)
-    *DELEGATION_TABLES,
-    # Always in the loop (memory/history.py): notes about this company's
-    # people and conversations, and their switches.
-    *HISTORY_TABLES,
-    # Take the lead (orchestrator/take_the_lead.py): its switches, rules and
-    # log, per company.
-    *TAKE_THE_LEAD_TABLES,
-    # Legacy talent / staff-onboarding tables. Both features are gone and
-    # nothing writes these any more, but the rows may still exist on upgraded
-    # installs and they carry candidate PII (names, employers, screening
-    # summaries, offer comp) — keep wiping them so a blank slot never inherits
-    # a previous client's pipeline. Existence-guarded, so a no-op on fresh
-    # installs where the tables were never created.
-    "onboarding_tasks",
-    "onboarding_plans",
-    "onboarding_templates",
-    "offers",
-    "candidates",
-    "engagements",
-    "decision_instances",
-    "decision_class_state",
-    "agent_override_history",
-    "agent_overrides",
-    "review_annotations",
-    "review_items",
-    # Roster requests (people.roster_requests) name who wrote to this
-    # company, and aliases are its people's addresses: children first.
-    "roster_ack_log",
-    "roster_request_messages",
-    "roster_requests",
-    "person_emails",
-    "person_authority_scope",
-    "person_availability",
-    "people",
-    "department_goals",
-    "departments",
-    "departments_meta",
-)
-
-
 class ClientSlotError(ValueError):
     """Base error for slot operations (maps to HTTP 400)."""
+
+
+class ClientSnapshotError(ClientSlotError):
+    """The live company couldn't be saved before a switch (maps to HTTP 500)."""
 
 
 class ClientSlotNotFoundError(ClientSlotError):
@@ -400,13 +307,13 @@ async def _restore_slot_state(
 
     # 1. SQLite state — whole-DB restore (or factory wipe for blank slots),
     #    with operator-level tables carried across.
-    preserved = _dump_global_tables()
     if is_blank:
+        preserved = _dump_global_tables()
         _wipe_per_client_tables()
+        _ensure_schemas()
+        _restore_global_tables(preserved)
     else:
-        _restore_db_from_file(slot / "state.db")
-    _ensure_schemas()
-    _restore_global_tables(preserved)
+        restore_company_db(slot / "state.db")
     seeded: dict[str, Any] = {}
     if is_blank:
         # Generated (seed) slots carry people.yaml / departments.yaml /
@@ -442,6 +349,11 @@ async def _restore_slot_state(
 
     # 3. Vector state — rebuild the company collections from the restored dirs.
     docs_indexed = await _rebuild_vector_state(settings, app_state)
+
+    # 4. Caches of the outgoing company's rows (agent overrides, departments,
+    #    people) — here, so every path that restores a slot drops them,
+    #    the rotation's recovery included.
+    forget_company_caches()
 
     return {
         "display_name": profile.name,
@@ -481,6 +393,34 @@ def _seed_from_slot_files(settings: Any, slot: Path) -> dict[str, Any]:
     return out
 
 
+def restore_company_db(state_src: Path) -> None:
+    """Make a saved copy of the company database live, carrying the
+    operator-level rows (``_GLOBAL_TABLES``) across. Used by a client switch
+    and by unload, which puts the user's own saved database back."""
+    # The copy's queue is as it was when saved: a job running then ran here,
+    # and a job long past its time would fire late. Both are closed, never
+    # run, except a job whose handler is still going, which finishes and
+    # chains as usual; a recurring job among the closed ones is then seeded
+    # afresh at its next time (each seed skips a kind still pending). The
+    # scheduler is held throughout, so no tick claims from the copy before
+    # it is settled.
+    from openexecutive.memory.episodic import settle_restored_queue
+    from openexecutive.scheduler.runner import (
+        hold_claims,
+        in_flight_actions,
+        seed_recurring_jobs,
+    )
+
+    with hold_claims():
+        in_flight = in_flight_actions()
+        preserved = _dump_global_tables()
+        _restore_db_from_file(state_src)
+        _ensure_schemas()
+        _restore_global_tables(preserved)
+        if settle_restored_queue(_episodic_db_path(), in_flight=in_flight):
+            seed_recurring_jobs()
+
+
 def _restore_db_from_file(state_src: Path) -> None:
     """Replace the live DB's content with the slot copy via the backup API.
 
@@ -501,25 +441,14 @@ def _restore_db_from_file(state_src: Path) -> None:
 
 
 def _wipe_per_client_tables() -> None:
-    """Factory-wipe per-client tables (blank-slot activation). Existence-guarded."""
-    db_path = _episodic_db_path()
-    if not db_path.exists():
-        return
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        existing = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        for table in _BLANK_WIPE_TABLES:
-            if table in existing:
-                conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed allowlist
-        conn.commit()
-    finally:
-        conn.close()
+    """Factory-wipe the company tables (blank-slot activation): the same sweep
+    as a factory reset, so a table added later is wiped here too. The
+    operator-level rows (``_GLOBAL_TABLES``) are carried across by the caller.
+    Workflows go too: the outgoing company's are in its slot or in the user's
+    snapshot, and a blank client starts with none."""
+    from openexecutive.cli.fixture_loader import RESET_KEEPS, _delete_every_table
+
+    _delete_every_table(_episodic_db_path(), keep=RESET_KEEPS | set(_GLOBAL_TABLES))
 
 
 def _dump_global_tables() -> dict[str, tuple[list[str], list[tuple[Any, ...]]]]:
@@ -537,7 +466,7 @@ def _dump_global_tables() -> dict[str, tuple[list[str], list[tuple[Any, ...]]]]:
             ).fetchone()
             if not exists:
                 continue
-            cursor = conn.execute(f"SELECT * FROM {table}")  # noqa: S608 — fixed allowlist
+            cursor = conn.execute(f'SELECT * FROM "{table}"')  # noqa: S608 — names from code constants
             cols = [d[0] for d in cursor.description]
             out[table] = (cols, cursor.fetchall())
     finally:
@@ -584,12 +513,14 @@ def _ensure_schemas() -> None:
     from openexecutive.agents.overrides import initialize_overrides_db
     from openexecutive.alerts.store import initialize_db as init_alerts
     from openexecutive.departments.store import initialize_db as init_departments
+    from openexecutive.evals.persistence import initialize_user_scenarios_db
     from openexecutive.fixtures.store import initialize_db as init_fixtures
     from openexecutive.knowledge.review_store import ReviewStore
     from openexecutive.memory.episodic import cancel_orphaned_talent_reminders
     from openexecutive.memory.episodic import initialize_db as init_episodic
     from openexecutive.memory.workspace_settings import init_workspace_settings_db
     from openexecutive.monitoring.store import initialize_db as init_monitoring
+    from openexecutive.people.install_owner import initialize_db as initialize_install_owner_db
     from openexecutive.people.store import initialize_db as init_people
     from openexecutive.scheduler.pause import initialize_pause_db
 
@@ -621,9 +552,12 @@ def _ensure_schemas() -> None:
     # A slot saved before workspace settings existed has no table; create it
     # so the slot reads as the defaults.
     init_workspace_settings_db(db_path)
-    # Before _restore_global_tables: a slot saved before the pause switch
-    # existed lacks the table, and the restore skips tables it can't find.
+    # Before _restore_global_tables: a slot saved before the pause switch or
+    # the eval scenarios existed lacks the table, and the restore skips
+    # tables it can't find.
     initialize_pause_db(db_path)
+    initialize_user_scenarios_db(db_path)
+    initialize_install_owner_db(db_path)
     ReviewStore.initialize_db(db_path)
     # Register shipped knowledge as trusted defaults too — without this a
     # freshly activated slot has an empty review_items table until the next
@@ -650,56 +584,15 @@ def _ensure_schemas() -> None:
 
 
 def _reseed_blank_defaults() -> None:
-    """Blank slot = factory state: the boot-time scheduled rows.
+    """Blank slot = factory state: the recurring jobs, from the one list a
+    reset and a restart also use (``scheduler.runner.seed_recurring_jobs``),
+    so the new client's Today page doesn't stay blank until a restart. No
+    departments are created: a blank slot starts with none, like a new
+    install, and a generated seed slot's own departments (if any) are picked
+    up by the cadence seed. Never raises."""
+    from openexecutive.scheduler.runner import seed_recurring_jobs
 
-    Mirrors ``reset_all_state`` step 5/5a — without these the new client's
-    Today page stays blank until the next process restart. Every call is
-    idempotent and individually guarded. No departments are created: a blank
-    slot starts with none, like a new install, and a generated seed slot's
-    own departments (if any) are picked up by the cadence bootstrap.
-    """
-    from openexecutive.config import get_settings
-
-    try:
-        from openexecutive.scheduler.runner import seed_principal_briefs
-
-        seed_principal_briefs()
-    except Exception:
-        logger.exception("client-slots: seed_principal_briefs failed")
-    try:
-        from openexecutive.departments.cadence import bootstrap_cadences
-
-        bootstrap_cadences()
-    except Exception:
-        logger.exception("client-slots: bootstrap_cadences failed")
-    settings = get_settings()
-    if settings.nudge_scan_enabled:
-        try:
-            from openexecutive.scheduler.nudge_engine import bootstrap_nudge_scan
-
-            bootstrap_nudge_scan()
-        except Exception:
-            logger.exception("client-slots: bootstrap_nudge_scan failed")
-    if settings.external_monitor_enabled:
-        try:
-            from openexecutive.monitoring.pipeline import (
-                bootstrap_external_monitor_scan,
-            )
-
-            bootstrap_external_monitor_scan()
-        except Exception:
-            logger.exception("client-slots: bootstrap_external_monitor_scan failed")
-    if settings.watchlist_research_enabled:
-        try:
-            from openexecutive.monitoring.research.scheduler import (
-                bootstrap_watchlist_research_scan,
-            )
-
-            bootstrap_watchlist_research_scan()
-        except Exception:
-            logger.exception(
-                "client-slots: bootstrap_watchlist_research_scan failed"
-            )
+    seed_recurring_jobs()
 
 
 async def _rebuild_vector_state(settings: Any, app_state: Any | None) -> int:
@@ -938,6 +831,19 @@ async def create_client_slot(
             if errors:
                 raise ClientSlotError("Invalid bundle: " + "; ".join(errors))
 
+        if source == "current":
+            # The live state is your own company and this enters client mode:
+            # save all of it to _user_backup every time, so unload brings back
+            # this copy and not an older one. A failed snapshot stops before
+            # the slot exists, since unload would otherwise restore stale data.
+            try:
+                await asyncio.to_thread(snapshot_user_state, settings)
+            except Exception as exc:
+                logger.exception("client-slots: pre-create user snapshot failed")
+                raise ClientSnapshotError(
+                    "Couldn't save your company before switching. Nothing was changed."
+                ) from exc
+
         slot.mkdir(parents=True, exist_ok=True)
         _write_meta(
             slot,
@@ -948,19 +854,6 @@ async def create_client_slot(
         )
 
         if source == "current":
-            # Preserve the user's original company in _user_backup before
-            # entering client mode, so POST /fixtures/unload remains a working
-            # "exit client mode" path (the slot holds the same data, but
-            # unload restores from _user_backup specifically).
-            if not (
-                settings.company_profile_path.parent / "_user_backup" / "profile.yaml"
-            ).exists():
-                try:
-                    snapshot_user_state(settings)
-                except Exception:
-                    logger.exception(
-                        "client-slots: pre-create user snapshot failed"
-                    )
             saved = _save_slot_state(settings, slot)
             _active_client_sentinel(settings).write_text(slug, encoding="utf-8")
             _set_honcho_client_workspace(slug)
@@ -1041,16 +934,19 @@ async def activate_client_slot(
             else:
                 _save_slot_state(settings, previous_slot)
         else:
-            # Mirror the fixture switcher's first-load behavior: preserve the
-            # user's original company before replacing it. Best-effort — an
-            # empty environment has nothing worth snapshotting.
-            if not (settings.company_profile_path.parent / "_user_backup" / "profile.yaml").exists():
-                try:
-                    snapshot_user_state(settings)
-                except Exception:
-                    logger.exception(
-                        "client-slots: pre-activation user snapshot failed"
-                    )
+            # The live state is the user's own company (no client, no
+            # fixture): save all of it before it is replaced, every time, so
+            # unload brings back this copy and not an older one. The snapshot
+            # holds the whole database, so a blank switch's sweep loses
+            # nothing. A failed snapshot stops the switch, since the switch
+            # would replace data nothing has saved.
+            try:
+                await asyncio.to_thread(snapshot_user_state, settings)
+            except Exception as exc:
+                logger.exception("client-slots: pre-activation user snapshot failed")
+                raise ClientSnapshotError(
+                    "Couldn't save your company before switching. Nothing was changed."
+                ) from exc
 
         summary = await _restore_slot_state(settings, slot, app_state=app_state)
         _active_client_sentinel(settings).parent.mkdir(parents=True, exist_ok=True)

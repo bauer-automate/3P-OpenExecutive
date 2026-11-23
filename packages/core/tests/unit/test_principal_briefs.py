@@ -101,14 +101,16 @@ def test_seed_principal_briefs_inserts_all_recurring_rows_on_fresh_db(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Shift 5 added `executive_reflection` to the seed loop alongside
-    the morning and EoD brief, and the chat replay joined them. Fresh DB → 4 rows."""
+    the morning and EoD brief, and the chat replay and the weekly goal review
+    joined them. Fresh DB → 5 rows."""
     _setup_isolated_db(tmp_path / "briefs.db", monkeypatch)
 
     inserted = runner.seed_principal_briefs()
-    assert inserted == 4
+    assert inserted == 5
 
     actions = episodic.list_scheduled_actions(status="pending", limit=10)
     kinds = {a.kind for a in actions}
+    assert runner.GOAL_REVIEW_KIND in kinds
     assert "principal_brief_morning" in kinds
     assert "principal_brief_eod" in kinds
     assert "executive_reflection" in kinds
@@ -318,6 +320,97 @@ def test_a_brief_that_couldnt_be_written_is_recorded(
     assert sends == []
     outcome = brief_state.last_delivery_outcome()
     assert outcome is not None and outcome.reason == "not_written"
+
+
+def _quiet_brief_workflow():  # type: ignore[no-untyped-def]
+    from openexecutive.workflows.base import WorkflowEvent
+    from openexecutive.workflows.morning_brief import MorningBriefInput, MorningBriefWorkflow
+
+    class _Quiet(MorningBriefWorkflow):
+        async def run(self, inputs, store):  # type: ignore[override]
+            yield WorkflowEvent(
+                type="result",
+                data={"brief_fingerprint": "fp-q", "suppressed": False, "quiet": True},
+            )
+            yield WorkflowEvent(type="done")
+
+        def input_model(self):  # type: ignore[override]
+            return MorningBriefInput
+
+    return _Quiet()
+
+
+def test_a_quiet_day_sends_nothing_and_keeps_the_last_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.briefing import brief_state
+
+    sends: list[str] = []
+
+    async def _deliver(text: str, **_kw: object) -> runner.PrincipalDelivery:
+        sends.append(text)
+        return runner.PrincipalDelivery(True, "email → x", "delivered", "email")
+
+    monkeypatch.setattr(runner, "_with_held_messages", lambda kind, artifact: (artifact, []))
+    _run_brief(tmp_path, monkeypatch, workflow=_quiet_brief_workflow(), deliver=_deliver)
+    assert sends == []
+    # Not "couldn't be written": no notice, and the window stays where it was.
+    assert brief_state.last_delivery_outcome() is None
+    assert brief_state.last_delivered("principal_brief_morning") is None
+
+
+def test_a_quiet_day_still_sends_messages_held_for_the_brief(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sends: list[str] = []
+
+    async def _deliver(text: str, **_kw: object) -> runner.PrincipalDelivery:
+        sends.append(text)
+        return runner.PrincipalDelivery(True, "email → x", "delivered", "email")
+
+    async def _sent(ids: list[int]) -> None:
+        sends.append(f"marked {ids}")
+
+    monkeypatch.setattr(
+        runner, "_with_held_messages",
+        lambda kind, artifact: (f"{artifact}\n\n**While you were away**\n- Dana: hi", [5]),
+    )
+    monkeypatch.setattr(runner, "_mark_held_sent", _sent)
+    _run_brief(tmp_path, monkeypatch, workflow=_quiet_brief_workflow(), deliver=_deliver)
+    assert sends == ["**While you were away**\n- Dana: hi", "marked [5]"]
+    from openexecutive.briefing import brief_state
+
+    # Not a digest: the window stays, and no "digest delivered" outcome.
+    assert brief_state.last_delivered("principal_brief_morning") is None
+    assert brief_state.last_delivery_outcome() is None
+
+
+@pytest.mark.parametrize("how", ["refused", "crash"])
+def test_a_quiet_day_held_message_that_fails_is_unclaimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    from openexecutive.briefing import brief_state
+
+    unclaimed: list[list[int]] = []
+
+    async def _deliver(text: str, **_kw: object) -> runner.PrincipalDelivery:
+        if how == "crash":
+            raise RuntimeError("people store locked")
+        return runner.PrincipalDelivery(False, "email refused", "send_failed", "email")
+
+    async def _sent(ids: list[int]) -> None:
+        raise AssertionError("a failed send must not mark held messages sent")
+
+    monkeypatch.setattr(
+        runner, "_with_held_messages",
+        lambda kind, artifact: (f"{artifact}\n\n**While you were away**\n- Dana: hi", [5]),
+    )
+    monkeypatch.setattr(runner, "_mark_held_sent", _sent)
+    monkeypatch.setattr(runner, "_unclaim_held", lambda ids: unclaimed.append(list(ids)))
+    _run_brief(tmp_path, monkeypatch, workflow=_quiet_brief_workflow(), deliver=_deliver)
+    assert unclaimed == [[5]]
+    assert brief_state.last_delivered("principal_brief_morning") is None
+    assert brief_state.last_delivery_outcome() is None
 
 
 def test_a_send_that_crashes_is_recorded_as_failed(
@@ -556,6 +649,7 @@ def test_the_email_subject_carries_the_users_date(monkeypatch: pytest.MonkeyPatc
     assert runner._email_subject("End-of-Day Digest", evening) == "End-of-Day Digest — Fri 25 Sep"
 
 
+
 def test_email_without_a_gateway_is_not_delivered(sent: _Sent) -> None:
     _principal(preferred_channel="email", email="owner@example.com")
 
@@ -701,3 +795,37 @@ def test_a_private_brief_is_delivered_whole_but_kept_out_of_run_history(
     runs = wf_persistence.list_runs(workflow_name="morning_brief")
     stored = wf_persistence.get_run(runs[0]["run_id"])
     assert stored is not None and stored["artifact"] == wf_persistence.PRIVATE_RUN_ARTIFACT
+
+
+def test_a_delivered_brief_is_recorded_as_a_brief_not_as_work_done(
+    sent: _Sent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The brief's own send writes its done row as a brief delivery, so the
+    next brief's activity feed never reads it back as something the Executive
+    did (one top call was repeated three days running that way). A send
+    outside the delivery is still an ordinary one."""
+    import json
+
+    from openexecutive.orchestrator import schedule_tools
+
+    async def _send(args: dict) -> str:  # type: ignore[type-arg]
+        schedule_tools._record_send_to_activity(
+            channel="telegram", channel_ref=str(args["chat_id"]), intent_text=args["text"],
+        )
+        return json.dumps({"status": "sent"})
+
+    monkeypatch.setattr(schedule_tools, "handle_send_telegram_message", _send)
+    _principal(preferred_channel="telegram", telegram_chat_id="42")
+    ok, _detail = _deliver("**Top call:** pick up the Maple Court buyout")
+    assert ok
+    schedule_tools._record_send_to_activity(
+        channel="telegram", channel_ref="42", intent_text="An ordinary message",
+    )
+
+    rows = episodic.list_scheduled_actions(status="done")
+    assert {r.intent_text: r.kind for r in rows} == {
+        "**Top call:** pick up the Maple Court buyout": episodic.BRIEF_DELIVERY_KIND,
+        "An ordinary message": "ad_hoc",
+    }
+    # The outbound guard still sees both sends to the recipient.
+    assert len(episodic.recent_sends_for_channel_ref("telegram", "42", "2000-01-01")) == 2

@@ -62,12 +62,14 @@ def _solo() -> None:
 
 def _decision(db: Path, *, days_ago: float, summary: str, outcome: str = "") -> int:
     ts = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    from openexecutive.memory import facts
+
+    # A decision is a standing fact; its own subject keeps it from replacing another.
+    fact, _ = facts.record_fact(subject=f"Decision: {summary}", statement=summary, source_quote="",
+                                decision=True, db_path=db)
     with sqlite3.connect(str(db)) as conn:
-        cur = conn.execute(
-            "INSERT INTO decisions (timestamp, domain, summary, outcome) VALUES (?, ?, ?, ?)",
-            (ts, "strategy", summary, outcome),
-        )
-        return int(cur.lastrowid or 0)
+        conn.execute("UPDATE facts SET created_at = ?, outcome = ? WHERE id = ?", (ts, outcome, fact.id))
+    return fact.id
 
 
 def _initiative(db: Path, *, title: str, status: str, days_ago: float) -> int:
@@ -349,6 +351,23 @@ def test_the_briefing_reads_the_top_three_back_from_the_artifact(
     assert summarize_review("(no artifact)") == {"period": "", "top_three": [], "excerpt": ""}
 
 
+def test_an_area_whose_goals_are_all_done_is_skipped(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ids = _seed_areas()
+    for key in ("buffer", "invoices"):
+        dept_store.update_goal(ids[key], status="done")
+    dept_registry.invalidate()
+    calls = _stub_models(monkeypatch)
+
+    artifact = _artifact(_run())
+
+    # Finance has only done goals: no grader call, no section in the review.
+    assert [c[0] for c in calls["specialist"]] == []
+    assert "### Finance" not in artifact
+    assert "### Client work" in artifact
+
+
 def test_a_failing_specialist_leaves_the_area_ungraded(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -403,7 +422,7 @@ def _local(run_at: str, zone: str) -> datetime:
 
 
 def test_seeded_only_in_solo() -> None:
-    assert runner.seed_principal_briefs() == 4
+    assert runner.seed_principal_briefs() == 5  # the four daily kinds + goal_review
     assert _pending() == []
     _solo()
     assert runner.seed_principal_briefs() == 1  # only the weekly review was missing
@@ -633,3 +652,23 @@ def test_the_daily_chain_is_unchanged_by_the_weekly_dedupe() -> None:
     first = runner._enqueue_next_principal_brief("principal_brief_morning", after)
     second = runner._enqueue_next_principal_brief("principal_brief_morning", after)
     assert first is not None and second is not None and first != second
+
+
+def test_every_review_grades_goals_without_a_number_and_closes_finished_ones() -> None:
+    """11-13: a goal with no number was skipped (never reviewed), and a goal
+    whose progress said "Done" stayed open. All three reviews share the rules."""
+    import inspect
+
+    from openexecutive.departments import goal_review
+    from openexecutive.workflows import department_check_in, weekly_review
+
+    rules = department_check_in.GRADING_RULES
+    assert "One with no number" in rules and "Use done only when" in rules
+    for module in (department_check_in, weekly_review, goal_review):
+        source = inspect.getsource(module)
+        assert "GRADING_RULES" in source and "VERDICT_STATUS_SHAPE" in source
+        assert "Skip goals you cannot grade" not in source
+    verdicts, _ = department_check_in._parse_verdicts(
+        '{"verdicts": [{"goal_id": 2, "status": "done", "rationale": "Stripe is finished."}], "narrative": ""}'
+    )
+    assert verdicts == [{"goal_id": 2, "status": "done", "rationale": "Stripe is finished."}]

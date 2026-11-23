@@ -3,28 +3,28 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import {
-  listFactApprovalRules,
+  editStandingFact,
   listStandingFacts,
   retireStandingFact,
+  editOwnDecision,
+  removeOwnDecision,
   reviewStandingFact,
-  setFactApprovalRule,
-  type FactApprovalRule,
+  shareDecision,
   type StandingFact,
 } from "@/lib/api";
 import Button from "@/components/ui/Button";
 import OverflowMenu from "@/components/ui/OverflowMenu";
 import { EmptyState, formatDate } from "./shared";
+import { PageSpinner } from "@/components/ui/Spinner";
 
 // The "what stuck" view: facts and corrections the principal or a teammate
 // told the Executive to keep (the `remember_fact` chat tool) and company-profile
 // fields changed from chat (`update_company_profile`). Active facts are read by
 // every prompt that produces output — chat, briefs, scheduled runs, the alert
 // review — so this is where the owner checks a correction actually held, and
-// retires one that no longer does. A teammate's fact is marked with their name
-// and waits for the owner's approval (listed first, with Approve and Decline)
-// unless the owner trusts that teammate — and even then when it would replace
-// the owner's own fact. The owner sets, per teammate, whether theirs need
-// approval (on by default).
+// edits or retires one that no longer holds. A teammate's fact is marked with
+// their name and is in use at once, as the owner's is. Only a decision copied
+// in from mail waits for the principal's OK (listed first, with Approve and Decline).
 
 const EMPTY =
   "No corrections yet — when you correct a figure or a fact in chat, the Executive keeps it here and uses it everywhere.";
@@ -44,6 +44,8 @@ const KIND_PILL: Record<StandingFact["kind"], string> = {
 const HISTORY_STATUSES = new Set<StandingFact["status"]>(["superseded", "retired", "declined"]);
 
 function channelLabel(channel: string): string {
+  // A decision copied from the older decisions list: where it came from.
+  if (channel.startsWith("decisions:")) channel = channel.slice("decisions:".length);
   if (!channel) return "chat";
   if (channel === "web") return "web chat";
   if (channel === "google_chat") return "Google Chat";
@@ -53,8 +55,9 @@ function channelLabel(channel: string): string {
 export default function CorrectionsTab({ onCount }: { onCount: (n: number) => void }) {
   const [facts, setFacts] = useState<StandingFact[]>([]);
   const [retirable, setRetirable] = useState<Set<number>>(new Set());
+  const [shareable, setShareable] = useState<Set<number>>(new Set());
+  const [unshareable, setUnshareable] = useState<Set<number>>(new Set());
   const [canReview, setCanReview] = useState(false);
-  const [rules, setRules] = useState<FactApprovalRule[]>([]);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -65,13 +68,11 @@ export default function CorrectionsTab({ onCount }: { onCount: (n: number) => vo
       const page = await listStandingFacts();
       setFacts(page.facts);
       setRetirable(new Set(page.retirable_ids ?? []));
+      setShareable(new Set(page.shareable_ids ?? []));
+      setUnshareable(new Set(page.unshareable_ids ?? []));
       setCanReview(page.can_review ?? false);
       setFailed(false);
       onCount(page.facts.filter((f) => f.status === "active").length);
-      if (page.can_review) {
-        // The switch list is extra: failing to load it leaves the facts shown.
-        setRules(await listFactApprovalRules().catch(() => []));
-      }
     } catch {
       setFailed(true);
     } finally {
@@ -87,9 +88,34 @@ export default function CorrectionsTab({ onCount }: { onCount: (n: number) => vo
     async (fact: StandingFact) => {
       if (!window.confirm(`Stop using this everywhere?\n\n${fact.statement}`)) return;
       try {
-        await retireStandingFact(fact.id);
+        // A private decision is its person's own: its own routes, open to
+        // every teammate.
+        if (fact.private_to_person_id != null) await removeOwnDecision(fact.id);
+        else await retireStandingFact(fact.id);
       } catch {
         window.alert("Failed to retire.");
+        return;
+      }
+      void refresh();
+    },
+    [refresh],
+  );
+
+  const handleEdit = useCallback(
+    async (fact: StandingFact, statement: string) => {
+      if (fact.private_to_person_id != null) await editOwnDecision(fact.id, statement);
+      else await editStandingFact(fact.id, statement);
+      void refresh();
+    },
+    [refresh],
+  );
+
+  const handleShare = useCallback(
+    async (fact: StandingFact, shared: boolean) => {
+      try {
+        await shareDecision(fact.id, shared);
+      } catch (err) {
+        window.alert(err instanceof Error ? err.message : "Couldn't change who sees it");
         return;
       }
       void refresh();
@@ -110,16 +136,7 @@ export default function CorrectionsTab({ onCount }: { onCount: (n: number) => vo
     [refresh],
   );
 
-  const handleRule = useCallback(async (rule: FactApprovalRule) => {
-    try {
-      const saved = await setFactApprovalRule(rule.person_id, !rule.needs_approval);
-      setRules((prev) => prev.map((r) => (r.person_id === saved.person_id ? saved : r)));
-    } catch {
-      window.alert("Failed to change who needs approval.");
-    }
-  }, []);
-
-  if (loading) return <div className="text-fg-muted text-[15px] py-4">Loading…</div>;
+  if (loading) return <PageSpinner />;
   if (failed) return <EmptyState message="Corrections are unavailable right now." />;
 
   const proposed = facts.filter((f) => f.status === "proposed");
@@ -149,6 +166,7 @@ export default function CorrectionsTab({ onCount }: { onCount: (n: number) => vo
                 replaces={f.replaces_fact_id ? byId.get(f.replaces_fact_id) : undefined}
                 onApprove={canReview ? () => handleReview(f, "approve") : undefined}
                 onDecline={canReview ? () => handleReview(f, "decline") : undefined}
+                onMakePrivate={unshareable.has(f.id) ? () => handleShare(f, false) : undefined}
               />
             ))}
           </div>
@@ -164,6 +182,9 @@ export default function CorrectionsTab({ onCount }: { onCount: (n: number) => vo
                 key={f.id}
                 fact={f}
                 onRetire={retirable.has(f.id) && f.kind !== "profile" ? () => handleRetire(f) : undefined}
+                onEdit={retirable.has(f.id) && f.kind !== "profile" ? (text) => handleEdit(f, text) : undefined}
+                onShare={shareable.has(f.id) ? () => handleShare(f, true) : undefined}
+                onMakePrivate={unshareable.has(f.id) ? () => handleShare(f, false) : undefined}
               />
             ))}
           </div>
@@ -185,32 +206,6 @@ export default function CorrectionsTab({ onCount }: { onCount: (n: number) => vo
           )}
         </div>
       )}
-      {canReview && rules.length > 0 && (
-        <div className="border-t border-line pt-3">
-          <div className="text-base font-semibold text-fg">Teammates&apos; corrections</div>
-          <p className="text-sm text-fg-muted mb-2">
-            Teammates can correct facts too; theirs are marked with their name and wait for your
-            approval. Untick &ldquo;needs my approval&rdquo; to trust a teammate&apos;s corrections straight
-            away (one that would replace yours still waits).
-          </p>
-          <ul className="space-y-1">
-            {rules.map((r) => (
-              <li key={r.person_id}>
-                <label className="flex items-center gap-3 min-h-10 text-[15px] text-fg cursor-pointer">
-                  <input
-                    type="checkbox"
-                    className="h-5 w-5 accent-[rgb(var(--accent-strong))]"
-                    checked={r.needs_approval}
-                    onChange={() => void handleRule(r)}
-                  />
-                  <span>{r.full_name}</span>
-                  <span className="text-sm text-fg-muted">— needs my approval</span>
-                </label>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
     </div>
   );
 }
@@ -218,31 +213,67 @@ export default function CorrectionsTab({ onCount }: { onCount: (n: number) => vo
 function FactRow({
   fact,
   onRetire,
+  onEdit,
   onApprove,
   onDecline,
+  onShare,
+  onMakePrivate,
   replacedBy,
   replaces,
 }: {
   fact: StandingFact;
   onRetire?: () => void;
+  onEdit?: (statement: string) => Promise<void>;
   onApprove?: () => void;
   onDecline?: () => void;
+  onShare?: () => void;
+  onMakePrivate?: () => void;
   replacedBy?: StandingFact;
   replaces?: StandingFact;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(fact.statement);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const save = async () => {
+    if (!onEdit) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onEdit(draft.trim());
+      setEditing(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't save that change");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const menu = [
+    ...(onEdit ? [{ label: "Edit", onSelect: () => { setDraft(fact.statement); setEditing(true); } }] : []),
+    ...(onMakePrivate ? [{ label: "Make private", onSelect: onMakePrivate }] : []),
+    ...(onRetire ? [{ label: "Retire (stop using it)", danger: true, onSelect: onRetire }] : []),
+  ];
   return (
     <div className="py-3.5">
       <div className="flex items-start justify-between gap-3 mb-1.5">
         <div className="flex flex-wrap items-center gap-2 text-sm text-fg-muted min-w-0 pt-1.5">
           <span className={`px-2 py-0.5 rounded border font-medium ${KIND_PILL[fact.kind]}`}>
-            {KIND_LABEL[fact.kind]}
+            {fact.decision ? "Decision" : KIND_LABEL[fact.kind]}
           </span>
           <span className="truncate" title={fact.subject}>{fact.subject}</span>
           <span>· {formatDate(fact.created_at)} via {channelLabel(fact.source_channel)}</span>
           {fact.recorded_by_role === "teammate" && (
             <span className="text-fg">· per {fact.recorded_by_name || "a teammate"}</span>
           )}
+          {fact.private_to_person_id != null && (
+            <span className="px-2 py-0.5 rounded border border-line font-medium text-fg">Only you</span>
+          )}
         </div>
+        {onShare && !editing && (
+          <Button variant="secondary" size="sm" className="shrink-0 !h-10" onClick={onShare}>
+            Share with team
+          </Button>
+        )}
         {(onApprove || onDecline) && (
           <div className="shrink-0 flex gap-2">
             {onApprove && (
@@ -257,13 +288,7 @@ function FactRow({
             )}
           </div>
         )}
-        {onRetire && (
-          <OverflowMenu
-            size="sm"
-            label="Correction actions"
-            items={[{ label: "Retire (stop using it)", danger: true, onSelect: onRetire }]}
-          />
-        )}
+        {menu.length > 0 && !editing && <OverflowMenu size="sm" label="Correction actions" items={menu} />}
         {fact.kind === "profile" && fact.status === "active" && (
           <Link
             href="/company-profile"
@@ -273,7 +298,40 @@ function FactRow({
           </Link>
         )}
       </div>
-      <div className="text-[15px] text-fg">{fact.statement}</div>
+      {editing ? (
+        <div className="space-y-2">
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={2}
+            maxLength={600}
+            aria-label="What it should say"
+            className="w-full rounded-md border border-line bg-surface px-3 py-2 text-[15px] text-fg"
+          />
+          {error && <p className="text-sm text-fg-muted">{error}</p>}
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              className="!h-10"
+              disabled={saving || !draft.trim() || draft.trim() === fact.statement}
+              onClick={() => void save()}
+            >
+              {saving ? "Saving…" : "Save"}
+            </Button>
+            <Button variant="secondary" size="sm" className="!h-10" disabled={saving} onClick={() => setEditing(false)}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="text-[15px] text-fg">
+          {fact.statement}
+          {fact.decision && fact.outcome && (
+            <div className="text-sm text-fg-muted mt-1">Outcome: {fact.outcome}</div>
+          )}
+        </div>
+      )}
       {fact.previous_statement && (
         <div className="text-sm text-fg-muted mt-0.5">
           <span className="line-through">{fact.previous_statement}</span>

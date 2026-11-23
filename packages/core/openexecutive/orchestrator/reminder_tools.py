@@ -50,17 +50,14 @@ def parse_when(value: str, now: datetime) -> datetime | str:
     """``value`` as an aware time, read in the workspace's timezone when it
     has none, or why it can't be one."""
     from openexecutive.delegation.reminders import HORIZON
-    from openexecutive.memory.workspace_settings import get_user_timezone
+    from openexecutive.memory.workspace_settings import company_time
 
     raw = str(value or "").strip()
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
+    parsed = company_time(raw)
+    if parsed is None:
         return "`when` must be a date and time like 2026-10-10T09:00."
     if len(raw) == 10:  # a date alone
-        parsed = datetime.combine(parsed.date(), _DEFAULT_HOUR)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=get_user_timezone())
+        parsed = parsed.replace(hour=_DEFAULT_HOUR.hour, minute=_DEFAULT_HOUR.minute)
     if parsed <= now + timedelta(minutes=1):
         return "That time has passed. Ask them when they want it."
     if parsed > now + HORIZON:
@@ -117,4 +114,6 @@ async def handle_remind_me(tool_input: dict[str, Any]) -> str:
 
 
 REMINDER_TOOLS: list[dict[str, Any]] = [REMIND_ME_TOOL]
-REMINDER_TOOL_HANDLERS: dict[str, Any] = {REMIND_ME: handle_remind_me}
+REMINDER_TOOL_HANDLERS: dict[str, Any] = {
+    REMIND_ME: handle_remind_me,
+}

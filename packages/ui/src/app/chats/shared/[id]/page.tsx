@@ -6,6 +6,8 @@ import Link from "next/link";
 import Chat from "@/components/Chat";
 import { getSession, getSessionMessages, type ChatMessage, type SessionSummary } from "@/lib/api";
 import { sessionTitle } from "@/lib/sessionChannel";
+import { PageSpinner } from "@/components/ui/Spinner";
+import { usePageCrumb } from "@/components/shell/PageCrumb";
 
 type Loaded =
   | { id: string; state: "ok"; session: SessionSummary; messages: ChatMessage[] }
@@ -40,6 +42,7 @@ export default function SharedChatPage() {
 
   const current = loaded && loaded.id === id ? loaded : null;
   const chat = current?.state === "ok" ? current : null;
+  usePageCrumb(chat ? sessionTitle(chat.session) : null);
 
   return (
     <div className="flex flex-col h-full bg-surface text-fg">
@@ -54,7 +57,7 @@ export default function SharedChatPage() {
         </div>
       </div>
       {!current ? (
-        <p className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-8 text-[15px] text-fg-muted">Loading chat…</p>
+        <PageSpinner label="Loading chat" />
       ) : current.state === "gone" ? (
         <p className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-8 text-[15px] text-fg-muted">
           This chat isn&apos;t shared with you any more.

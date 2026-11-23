@@ -16,7 +16,9 @@ import {
   getWorkflow,
   getWorkflowSample,
 } from "@/lib/api";
-import { describeCadence } from "@/lib/workflowChanges";
+import { describeCadenceLocal } from "@/lib/workflowChanges";
+import { shownSteps, startsOnArrival, takeRunOnArrival } from "@/lib/workflowRun";
+import { Spinner } from "@/components/ui/Spinner";
 
 type FormState = Record<string, string>;
 
@@ -81,7 +83,6 @@ export default function JobDetailPage() {
   // A custom workflow that is switched off isn't runnable (so getWorkflow
   // 404s); it gets its review card instead, where turning it on approves it.
   const [pendingDef, setPendingDef] = useState<DynamicWorkflowDef | null>(null);
-  const [reloadKey, setReloadKey] = useState(0);
   // A saved custom workflow, for when it runs.
   const [customDef, setCustomDef] = useState<DynamicWorkflowDef | null>(null);
   // Only offer "Fill with an example" when the workflow has one.
@@ -143,6 +144,13 @@ export default function JobDetailPage() {
         if (appliedAny) setPrefillBanner("suggestion");
         setForm(initial);
         initializedForWorkflowRef.current = name;
+        const filled = (wf.input_schema.required ?? []).every((f) =>
+          Boolean(initial[f]?.trim()),
+        );
+        // Arrived from a list's Run: start now, unless details are needed.
+        // The note is taken here, after the cancelled check, so StrictMode's
+        // throwaway first fetch can't use it up.
+        if (startsOnArrival(takeRunOnArrival(name), filled)) setRunning(true);
         if (wf.is_custom) {
           getCustomWorkflow(name)
             .then((d) => !cancelled && setCustomDef(d))
@@ -158,6 +166,9 @@ export default function JobDetailPage() {
         const message = e instanceof Error ? e.message : String(e);
         const custom = await getCustomWorkflow(name).catch(() => null);
         if (cancelled) return;
+        // It didn't load, so it can't run: drop Run's note, so a later visit
+        // doesn't start it.
+        takeRunOnArrival(name);
         if (custom && !custom.is_active) setPendingDef(custom);
         else setLoadError(message);
       });
@@ -166,9 +177,8 @@ export default function JobDetailPage() {
     };
     // prefillRaw is intentionally captured at first init only — re-running
     // when it changes would clobber user edits. See ref guard above.
-    // reloadKey re-runs the load once a pending workflow is turned on.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [name, reloadKey]);
+  }, [name]);
 
   const handleLoadSample = useCallback(async () => {
     if (!name) return;
@@ -224,18 +234,14 @@ export default function JobDetailPage() {
     []
   );
 
-  const handleCancel = useCallback(() => {
-    setRunning(false);
-  }, []);
 
   if (pendingDef) {
     return (
       <PendingWorkflowReview
         definition={pendingDef}
-        onActivated={() => {
-          setPendingDef(null);
-          setReloadKey((k) => k + 1);
-        }}
+        // Back to the list, where the workflow now shows as on: this page
+        // would only repeat the steps the card just showed.
+        onActivated={() => router.push(`/jobs?turned_on=${encodeURIComponent(name)}`)}
       />
     );
   }
@@ -253,8 +259,8 @@ export default function JobDetailPage() {
 
   if (!workflow) {
     return (
-      <div className="flex flex-col h-full bg-surface text-fg-muted items-center justify-center text-sm">
-        Loading…
+      <div className="flex flex-col h-full bg-surface items-center justify-center">
+        <Spinner size="md" />
       </div>
     );
   }
@@ -262,19 +268,17 @@ export default function JobDetailPage() {
   const props = workflow.input_schema.properties ?? {};
   const hasInputs = Object.keys(props).length > 0;
   // "Load context" is setup every run does, not something this workflow does.
-  const steps = workflow.steps
-    .filter((s) => s.id !== "context")
-    .map((s) => {
-      const custom = customDef?.steps.find((c) => c.id === s.id);
-      const detail = !custom
-        ? ""
-        : custom.kind === "approval_gate"
-          ? custom.question
-          : custom.kind === "synthesis"
-            ? custom.instructions
-            : custom.goal;
-      return { id: s.id, title: s.title, detail: s.description || detail };
-    });
+  const steps = shownSteps(workflow.steps).map((s) => {
+    const custom = customDef?.steps.find((c) => c.id === s.id);
+    const detail = !custom
+      ? ""
+      : custom.kind === "approval_gate"
+        ? custom.question
+        : custom.kind === "synthesis"
+          ? custom.instructions
+          : custom.goal;
+    return { id: s.id, title: s.title, detail: s.description || detail };
+  });
   const editHref = workflow.is_custom
     ? `/jobs/new?edit=${encodeURIComponent(workflow.name)}`
     : null;
@@ -340,7 +344,7 @@ export default function JobDetailPage() {
                   <div>
                     <p className="text-[15px] font-semibold text-fg">
                       {customDef.cadence
-                        ? describeCadence(customDef.cadence)
+                        ? describeCadenceLocal(customDef.cadence)
                         : "Runs when you start it"}
                     </p>
                     <p className="text-sm text-fg-muted">
@@ -511,7 +515,7 @@ export default function JobDetailPage() {
             <WorkflowRunner
               workflow={workflow}
               inputs={form}
-              onCancel={handleCancel}
+              onBack={() => setRunning(false)}
             />
           )}
         </div>

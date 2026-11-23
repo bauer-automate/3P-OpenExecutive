@@ -1,11 +1,15 @@
 """Act as me: Read my calendar.
 
 A person who has Act as me can also let the Executive read their own
-calendar, read-only: ``calendar.readonly`` on Google, ``Calendars.Read`` on
+calendar: ``calendar.events`` on Google, ``Calendars.ReadWrite`` on
 Microsoft, granted on the same per-person sign-in as their mailbox when they
 connect it with ``--calendar`` (``scripts/connect-own-gmail.py``,
-``scripts/connect-own-outlook.py``). A sign-in made without it keeps working
-for mail; only the calendar read says to connect again.
+``scripts/connect-own-outlook.py``). The only change it ever makes there is
+answering a meeting invite, on the person's tap or accepted on its own under
+Handle it for me (``delegation.invites``). A sign-in made before with
+read-only access (``calendar.readonly``, ``Calendars.Read``) keeps reading;
+its invite cards say to connect again. A sign-in made without it keeps
+working for mail; only the calendar read says to connect again.
 
 **The switch.** One row per person in ``delegation_calendar``; absent,
 unreadable or off all mean off. Only they turn it on (``PUT
@@ -16,7 +20,12 @@ opens; turning Act as me off turns it off too.
 the same turns and with the same fence as their mail: a read makes the turn
 private and locks it down (``delegation.lockdown``), since an invite's title
 is anyone's words. And the first week's private brief lists today's meetings
-(``briefing.first_week``). Nothing is kept: each read asks the calendar again.
+(``briefing.first_week``), and the principal's daily briefs merge it with the
+calendar the Executive reads (``briefing.top_three.read_todays_calendar``). And a reply card whose open question is when to
+meet offers their next free slots (``delegation.answers.free_slots``): only
+the busy times are used, in code, and no event's title reaches a model.
+And an invite card's clashes (``delegation.invites.clashes``), the same way.
+Nothing is kept: each read asks the calendar again.
 """
 from __future__ import annotations
 
@@ -28,24 +37,20 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from openexecutive.delegation.schema import CALENDAR_TABLE, ensure_schema
+from openexecutive.utils import db
 
 logger = logging.getLogger(__name__)
 
 MAX_DAYS = 31
 
 NOT_GRANTED = (
-    "Your saved sign-in doesn't include your calendar. Add it under Read my calendar "
-    "in Delegate → Act as me, then turn Read my calendar on."
+    "Your saved sign-in doesn't include your calendar. Add it under Read your calendar "
+    "in Delegate → As you, then turn Read your calendar on."
 )
-OFF = "Read my calendar is off. They can turn it on in Settings → Act as me."
+OFF = "Read your calendar is off. They can turn it on in Delegate → As you."
 
 
-def _db(db_path: Path | None) -> Path:
-    if db_path is not None:
-        return db_path
-    from openexecutive.memory import episodic
-
-    return Path(episodic.DB_PATH)
+_db = db.company_path
 
 
 def _connect(db_path: Path | None) -> sqlite3.Connection:

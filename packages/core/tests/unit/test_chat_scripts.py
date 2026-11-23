@@ -35,6 +35,10 @@ def _principals_own_turn(monkeypatch: pytest.MonkeyPatch) -> None:
         "openexecutive.orchestrator.executive.principal_only_withheld",
         lambda _s: frozenset(),
     )
+    # The suite pins Approvals to Careful (tests/conftest.py), which holds
+    # every acting step a turn asks for; these tests are about scripts, so
+    # Careful's hold on asked steps (take_the_lead._asked_hit) stays out.
+    monkeypatch.setattr("openexecutive.orchestrator.take_the_lead._careful_turn", lambda: None)
 
 
 class _TextBlock:
@@ -218,20 +222,22 @@ def test_off_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "run_script" not in [t.get("name") for t in provider.calls[0]["tools"]]
 
 
-def test_a_private_turn_is_not_offered_it_and_is_refused(
+def test_a_private_turn_is_offered_it_and_it_waits(
     monkeypatch: pytest.MonkeyPatch, audit: list[dict[str, Any]]
 ) -> None:
     monkeypatch.setattr("openexecutive.orchestrator.executive.turn_is_private_to_principal", lambda: True)
     gateway = _Gateway()
     provider = _script_turn()
     _run(provider, gateway)
-    assert "run_script" not in [t.get("name") for t in provider.calls[0]["tools"]]
-    assert "not available on this turn" in json.loads(_any_result(provider, "tu-s"))["error"]
+    # Offered: the one check decides at dispatch (orchestrator.levels). A
+    # script can't wait on an Approve card, so the model is told, not dropped.
+    assert "run_script" in [t.get("name") for t in provider.calls[0]["tools"]]
+    assert "can't wait on a card" in json.loads(_any_result(provider, "tu-s"))["error"]
     assert gateway.calls == []
-    assert any(r["details"].get("refused") == "private_turn" for r in audit)
+    assert any(r["details"].get("held") == "private_turn" for r in audit)
 
 
-def test_someone_elses_turn_is_not_offered_it_and_is_refused(
+def test_someone_elses_turn_does_not_run_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`run_script` is the principal's own, like run_python_job beside it.
@@ -252,8 +258,7 @@ def test_someone_elses_turn_is_not_offered_it_and_is_refused(
     gateway = _Gateway()
     provider = _script_turn()
     _run(provider, gateway)
-    assert "run_script" not in [t.get("name") for t in provider.calls[0]["tools"]]
-    assert "only the principal" in json.loads(_any_result(provider, "tu-s"))["error"]
+    assert "can't wait on a card" in json.loads(_any_result(provider, "tu-s"))["error"]
     assert gateway.calls == []
 
 
@@ -286,9 +291,9 @@ def test_a_turn_that_read_the_owners_mail_refuses_the_whole_script(
     gateway = _Gateway()
     provider = _script_turn()
     _run(provider, gateway)
-    assert "read the user's own mail" in json.loads(_any_result(provider, "tu-s"))["error"]
+    assert "can't wait on a card" in json.loads(_any_result(provider, "tu-s"))["error"]
     assert gateway.calls == []
-    assert any(r["details"].get("refused") == "mail_touched" for r in audit)
+    assert any(r["details"].get("held") == "mail_touched" for r in audit)
 
 
 def test_a_later_turn_of_a_mail_conversation_is_not_locked_once_the_mail_is_out_of_view(
@@ -390,7 +395,7 @@ def test_chat_saves_a_script_and_lists_then_runs_it(
     saved = json.loads(_any_result(provider, "tu-s"))["saved"]
     assert saved == {"name": "file_scans", "version": 1,
                      "uses_tools": ["drive__list_items", "drive__move_file"], "enabled": True,
-                     "workflows": "off until the owner turns it on in Settings → Advanced → Custom tools"}
+                     "workflows": "off until the owner turns it on in Settings → Advanced → Tools I built"}
     listed = json.loads(_any_result(provider, "tu-l"))["saved_tools"]
     assert [t["name"] for t in listed] == ["file_scans"]
     again = json.loads(_any_result(provider, "tu-r"))
@@ -451,9 +456,8 @@ def test_someone_elses_turn_is_not_offered_or_run_saved_tools(
         _FinalMsg([_TextBlock("Done.")], "end_turn"),
     ])
     _run(provider, gateway)
-    assert "list_saved_tools" not in [t.get("name") for t in provider.calls[0]["tools"]]
-    assert "only the principal" in json.loads(_any_result(provider, "tu-l"))["error"]
-    assert "principal's own turns" in json.loads(_any_result(provider, "tu-r"))["error"]
+    assert "can't wait on a card" in json.loads(_any_result(provider, "tu-l"))["error"]
+    assert "someone on the team" in json.loads(_any_result(provider, "tu-r"))["error"]
     assert gateway.calls == []
 
 
@@ -483,6 +487,34 @@ def test_a_script_can_use_the_executives_own_tools(
     rows = [r for r in audit if r["details"].get("via") == "run_script"]
     assert [(r["details"]["tool"], r["details"]["kind"]) for r in rows] == [("create_alert", "skill")] * 3
     assert json.loads(_any_result(provider, "tu-s"))["result"] == 0
+
+
+def test_a_script_cannot_raise_an_alert_the_mail_hold_withholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a mail read, a script's own calls are held as a direct call would
+    be (delegation.lockdown.mail_turn_withholds): an alert at any level."""
+    from openexecutive.orchestrator import executive as executive_module
+
+    made: list[dict[str, Any]] = []
+
+    async def create_alert(tool_input: dict[str, Any]) -> str:
+        made.append(tool_input)
+        return json.dumps({"ok": True})
+
+    monkeypatch.setitem(executive_module._ALL_SKILL_HANDLERS, "create_alert", create_alert)
+    from types import SimpleNamespace
+
+    pinned = SimpleNamespace(offered=False, touched_mail=True, read_mail=True)
+    monkeypatch.setattr("openexecutive.orchestrator.executive.turn_delegation", lambda _s: pinned)
+    # The mail read this turn was checked and clean: the script runs, its
+    # alert doesn't.
+    monkeypatch.setattr(
+        executive_module, "mail_turn_withholds", lambda name, _input, **_kw: name == "create_alert"
+    )
+    provider = _script_turn("create_alert(title='Mail said', severity='low')\nlen(inputs)")
+    _run(provider, _Gateway())
+    assert made == []
 
 
 def test_an_own_tool_the_turn_is_not_offered_is_not_a_function(

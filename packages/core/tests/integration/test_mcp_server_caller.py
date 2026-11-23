@@ -124,7 +124,7 @@ def _read(app: Any, endpoint: Any, uri: str, headers: dict[str, str]) -> dict[st
     [
         (lambda: _signed_as("user", OWNER), True),
         (lambda: _signed_as("operator"), True),
-        (lambda: _signed_as("user", TEAMMATE), False),
+        (lambda: _signed_as("user", TEAMMATE), True),
         (lambda: {}, False),  # a service: signed callers on, no assertion
     ],
 )
@@ -137,7 +137,7 @@ def test_signed_callers_reach_the_mcp_handlers(
     if allowed:
         assert json.loads(out["result"]["contents"][0]["text"]) == []
     else:
-        assert "Only the owner can read this." in out["error"]["message"]
+        assert "Only someone on the team can read this." in out["error"]["message"]
 
 
 def test_a_signed_in_teammate_reads_the_roster_and_a_service_does_not(
@@ -158,8 +158,9 @@ def test_open_mode_takes_the_caller_header_at_its_word(
     with patch("openexecutive.memory.episodic.list_advice", return_value=[]):
         mine = _read(app, endpoint, "oe://memory/advice", {})
         theirs = _read(app, endpoint, "oe://memory/advice", {"x-caller-email": TEAMMATE})
-    assert "result" in mine
-    assert "Only the owner can read this." in theirs["error"]["message"]
+        stranger = _read(app, endpoint, "oe://memory/advice", {"x-caller-email": "x@else.example"})
+    assert "result" in mine and "result" in theirs
+    assert "Only someone on the team can read this." in stranger["error"]["message"]
 
 
 @pytest.mark.parametrize(
@@ -189,3 +190,79 @@ def test_ask_executive_asks_as_the_signed_caller(
     assert kwargs["person_id"] == person_id
     assert kwargs["session"].from_mcp_client is True
     assert kwargs["session"].caller_person_id == person_id
+
+
+def _secret_app(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The API app behind a shared secret, open mode for callers."""
+    from openexecutive.api.main import create_app
+    from openexecutive.mcp_server import server as mcp_server
+
+    monkeypatch.setenv("BACKEND_SHARED_SECRET", "s3cret")
+    monkeypatch.delenv("CALLER_ASSERTION_PUBLIC_KEYS", raising=False)
+    app = create_app()
+    endpoint = next(
+        getattr(r, "endpoint", None) or getattr(r, "app", None)
+        for r in mcp_server._http_app.routes
+        if hasattr(getattr(r, "endpoint", None) or getattr(r, "app", None), "session_manager")
+    )
+    monkeypatch.setattr(endpoint, "session_manager", endpoint.session_manager)
+    return app, endpoint
+
+
+def test_ask_executive_is_the_callers_own_turn_behind_the_shared_secret(
+    roster: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, endpoint = _secret_app(monkeypatch)
+    chat = AsyncMock(return_value="An answer")
+    with (
+        patch("openexecutive.orchestrator.executive.Executive.chat", new=chat),
+        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=None),
+        patch("openexecutive.briefing.context.render_and_trust", return_value="<board/>"),
+    ):
+        out = _rpc(
+            app, endpoint, "tools/call",
+            {"name": "ask_executive", "arguments": {"message": "Close the pilot task"}},
+            {"x-api-key": "s3cret"},
+        )
+    assert out["result"]["content"][0]["text"] == "An answer"
+    kwargs = chat.await_args.kwargs
+    assert kwargs["session"].from_mcp_client is True
+    assert kwargs["session"].caller_person_id == roster["principal"]
+    assert kwargs["briefing_context"] == "<board/>"
+
+
+def test_route_reads_answer_as_the_verified_caller(roster: dict[str, int], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tasks are read through the web app's own route with the /mcp
+    request: the owner sees everyone's, a teammate their own."""
+    from openexecutive.attunement import open_loops
+
+    seen: list[int | None] = []
+
+    def list_tasks(**kwargs: Any) -> tuple[list[Any], int]:
+        seen.append(kwargs["owner_person_id"])
+        return [], 0
+
+    monkeypatch.setattr(open_loops, "list_tasks", list_tasks)
+    app, endpoint = _app(monkeypatch, signed=True)
+    for email in (OWNER, TEAMMATE):
+        out = _read(app, endpoint, "oe://tasks", _signed_as("user", email))
+        assert json.loads(out["result"]["contents"][0]["text"]) == {"tasks": [], "total": 0}
+    assert seen == [None, roster["teammate"]]
+
+
+def test_a_wrong_key_never_reaches_the_tool(roster: dict[str, int], monkeypatch: pytest.MonkeyPatch) -> None:
+    app, endpoint = _secret_app(monkeypatch)
+    manager = _fresh_manager(endpoint)
+
+    async def _go() -> int:
+        async with manager.run():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/mcp/", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                    headers={"x-api-key": "wrong",
+                             "accept": "application/json, text/event-stream"},
+                )
+        return response.status_code
+
+    assert asyncio.run(_go()) == 401

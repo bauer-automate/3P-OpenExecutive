@@ -27,7 +27,13 @@ from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from openexecutive.memory.workspace_settings import COMPANY_TIME_HINT, company_time
+from openexecutive.orchestrator.card_answers import ANSWER_CARD_TOOL, handle_answer_card
 from openexecutive.orchestrator.disclosure import with_chat_line
+
+# How message_person says a person has no chat app it could use. The alert
+# review matches on it, so it is said in one place.
+NO_REACHABLE_CHANNEL = "no reachable channel"
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +67,7 @@ def set_session(session: Any) -> Iterator[None]:
     alert board off the session; with ``None`` it fell back to an empty set
     and refused every ack the principal asked for, on the one surface they
     actually use. The same ``None`` also blanks the `session_id` on
-    `scheduled_actions` rows and disables `schedule_followup`'s
-    seen-channel_refs anti-spam gate, which only fires when it can see a
-    session.
+    `scheduled_actions` rows.
 
     Save/restore rather than ``Token.reset()``, for the same reason
     `audit.context.set_turn` does it: the Token variant raises ``ValueError:
@@ -96,6 +100,25 @@ def _is_contact_ref(channel: str, channel_ref: str, finder: Callable[..., Any]) 
         logger.warning("record_send_to_activity: contact lookup failed — not recorded")
         return True
     return person is not None and getattr(person, "kind", "team") != "team"
+
+
+# The kind the next sends in this context record their done row as
+# (``recorded_as``); the default is an ordinary send.
+_RECORD_KIND: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "schedule_tools_record_kind", default="ad_hoc"
+)
+
+
+@contextlib.contextmanager
+def recorded_as(kind: str) -> Iterator[None]:
+    """Record the sends made inside this block as ``kind``. The scheduler
+    wraps a brief's delivery in ``recorded_as(BRIEF_DELIVERY_KIND)`` so the
+    activity feed, which every later brief reads, leaves it out."""
+    token = _RECORD_KIND.set(kind)
+    try:
+        yield
+    finally:
+        _RECORD_KIND.reset(token)
 
 
 def _record_send_to_activity(
@@ -148,6 +171,7 @@ def _record_send_to_activity(
                 channel_ref=channel_ref,
                 intent_text=intent_text[:160],
                 originating_session_id=session_id,
+                kind=_RECORD_KIND.get(),
                 status="done",
             )
         except Exception as exc:
@@ -173,6 +197,42 @@ def _record_send_to_activity(
         logger.exception("record_send_to_activity: outer guard caught failure")
 
 
+def _own_outreach() -> bool:
+    """Whether a send is the Executive's own outreach: a proactive pass
+    tagged it (``attunement.outcomes``), or no person is in the turn (an
+    unattended run, or no session at all). Errors count as its own."""
+    try:
+        from openexecutive.attunement.outcomes import current_tag
+
+        if current_tag() is not None:
+            return True
+        session = current_session.get()
+        return session is None or getattr(session, "unattended", False) is True
+    except Exception:
+        return True
+
+
+def _team_asked() -> bool:
+    """Whether someone on the team started this turn on a surface that
+    verified who they are (the principal or a rostered teammate). Fails
+    closed."""
+    try:
+        from openexecutive.orchestrator.people_tools import (
+            is_principal_on_verified_surface,
+            teammate_on_verified_surface,
+        )
+
+        session = current_session.get()
+        if session is None:
+            return False
+        return bool(
+            is_principal_on_verified_surface(session)
+            or teammate_on_verified_surface(session) is not None
+        )
+    except Exception:
+        return False
+
+
 def _guard_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> str | None:
     """Run the outbound anti-spam guard before a direct send.
 
@@ -189,7 +249,15 @@ def _guard_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> 
     if outside_content.added_ref(channel_ref):
         # On the roster only since this turn (outside_content).
         return outside_content.added_person_error(f"{channel_ref!r}")
-    reason = check_outbound_allowed(channel, channel_ref, text)
+    # What someone on the team asks for in the turn goes as they asked:
+    # Approvals already decided it. The guard is for the Executive's own
+    # outreach (a tagged proactive send, or a run nobody is in) and for a turn
+    # nobody on the team started (a stranger's mail could steer a burst of
+    # sends); quiet hours only for its own outreach.
+    own = _own_outreach()
+    if not own and _team_asked():
+        return _hold_outbound(tool=tool, channel=channel, channel_ref=channel_ref, text=text)
+    reason = check_outbound_allowed(channel, channel_ref, text, availability=own)
     if reason is None:
         return _hold_outbound(tool=tool, channel=channel, channel_ref=channel_ref, text=text)
     from openexecutive.audit import log_event as audit_log
@@ -276,13 +344,30 @@ def _resolve_recipient_person_id(channel: str, channel_ref: str) -> int | None:
         return None
 
 
+def _off_roster_runs() -> bool:
+    """Whether a direct message to someone not in People goes ahead: under
+    Hands-off, for a step the owner approved (``orchestrator.levels``), or
+    when a rule lets someone new go (``take_the_lead.lets_go``)."""
+    from openexecutive.orchestrator import levels, take_the_lead
+
+    return levels.relaxed() or take_the_lead.lets_go(take_the_lead.SOMEONE_NEW)
+
+
+def _off_roster_card(blocked: str, tool: str, tool_input: dict[str, Any]) -> str:
+    """Below Hands-off, a direct message to someone not in People is an
+    Approve card for the owner; with nobody in the turn, the refusal."""
+    from openexecutive.orchestrator import levels
+
+    return levels.card_or(blocked, tool, dict(tool_input), reason=levels.NEW_PERSON, mcp=False)
+
+
 def _dm_recipient_on_roster(finder: Callable[..., Any], ref: str) -> bool:
     """Whether a raw DM tool may send to ``ref``: a team member always, a
     contact only when the principal asked on a verified surface (see
     ``people_tools.contacts_reachable_now``)."""
     from openexecutive.orchestrator.people_tools import (
         contacts_reachable_now,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
 
     person = finder(ref)
@@ -291,7 +376,7 @@ def _dm_recipient_on_roster(finder: Callable[..., Any], ref: str) -> bool:
     if person is None:
         return False
     # A turn about the principal's private mail reaches the principal only.
-    return not turn_is_private_to_principal() or getattr(person, "is_principal", False) is True
+    return not private_turn_holds() or getattr(person, "is_principal", False) is True
 
 
 def _record_outbound_context(
@@ -391,29 +476,37 @@ def _record_outbound_context(
 SCHEDULE_FOLLOWUP_TOOL: dict[str, Any] = {
     "name": "schedule_followup",
     "description": (
-        "Queue a proactive follow-up message to be sent to the user at a future time via "
-        "their channel. Use ONLY when the user explicitly asks for a follow-up, reminder, "
-        "check-in, or scheduled action. Convert any relative time (\"tomorrow 9am\", "
-        "\"in 2 hours\") to an ISO8601 UTC timestamp yourself before calling — the user's "
-        "timezone is provided in your system prompt. Do NOT use this to defer normal "
-        "in-conversation replies."
+        "Queue a follow-up for a future time, to the person who asked or to someone "
+        "else (channel_ref). One to someone else is sent when it runs, under the "
+        "asker's Approvals like any send. Use "
+        "ONLY when the user explicitly asks for a follow-up, reminder, check-in or "
+        "scheduled action, never to defer a normal reply. It runs once, unless "
+        "they want it again and again (\"from now on\", \"every Monday\", \"each "
+        "morning\"): then give repeat, and it comes back at each time until it is "
+        "cancelled; run_at is its first time. Never set a one-time follow-up that "
+        "promises to set up the next one. A recurring piece of work with several "
+        "steps (a recap built from mail and the calendar) is a workflow with a "
+        "schedule instead. Give run_at in the "
+        "company's time zone, as the person said it (\"tomorrow 9am\" is 09:00 "
+        "tomorrow), never converted to UTC."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "run_at": {
                 "type": "string",
-                "description": "ISO8601 UTC timestamp for when to send the follow-up.",
+                "description": COMPANY_TIME_HINT,
             },
             "channel": {
                 "type": "string",
                 "enum": ["email", "telegram", "slack_dm"],
-                "description": "Channel to deliver via. Must match a channel the user has used in this session.",
+                "description": "Channel to deliver via.",
             },
             "channel_ref": {
                 "type": "string",
                 "description": (
-                    "Channel-specific recipient. For telegram: the numeric chat_id as a string. "
+                    "Who the follow-up reaches: the person who asked, or someone else. "
+                    "For telegram: the numeric chat_id as a string. "
                     "For email: the email address (optionally with thread_id appended as "
                     "'address|thread_id'). For slack_dm: the Slack user id."
                 ),
@@ -421,19 +514,24 @@ SCHEDULE_FOLLOWUP_TOOL: dict[str, Any] = {
             "intent": {
                 "type": "string",
                 "description": (
-                    "1-3 sentences describing what to do at run_at, including any context "
-                    "the future Executive call will need (the topic, decision being followed "
-                    "up on, key facts). Be specific — the future session will not see this "
-                    "conversation's history."
+                    "1-3 sentences on what to do at run_at, with the context it needs "
+                    "(topic, decision, key facts): that run will not see this conversation."
+                ),
+            },
+            "repeat": {
+                "type": "string",
+                "description": (
+                    "Only for one that repeats: 'daily@HH:MM' or 'weekly@DOW@HH:MM' "
+                    "(mon..sun), in the company's time zone ('every Monday 9am' is "
+                    "'weekly@mon@09:00')."
                 ),
             },
             "department": {
                 "type": "string",
                 "description": (
-                    "Optional department slug (e.g. 'finance', 'hr_talent'). When set, "
-                    "the authority gate applies at fire time: propose_only departments "
-                    "will route the action to the appropriate approver instead of "
-                    "dispatching it directly."
+                    "Optional department slug (e.g. 'finance'). When set, that department's "
+                    "authority applies at fire time: a propose_only department routes it "
+                    "to an approver instead of sending it."
                 ),
             },
             "assigned_to_person_id": {
@@ -560,10 +658,9 @@ ACK_ALERT_TOOL: dict[str, Any] = {
         "the call is refused; do not retry the same id — if the principal named the "
         "item, look it up with find_alerts, otherwise say you cannot clear that one.\n"
         "Status 'ack' means the user approved (you are about to execute the suggested "
-        "action); 'dismissed' means declined. Note this clears the card only — a "
-        "proposal that books something (a meeting, a calendar hold) also needs the "
-        "Approve button on the briefing page, which you cannot press; say so rather "
-        "than implying an ack completed it."
+        "action); 'dismissed' means declined. Note this clears the card only: to carry "
+        "out what a card proposes or held back (book the meeting, send what it "
+        "held), or to answer its question, use answer_card instead."
     ),
     "input_schema": {
         "type": "object",
@@ -629,13 +726,25 @@ FIND_ALERTS_TOOL: dict[str, Any] = {
 }
 
 
+# Said with every lookup that finds more than one person: the model must not
+# pick one of two Alexes silently, nor tell the principal something "wasn't
+# sent" after checking only one of them.
+SEVERAL_MATCH_NOTE = (
+    "More than one person matches. Unless the conversation makes clear which "
+    "one is meant, ask. Whatever you send or say was sent, name the person by "
+    "full name and email address."
+)
+
+
 LOOKUP_PERSON_TOOL: dict[str, Any] = {
     "name": "lookup_person",
     "description": (
         "Look up a person by name or role (case-insensitive substring match) and return "
         "their routing identifiers — person_id, full_name, role, email, slack_user_id, "
         "telegram_chat_id, discord_user_id, preferred_channel, authority_scope, "
-        "is_principal. Use this BEFORE calling send_slack_dm / send_discord_dm / "
+        "is_principal; on the principal's own turn also their contacts, and the "
+        "phone, mobile, address, website and LinkedIn saved for each person "
+        "(`details`). Check here first when asked how to reach someone. Use this BEFORE calling send_slack_dm / send_discord_dm / "
         "send_telegram_message when you don't already have the identifier in this session. "
         "IMPORTANT: to DM someone, pass their CHANNEL identifier (slack_user_id / "
         "discord_user_id / telegram_chat_id) — NOT the person_id. person_id is an internal "
@@ -790,13 +899,17 @@ async def handle_schedule_followup(tool_input: dict[str, Any]) -> str:
     if channel not in {"email", "telegram", "slack_dm"}:
         return json.dumps({"error": f"unknown channel {channel!r}"})
 
-    # Parse run_at as ISO8601, accept trailing "Z" as UTC.
-    try:
-        parsed = datetime.fromisoformat(run_at_raw.replace("Z", "+00:00"))
-    except ValueError:
-        return json.dumps({"error": f"run_at not parseable as ISO8601: {run_at_raw!r}"})
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+    parsed = company_time(run_at_raw)
+    if parsed is None:
+        return json.dumps({"error": f"run_at {run_at_raw!r} can't be read. {COMPANY_TIME_HINT}"})
+    repeat = " ".join(str(tool_input.get("repeat") or "").split()) or None
+    if repeat is not None:
+        from openexecutive.departments.cadence import is_valid_cadence_spec
+
+        if not is_valid_cadence_spec(repeat):
+            return json.dumps({
+                "error": f"repeat {repeat!r} can't be read: use 'daily@HH:MM' or 'weekly@DOW@HH:MM'.",
+            })
     parsed_utc = parsed.astimezone(UTC)
 
     now = datetime.now(UTC)
@@ -810,19 +923,9 @@ async def handle_schedule_followup(tool_input: dict[str, Any]) -> str:
             "error": f"run_at is more than {settings.max_scheduled_horizon_days} days out",
         })
 
-    # Anti-spam: only allow scheduling to channel_refs the Executive has seen in this session.
+    # Who it may go to is not checked here: when it fires, its send runs
+    # through the one gate (``take_the_lead.gate``) like any other.
     session = current_session.get()
-    seen: set[tuple[str, str]] | None = (
-        getattr(session, "seen_channel_refs", None) if session is not None else None
-    )
-    if seen is not None and (channel, channel_ref) not in seen:
-        return json.dumps({
-            "error": (
-                f"channel_ref {channel_ref!r} on channel {channel!r} was not seen in this "
-                f"session — refusing to schedule. Only schedule follow-ups to channels the "
-                f"user has actually used."
-            ),
-        })
 
     pending = count_pending_for_channel_ref(channel, channel_ref)
     if pending >= settings.max_pending_per_channel_ref:
@@ -860,6 +963,7 @@ async def handle_schedule_followup(tool_input: dict[str, Any]) -> str:
             assigned_to_person_id=assigned_to_person_id,
             required_scope=required_scope,
             created_by_person_id=_turn_speaker_id(session),
+            repeat=repeat,
         )
     except Exception as exc:
         logger.exception("schedule_followup: insert failed")
@@ -903,6 +1007,7 @@ async def handle_schedule_followup(tool_input: dict[str, Any]) -> str:
         "id": action_id,
         "run_at": parsed_utc.isoformat(),
         "channel": channel,
+        **({"repeat": repeat} if repeat else {"repeat": "none: it runs once"}),
     })
 
 
@@ -944,10 +1049,12 @@ async def handle_send_telegram_message(tool_input: dict[str, Any]) -> str:
                 "send_telegram_message: refused chat_id=%s (not in People roster)",
                 chat_id,
             )
-            return json.dumps({"error": (
+            blocked = json.dumps({"error": (
                 f"chat_id {chat_id!r} is not in the People roster. Pass the person's "
                 "telegram_chat_id from lookup_person — NOT their person_id."
             )})
+            if not _off_roster_runs():
+                return _off_roster_card(blocked, "send_telegram_message", tool_input)
 
     # Anti-spam guard: suppress duplicates / rate-cap breaches / quiet-hours sends.
     suppressed = _guard_outbound(
@@ -1010,11 +1117,11 @@ async def handle_send_slack_dm(tool_input: dict[str, Any]) -> str:
     # A turn about the principal's private mail reaches the principal only.
     from openexecutive.orchestrator.people_tools import (
         PRIVATE_TURN_REFUSAL,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
     from openexecutive.people.store import find_person_by_slack_id
 
-    if turn_is_private_to_principal():
+    if private_turn_holds():
         recipient = find_person_by_slack_id(user_id)
         if recipient is None or not recipient.is_principal:
             return json.dumps({"error": PRIVATE_TURN_REFUSAL})
@@ -1028,11 +1135,13 @@ async def handle_send_slack_dm(tool_input: dict[str, Any]) -> str:
         logger.warning(
             "send_slack_dm: refused user_id=%s (not in People roster)", user_id
         )
-        return json.dumps({"error": (
+        blocked = json.dumps({"error": (
             f"user_id {user_id!r} is not in the People roster. Pass the person's "
             "slack_user_id from lookup_person (a Slack member id like U01ABCDEF) "
             "— NOT their person_id."
         )})
+        if not _off_roster_runs():
+            return _off_roster_card(blocked, "send_slack_dm", tool_input)
 
     settings = get_settings()
     if not settings.slack_bot_token:
@@ -1125,12 +1234,12 @@ def _recover_channel_id_from_person_id(value: str, channel: str) -> str | None:
         return None
     from openexecutive.orchestrator.people_tools import (
         contacts_reachable_now,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
 
     if person.kind != "team" and not contacts_reachable_now():
         return None
-    if turn_is_private_to_principal() and not person.is_principal:
+    if private_turn_holds() and not person.is_principal:
         return None
     if channel == "discord":
         # Discord user ids are positive numeric snowflakes; reject a malformed
@@ -1183,11 +1292,13 @@ async def handle_send_discord_dm(tool_input: dict[str, Any]) -> str:
                 "send_discord_dm: refused user_id=%s (not in People roster)",
                 discord_user_id,
             )
-            return json.dumps({"error": (
+            blocked = json.dumps({"error": (
                 f"discord_user_id {discord_user_id!r} is not in the People roster. "
                 "Pass the person's discord_user_id from lookup_person (a long Discord "
                 "snowflake) — NOT their person_id."
             )})
+            if not _off_roster_runs():
+                return _off_roster_card(blocked, "send_discord_dm", tool_input)
 
     # Anti-spam guard: suppress duplicates / rate-cap breaches / quiet-hours sends.
     suppressed = _guard_outbound(
@@ -1266,8 +1377,13 @@ async def handle_lookup_person(tool_input: dict[str, Any]) -> str:
         "or edit people at /people."
     )
 
+    # The query as logged. On the principal's turn it may name one of their
+    # private contacts, so it is logged only once it matches someone on the
+    # team (below); the audit log is readable by every signed-in user.
+    audit_query = query
+
     def _audit(ok: bool, matches_count: int, reason: str | None = None) -> None:
-        msg = f"lookup_person query={query!r} matched {matches_count}"
+        msg = f"lookup_person query={audit_query!r} matched {matches_count}"
         if reason:
             msg += f" ({reason})"
         audit_log(
@@ -1276,7 +1392,7 @@ async def handle_lookup_person(tool_input: dict[str, Any]) -> str:
             actor="executive",
             details={
                 "tool": "lookup_person", "kind": "lookup", "ok": ok,
-                "query": query, "matches": matches_count,
+                "query": audit_query, "matches": matches_count,
             },
         )
 
@@ -1284,8 +1400,16 @@ async def handle_lookup_person(tool_input: dict[str, Any]) -> str:
         _audit(ok=True, matches_count=0, reason="empty query")
         return json.dumps({"matches": [], "hint": hint})
 
+    # Contacts, and everyone's phone numbers and addresses, only on the
+    # principal's own verified turn — the same rule as list_people. Anyone
+    # else gets the team exactly as if no contact existed.
+    from openexecutive.orchestrator.people_tools import contacts_reachable_now
+
+    private_ok = contacts_reachable_now()
+    if private_ok:
+        audit_query = ""
     try:
-        people = list_people()
+        people = list_people(include_contacts=private_ok)
     except Exception:
         logger.exception("lookup_person: list_people failed")
         _audit(ok=False, matches_count=0, reason="list_people failed")
@@ -1308,15 +1432,43 @@ async def handle_lookup_person(tool_input: dict[str, Any]) -> str:
                 "preferred_channel": p.preferred_channel,
                 "authority_scope": [s.value for s in p.authority_scope],
                 "response_sla_hours": p.response_sla_hours,
+                **({"kind": p.kind} if private_ok else {}),
+                **(
+                    {"details": [d.model_dump() for d in p.details]}
+                    if p.details and private_ok else {}
+                ),
             })
             if len(matches) >= _LOOKUP_PERSON_MAX_MATCHES:
                 break
 
+    team_matches = sum(
+        1 for p in people
+        if p.kind == "team" and (
+            query in (p.full_name or "").lower() or (p.role and query in p.role.lower())
+        )
+    )
+    if team_matches:
+        audit_query = query
+
     if not matches:
         _audit(ok=True, matches_count=0)
+        if private_ok:
+            # list_people would return no one else here: point at the next
+            # place to look for how to reach them instead.
+            hint = (
+                "No person matched the query, and nobody on People has that name "
+                "or role. To find how to reach them, look in the principal's "
+                "email, then the web, and offer to add them with upsert_person."
+            )
         return json.dumps({"matches": [], "hint": hint})
 
-    _audit(ok=True, matches_count=len(matches))
+    # The audit log is readable by every signed-in user: count the team
+    # matches only, so the principal's turn logs what anyone else's would.
+    _audit(ok=True, matches_count=min(team_matches, _LOOKUP_PERSON_MAX_MATCHES))
+    # Only names make it ambiguous: two engineers matched by role are not.
+    name_hits = sum(1 for m in matches if query in (m["full_name"] or "").lower())
+    if name_hits > 1:
+        return json.dumps({"matches": matches, "note": SEVERAL_MATCH_NOTE})
     return json.dumps({"matches": matches})
 
 
@@ -1347,12 +1499,12 @@ SUGGEST_WORKFLOW_TOOL: dict[str, Any] = {
             },
             "run_at": {
                 "type": "string",
-                "description": "ISO8601 UTC timestamp for when to send the nudge.",
+                "description": COMPANY_TIME_HINT,
             },
             "channel": {
                 "type": "string",
                 "enum": ["email", "telegram", "slack_dm"],
-                "description": "Channel to deliver via. Must match a channel the user has used in this session.",
+                "description": "Channel to deliver via.",
             },
             "channel_ref": {
                 "type": "string",
@@ -1438,6 +1590,29 @@ async def handle_message_person(tool_input: dict[str, Any]) -> str:
     return await message_person(tool_input)
 
 
+def usable_chat_ref(channel: str, channel_ref: str | None) -> bool:
+    """Whether ``channel_ref`` is an id ``message_person`` can send to on
+    ``channel``: a Discord snowflake is all digits, a Telegram chat id an
+    integer with at most one leading '-' (a group's), a Slack id anything."""
+    if not channel_ref:
+        return False
+    if channel == "discord":
+        return channel_ref.isascii() and channel_ref.isdigit()
+    if channel == "telegram":
+        digits = channel_ref[1:] if channel_ref.startswith("-") else channel_ref
+        return channel_ref.isascii() and digits.isdigit()
+    return channel == "slack"
+
+
+def _chat_candidates(person: Any) -> list[tuple[str, str | None]]:
+    """The person's chat channels as (channel, stored id) pairs, in
+    ``people.reach.reach_order``'s order."""
+    from openexecutive.people.reach import channel_id, reach_order
+
+    # A group id stays a candidate here, as before: message_person validates it.
+    return [(c, channel_id(person, c)) for c in reach_order(person, email=False, telegram_groups=True)]
+
+
 async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = True) -> str:
     """Send a DM to a rostered person, resolving the channel + real channel id
     server-side from their person_id.
@@ -1483,10 +1658,10 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
     from openexecutive.orchestrator.people_tools import (
         PRIVATE_TURN_REFUSAL,
         contacts_reachable_now,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
 
-    if turn_is_private_to_principal() and not person.is_principal:
+    if private_turn_holds() and not person.is_principal:
         return json.dumps({"error": PRIVATE_TURN_REFUSAL})
     from openexecutive.orchestrator import outside_content
 
@@ -1504,18 +1679,12 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
     configured = configured_integrations(get_settings())
 
     # Candidate channels for this person, each a (channel, the person's stored
-    # id for it) pair. Stable-sorted so preferred_channel comes first and the
-    # rest keep discord > telegram > slack order. We only route to a channel
+    # id for it) pair, in people.reach's order (their pick, else where they
+    # last talked, then Slack > Discord > Telegram). We only route to a channel
     # that is configured on this deployment AND that the person has a
     # well-formed id for (a malformed stored id is skipped, not handed to the
     # API as a misleading "bad arguments" error from the delegate).
-    candidates: list[tuple[str, str | None]] = [
-        ("discord", person.discord_user_id),
-        ("telegram", person.telegram_chat_id),
-        ("slack", person.slack_user_id),
-    ]
-    preferred = (person.preferred_channel or "").lower()
-    candidates.sort(key=lambda c: 0 if c[0] == preferred else 1)
+    candidates = _chat_candidates(person)
 
     # Try each usable channel in turn; a send failure (e.g. Discord 403 when the
     # bot can't DM that user) falls through to the next channel rather than
@@ -1524,20 +1693,13 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
     for channel, channel_ref in candidates:
         if channel not in configured or not channel_ref:
             continue
+        if not usable_chat_ref(channel, channel_ref):
+            continue  # e.g. a Discord "@handle" or a Telegram "--1"
         if channel == "discord":
-            if not (channel_ref.isascii() and channel_ref.isdigit()):
-                continue  # not a usable Discord snowflake
             result = await handle_send_discord_dm(
                 {"discord_user_id": channel_ref, "text": text}
             )
         elif channel == "telegram":
-            # Telegram chat ids are integers; group ids carry ONE leading '-'.
-            # Strip a single sign (not lstrip, which would accept "--1") and
-            # require the rest to be ascii digits, so the value round-trips
-            # through int() in the delegate.
-            digits = channel_ref[1:] if channel_ref.startswith("-") else channel_ref
-            if not (channel_ref.isascii() and digits.isdigit()):
-                continue  # not a usable Telegram chat id (e.g. "--1", "@handle")
             result = await handle_send_telegram_message(
                 {"chat_id": channel_ref, "text": text}
             )
@@ -1562,7 +1724,7 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
         # the audit log, which every signed-in user can read.
         return json.dumps({"error": (
             f"could not deliver to person_id {person_id} on any configured chat "
-            f"channel ({last_error or 'no reachable channel'}). Email them "
+            f"channel ({last_error or NO_REACHABLE_CHANNEL}). Email them "
             "instead if they have an address."
         )})
 
@@ -1571,7 +1733,7 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
         # alert is read by more people than its recipient.
         return json.dumps({"error": (
             f"could not deliver to {person.full_name!r} on any configured chat "
-            f"channel ({last_error or 'no reachable channel'})"
+            f"channel ({last_error or NO_REACHABLE_CHANNEL})"
         )})
     # No channel delivered (none usable, or every attempt failed). Don't drop
     # the finding — surface it as a briefing alert routed to that person so it
@@ -1625,24 +1787,26 @@ async def _alert_undeliverable_person(
     try:
         from openexecutive.orchestrator.alert_tools import handle_create_alert
 
+        # As written: the card carries the message, not a triage rewrite of
+        # it with other cards' topics added.
         await handle_create_alert({
             "source": "executive",
             "subject": subject,
             "body": text,
             "assigned_to_person_id": person_id,
-        })
+        }, as_written=True)
     except Exception as exc:
         logger.exception("message_person: alert fallback failed")
         return json.dumps({"error": (
             f"could not deliver to {person.full_name!r} on any configured "
-            f"channel ({last_error or 'no reachable channel'}); the alert "
+            f"channel ({last_error or NO_REACHABLE_CHANNEL}); the alert "
             f"fallback also failed: {exc}"
         )})
     return json.dumps({
         "status": "alerted",
         "reason": "dm_undeliverable",
         "person_id": person_id,
-        "detail": (last_error or "no reachable channel for this person"),
+        "detail": (last_error or f"{NO_REACHABLE_CHANNEL} for this person"),
     })
 
 
@@ -1667,15 +1831,7 @@ def resolve_person_scheduled_dm(
     ``slack_dm``) so a caller can enqueue a follow-up the runner will deliver.
     The two share the channel-validation rules; keep them in sync.
     """
-    candidates: list[tuple[str, str | None]] = [
-        ("discord", getattr(person, "discord_user_id", None)),
-        ("telegram", getattr(person, "telegram_chat_id", None)),
-        ("slack", getattr(person, "slack_user_id", None)),
-    ]
-    preferred = (getattr(person, "preferred_channel", "") or "").lower()
-    candidates.sort(key=lambda c: 0 if c[0] == preferred else 1)
-
-    for channel, channel_ref in candidates:
+    for channel, channel_ref in _chat_candidates(person):
         if channel not in configured or not channel_ref:
             continue
         if channel == "discord":
@@ -1699,6 +1855,7 @@ SCHEDULE_TOOLS: list[dict[str, Any]] = [
     LOOKUP_PERSON_TOOL,
     ACK_ALERT_TOOL,
     FIND_ALERTS_TOOL,
+    ANSWER_CARD_TOOL,
 ]
 
 
@@ -1719,6 +1876,9 @@ _DM_TOOL_INTEGRATION: dict[str, str] = {
 
 # Channel values that can appear in a broadcast tool's `integration` enum.
 _CHANNEL_INTEGRATIONS: frozenset[str] = frozenset({"slack", "discord", "telegram"})
+# The chat apps the broadcast tools post to: the DM channels, plus Google
+# Chat, whose app posts in its spaces (``broadcast_tools.INTEGRATIONS``).
+_POST_INTEGRATIONS: frozenset[str] = _CHANNEL_INTEGRATIONS | {"google_chat"}
 
 
 def configured_integrations(settings: Any) -> set[str]:
@@ -1730,11 +1890,14 @@ def configured_integrations(settings: Any) -> set[str]:
         configured.add("discord")
     if getattr(settings, "telegram_bot_token", None):
         configured.add("telegram")
-    # Calendar is enabled when the feature flag is true AND MCP is running.
+    if getattr(settings, "google_chat_project_number", None):
+        configured.add("google_chat")
+    # Calendar: booking on, MCP running and the calendar really loaded.
     # Import lazily to avoid circular imports.
-    if getattr(settings, "calendar_booking_enabled", False) and getattr(settings, "mcp_enabled", False):
-        from openexecutive.orchestrator.mcp_gateway import get_active_gateway
-        if get_active_gateway() is not None:
+    if getattr(settings, "mcp_enabled", False):
+        from openexecutive.orchestrator.calendar_tools import calendar_connected
+
+        if calendar_connected(settings):
             configured.add("calendar")
     return configured
 
@@ -1827,6 +1990,9 @@ UNATTENDED_WITHHELD_TOOLS: frozenset[str] = frozenset({
     # Library work on files (workflows/python_job.py): the principal's own
     # turns only; research synthesis and reflection build from the full list.
     "run_python_job",
+    # Saving files into the company's Drive (orchestrator/file_tools.py): the
+    # principal asks for it, never stored text.
+    "save_file",
     # Its sibling, for the reason this whole set exists: an unattended run's
     # context is stored or inbound text with nobody watching, and run_script
     # turns one instruction in it into a program spending the run's own tool
@@ -1846,6 +2012,16 @@ UNATTENDED_WITHHELD_TOOLS: frozenset[str] = frozenset({
     "remember_fact",
     "resolve_roster_request",
     "update_company_profile",
+    # A figure kept for the person (orchestrator/figure_tools.py): their own
+    # turn only, never stored text with nobody watching.
+    "keep_figure",
+    # Answers a Needs you card as the person (orchestrator/card_answers.py).
+    "answer_card",
+    # App control (orchestrator/app_control.py) acts as the person asking, and
+    # its cards wait for their tap: nobody is there to ask or to tap.
+    "do_in_app",
+    "find_in_app",
+    "open_in_app",
 })
 
 
@@ -1892,6 +2068,8 @@ def unattended_withheld_error(tool_name: str) -> str:
 #   its retirement) and the company profile are read on everyone's turns and
 #   in every brief. They also refuse any surface but the principal's verified
 #   ones, which email is not.
+# - keep_figure: a figure is kept only from a verified speaker's own private
+#   conversation, which an email turn is not.
 # Still offered: the email, DM and invite paths reach the principal and
 # refuse anyone else (`people_tools.PRIVATE_TURN_REFUSAL`, the gateway's
 # allow-list), and an alert the turn raises is private to the principal. The
@@ -1911,6 +2089,7 @@ PRIVATE_TURN_WITHHELD_TOOLS: frozenset[str] = frozenset({
     "create_instant_meeting",
     "draft_artifact",
     "forget_fact",
+    "keep_figure",
     "load_mcp_server",
     "read_document",
     "remember_fact",
@@ -1919,6 +2098,7 @@ PRIVATE_TURN_WITHHELD_TOOLS: frozenset[str] = frozenset({
     # each of its calls would be checked, but the turn is simply not offered it.
     "run_script",
     "run_python_job",
+    "save_file",
     "list_saved_tools",
     "run_workflow",
     "save_workflow",
@@ -2050,13 +2230,11 @@ def private_turn_withheld_error(tool_name: str) -> str:
     })
 
 
-# What a turn asked from another AI app over Open Executive's own MCP server
-# (`Session.from_mcp_client`, set by `mcp_server.ask_executive`) is never
-# offered. Such a turn reads and advises; it never sends, posts, books,
-# schedules, runs or changes anything, because nobody is in Open Executive to
-# see it happen and the other app's text is whatever that app put there. It
-# starts from everything a turn private to the principal and an unattended
-# run are denied, and adds every other tool that reaches someone or writes:
+# What a turn that may only read and advise (``read_only_turn``: a page in
+# another app, or a scheduled run a teammate queued) is never offered: it
+# never sends, posts, books, schedules, runs or changes anything. It starts
+# from everything a turn private to the principal and an unattended run are
+# denied, and adds every other tool that reaches someone or writes:
 # - message_person, send_slack_dm, send_discord_dm, send_telegram_message:
 #   direct messages.
 # - ack_alert, create_alert, leave_out_of_brief: change the briefing.
@@ -2065,16 +2243,16 @@ def private_turn_withheld_error(tool_name: str) -> str:
 # - remove_watchlist_entry, tune_watchlist_entry: monitoring writes.
 # - draft_workflow: drafts a definition only save_workflow (withheld) keeps.
 # - propose_form_values: fills a form on a screen this turn has none of.
-# The Act as me tools (`propose_actions`, `ghostwrite_email`, the mailbox
-# reads), recall_history and extension tools are not offered either: the chat
-# loop leaves those registries out of such a turn. Of the gateway tools, only
-# the reads in `MCP_CLIENT_MCP_TOOLS`. The loop drops this set before the
-# sort, so the variant has a stable tool prefix of its own, and refuses a call
-# the model emits anyway (`mcp_client_withholds`, `mcp_client_withheld_error`).
-MCP_CLIENT_WITHHELD_TOOLS: frozenset[str] = PRIVATE_TURN_WITHHELD_TOOLS | UNATTENDED_WITHHELD_TOOLS | frozenset({
+# The Act as me tools, recall_history and extension tools are not offered
+# either. Of the gateway tools, only the reads in `READ_ONLY_MCP_TOOLS`. A
+# call the model emits anyway waits on the owner's card (`levels.READ_ONLY`).
+READ_ONLY_WITHHELD_TOOLS: frozenset[str] = PRIVATE_TURN_WITHHELD_TOOLS | UNATTENDED_WITHHELD_TOOLS | frozenset({
     "ack_alert",
+    "answer_card",
     "archive_person",
     "close_open_loop",
+    "reopen_open_loop",
+    "update_open_loop",
     "create_alert",
     "draft_workflow",
     "leave_out_of_brief",
@@ -2091,57 +2269,71 @@ MCP_CLIENT_WITHHELD_TOOLS: frozenset[str] = PRIVATE_TURN_WITHHELD_TOOLS | UNATTE
 
 # The gateway tools such a turn may call: the private-turn reads, without the
 # mail tools that send or leave a draft in a mailbox.
-MCP_CLIENT_MCP_TOOLS: frozenset[str] = PRIVATE_TURN_MCP_TOOLS - frozenset({
+READ_ONLY_MCP_TOOLS: frozenset[str] = PRIVATE_TURN_MCP_TOOLS - frozenset({
     "google_workspace__draft_gmail_message",
     "google_workspace__send_gmail_message",
     "microsoft_365__create-draft-email",
     "microsoft_365__send-mail",
 })
 
-MCP_CLIENT_REFUSAL = (
-    "This conversation comes from another AI app, so here you can read and "
-    "advise but can't send, post, book or change anything. Tell the person to "
-    "ask for it in Open Executive itself."
+READ_ONLY_REFUSAL = (
+    "On this turn you can read and advise but can't send, post, book or "
+    "change anything. Tell the person to ask for it in Open Executive itself."
 )
 
 
+HOST_REFUSAL = (
+    "This conversation was written in, at least in part, from a page another "
+    "app shows, so in it you can read and advise but can't send, post, book or "
+    "change anything. Tell the person to start a new chat in Open Executive "
+    "itself and ask there."
+)
+
+def host_turn(session: Any) -> bool:
+    """Whether ``session`` is a web chat turn a host origin's page sent
+    (``Session.from_host``)."""
+    return session is not None and getattr(session, "from_host", False) is True
+
+
 def read_only_turn(session: Any) -> bool:
-    """Whether ``session`` may only read and advise: a turn from another AI
-    app (``Session.from_mcp_client``), or a scheduled run a teammate queued
+    """Whether ``session`` may only read and advise: a turn a host origin's
+    page sent (``Session.from_host``), or a scheduled run a teammate queued
     (``Session.run_for_person_id``), whose text is theirs and whose message
-    the scheduler sends itself. Both are denied ``MCP_CLIENT_WITHHELD_TOOLS``
-    and every gateway tool outside ``MCP_CLIENT_MCP_TOOLS``."""
+    the scheduler sends itself. Both are denied ``READ_ONLY_WITHHELD_TOOLS``
+    and every gateway tool outside ``READ_ONLY_MCP_TOOLS``. Another AI app's
+    turn is not: it is the signed-in person's own (``mcp_server``), and
+    Approvals decides each of its steps like the web chat's."""
     if session is None:
         return False
-    if getattr(session, "from_mcp_client", False) is True:
+    if host_turn(session):
         return True
     run_for = getattr(session, "run_for_person_id", None)
     return isinstance(run_for, int) and not isinstance(run_for, bool)
 
 
-def mcp_client_allows_mcp_tool(tool_name: object) -> bool:
-    """Whether a turn from another AI app may call the gateway tool
-    ``tool_name``: one of ``MCP_CLIENT_MCP_TOOLS``, and nothing else."""
-    return isinstance(tool_name, str) and tool_name in MCP_CLIENT_MCP_TOOLS
+def read_only_allows_mcp_tool(tool_name: object) -> bool:
+    """Whether a read-only turn may call the gateway tool ``tool_name``: one
+    of ``READ_ONLY_MCP_TOOLS``, and nothing else."""
+    return isinstance(tool_name, str) and tool_name in READ_ONLY_MCP_TOOLS
 
 
-def mcp_client_withholds(tool_name: str, tool_input: Any) -> bool:
-    """Whether a turn from another AI app may not run this tool use: a tool
-    in ``MCP_CLIENT_WITHHELD_TOOLS``, or a gateway ``call_tool`` naming
-    anything but ``MCP_CLIENT_MCP_TOOLS`` or a OneDrive file read."""
-    if tool_name in MCP_CLIENT_WITHHELD_TOOLS:
+def read_only_withholds(tool_name: str, tool_input: Any) -> bool:
+    """Whether a read-only turn may not run this tool use: a tool in
+    ``READ_ONLY_WITHHELD_TOOLS``, or a gateway ``call_tool`` naming anything
+    but ``READ_ONLY_MCP_TOOLS`` or a OneDrive file read."""
+    if tool_name in READ_ONLY_WITHHELD_TOOLS:
         return True
     if tool_name != "call_tool":
         return False
     named = tool_input.get("name") if isinstance(tool_input, dict) else None
-    return not (mcp_client_allows_mcp_tool(named) or is_onedrive_file_read(tool_input))
+    return not (read_only_allows_mcp_tool(named) or is_onedrive_file_read(tool_input))
 
 
-def mcp_client_withheld_error(tool_name: str) -> str:
-    """The JSON error tool_result for a call a turn from another AI app may
-    not make."""
+def read_only_withheld_error(tool_name: str) -> str:
+    """The JSON error tool_result for a call a read-only turn may not make."""
+    refusal = HOST_REFUSAL if host_turn(current_session.get()) else READ_ONLY_REFUSAL
     return json.dumps({
-        "error": f"{tool_name} is not available on this turn. {MCP_CLIENT_REFUSAL} Do not retry."
+        "error": f"{tool_name} is not available on this turn. {refusal} Do not retry."
     })
 
 
@@ -2160,7 +2352,11 @@ def mcp_client_withheld_error(tool_name: str) -> str:
 # acts later with the full tool set, past this turn's check. A fixed set, so
 # the variant keeps a stable tool prefix of its own.
 SHARED_CHAT_WITHHELD_TOOLS: frozenset[str] = frozenset({
+    # A Needs you card is answered by its person, not by whoever wrote here.
+    "answer_card",
     "archive_person",
+    # Changes in the app as the owner: their word, not a guest's.
+    "do_in_app",
     # Invites and cancellations mail the attendees.
     "cancel_calendar_event",
     "create_calendar_event",
@@ -2338,13 +2534,13 @@ def filter_tools_for_configured_channels(
             .get("integration", {})
             .get("enum")
         )
-        if isinstance(enum_vals, list) and (set(enum_vals) & _CHANNEL_INTEGRATIONS):
+        if isinstance(enum_vals, list) and (set(enum_vals) & _POST_INTEGRATIONS):
             narrowed = [
                 v
                 for v in enum_vals
-                if v not in _CHANNEL_INTEGRATIONS or v in configured
+                if v not in _POST_INTEGRATIONS or v in configured
             ]
-            if not (set(narrowed) & _CHANNEL_INTEGRATIONS):
+            if not (set(narrowed) & _POST_INTEGRATIONS):
                 # No channel left to post on — the tool can't do anything.
                 continue
             if narrowed == enum_vals:
@@ -2433,12 +2629,9 @@ async def handle_suggest_workflow(tool_input: dict[str, Any]) -> str:
     if channel not in {"email", "telegram", "slack_dm"}:
         return json.dumps({"error": f"unknown channel {channel!r}"})
 
-    try:
-        parsed = datetime.fromisoformat(run_at_raw.replace("Z", "+00:00"))
-    except ValueError:
-        return json.dumps({"error": f"run_at not parseable as ISO8601: {run_at_raw!r}"})
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+    parsed = company_time(run_at_raw)
+    if parsed is None:
+        return json.dumps({"error": f"run_at {run_at_raw!r} can't be read. {COMPANY_TIME_HINT}"})
     parsed_utc = parsed.astimezone(UTC)
 
     now = datetime.now(UTC)
@@ -2453,16 +2646,6 @@ async def handle_suggest_workflow(tool_input: dict[str, Any]) -> str:
         })
 
     session = current_session.get()
-    seen: set[tuple[str, str]] | None = (
-        getattr(session, "seen_channel_refs", None) if session is not None else None
-    )
-    if seen is not None and (channel, channel_ref) not in seen:
-        return json.dumps({
-            "error": (
-                f"channel_ref {channel_ref!r} on channel {channel!r} was not seen in this "
-                f"session — refusing to schedule."
-            ),
-        })
 
     pending = count_pending_for_channel_ref(channel, channel_ref)
     if pending >= settings.max_pending_per_channel_ref:
@@ -2586,6 +2769,7 @@ def _may_search_alerts(session: Any) -> bool:
     return bool(
         session is not None
         and getattr(session, "principal_board_shown", False)
+        and getattr(session, "answering_card", None) is None
         and not getattr(session, "unattended", False)
         and not getattr(session, "email_from", "")
         and is_principal_on_verified_surface(session)
@@ -2657,11 +2841,13 @@ async def handle_find_alerts(tool_input: dict[str, Any]) -> str:
 
     # A teammate's drafted artifact is theirs alone, the principal's search
     # included.
+    from openexecutive.alerts import own_chat
     from openexecutive.alerts.models import visible_alert
     from openexecutive.orchestrator.artifact_records import current_viewer
 
     viewer = current_viewer()
-    matches = [a for a in matches if visible_alert(a, viewer)]
+    own = own_chat.readers(matches)  # once for the list, not once per card
+    matches = [a for a in matches if visible_alert(a, viewer, own_chat_readers=own)]
 
     found: set[int] = session.found_alert_ids
     trusted: set[int] = session.trusted_alert_ids
@@ -2831,4 +3017,5 @@ SCHEDULE_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] = 
     "lookup_person": handle_lookup_person,
     "ack_alert": handle_ack_alert,
     "find_alerts": handle_find_alerts,
+    "answer_card": handle_answer_card,
 }

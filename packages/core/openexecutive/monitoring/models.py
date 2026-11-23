@@ -31,6 +31,11 @@ SOURCE_KIND_EDGAR = "edgar"
 # and emits a Signal when it changes vs the last poll; watches feed-less pages
 # (pricing, careers, leadership). Stateful (see monitoring.store page_watch_state).
 SOURCE_KIND_PAGE_WATCH = "page_watch"
+# One person's own inbox (Act as me's mailbox: Gmail or Outlook): tells them
+# every time an email comes in from a sender they named, or whose subject or
+# sender says one of their words. Private to that person
+# (``monitoring.mailbox``); never a company-wide watch.
+SOURCE_KIND_MAILBOX = "mailbox"
 
 # page_watch fetch-source marker. Every page_watch row is now fetched with the
 # keyless httpx fetcher; rows written before the xcrawl scrape path was removed
@@ -88,6 +93,12 @@ EXPLICIT_DECLINE_REASONS = frozenset({
     DECLINE_REASON_NOT_RELEVANT, DECLINE_REASON_TOO_NOISY, DECLINE_REASON_WRONG_SOURCE,
 })
 
+# Trigger key every source understands: tell the person only about big
+# changes. It is the one way a watch is made quieter beyond its own trigger,
+# and it is part of the "Tells you when" sentence the person reads, so what
+# holds a change back is always what the watch says about itself.
+TRIGGER_ONLY_BIG = "only_big"
+
 # Watchlist row "cadence" hints — used by the briefing/digest layer in
 # PR-C to decide whether a signal surfaces real-time vs in a digest.
 # Kept as opaque strings here; pipeline ignores them in PR-A.
@@ -117,6 +128,10 @@ class WatchlistItem(BaseModel):
     config_json: dict[str, Any] = Field(default_factory=dict)
     trigger_json: dict[str, Any] = Field(default_factory=dict)
     cadence: str = "15min"
+    # Kept on the row but no longer a filter: the pipeline never holds a
+    # change back for being under the floor. A watch tells the person
+    # whenever its trigger is met (see TRIGGER_ONLY_BIG for the quieter
+    # version). The ceiling still caps the severity recorded on a signal.
     severity_floor: AlertSeverity = AlertSeverity.LOW
     severity_ceiling: AlertSeverity = AlertSeverity.URGENT
     route_to_specialist: str = ""
@@ -138,6 +153,13 @@ class WatchlistItem(BaseModel):
     trust_score: float = 1.0  # 0..1, decays on dismiss; full trust at creation
     notes: str = ""
     origin: str = ORIGIN_MANUAL
+    # The goal this watch is for (``department_goals.id``), when it has one.
+    # Who it is for is ``route_to_person_id`` (None = the principal).
+    goal_id: int | None = None
+    # What the last check found, in plain words, and why it stayed quiet
+    # when it did ("Down 1.1% today. Under 5%, so it stayed quiet."). Written
+    # by the scan after every poll; "" until the first one.
+    last_check_note: str = ""
 
 
 class WatchlistDecline(BaseModel):
@@ -206,13 +228,20 @@ class Signal(BaseModel):
 # overnight" is a simple SQL query.
 OUTCOME_ALERTED = "alerted"
 OUTCOME_SUPPRESSED_DRY_RUN = "suppressed_dry_run"
-OUTCOME_SUPPRESSED_BELOW_FLOOR = "suppressed_below_floor"
+OUTCOME_SUPPRESSED_BELOW_FLOOR = "suppressed_below_floor"  # see note below
 OUTCOME_SUPPRESSED_DUP = "suppressed_dup"
 OUTCOME_SUPPRESSED_TRIAGE = "suppressed_triage"
+# Held back because the watch asks for big changes only (TRIGGER_ONLY_BIG)
+# and this one was not graded big. The name predates that: it used to mean
+# "under the row's severity floor", a second filter that no longer exists.
 # Captured + enriched, but the capture-time relevance score fell below the
 # configured floor (external_monitor_enrichment_min_relevance). Recorded, not
 # promoted — the gate is opt-in (default threshold 0.0 = off) until calibrated.
 OUTCOME_SUPPRESSED_LOW_RELEVANCE = "suppressed_low_relevance"
+# Captured + enriched, and the watch's notes (what the person told it, often
+# from a reply on one of its cards: monitoring/steer.py) say to skip a change
+# like this. Recorded, never promoted.
+OUTCOME_SUPPRESSED_BY_NOTES = "suppressed_by_notes"
 # Recorded on the FIRST poll of a feed-listing source (rss, edgar): every
 # entry already in the feed is persisted as "seen" so dedup covers it, but
 # nothing is promoted — the watch reports what changes from now on, not
@@ -222,9 +251,23 @@ OUTCOME_SUPPRESSED_BASELINE = "suppressed_baseline"
 # at capture time. Persisted for the audit trail + dedup; never promoted.
 OUTCOME_SUPPRESSED_STALE = "suppressed_stale"
 OUTCOME_FAILED = "failed"
+# A page_watch change that cleared every gate while its watch had already
+# alerted within PAGE_WATCH_DIGEST_HOURS. Held, not dropped: the next scan
+# after the window folds every held change into ONE alert (the daily digest
+# for a busy page), and each held row then moves to ``alerted``.
+OUTCOME_HELD_DIGEST = "held_digest"
+# A watch set to Watch quietly (MODE_DRY_RUN, not a suggestion): never a card;
+# the change goes in the next brief instead (``EVENT_QUIET_FIND``).
+OUTCOME_HELD_BRIEF = "held_brief"
+# The audit row a quiet watch's find writes; the brief reads it as one of the
+# things it handled (briefing.brief_state.HANDLED_EVENT_KINDS).
+EVENT_QUIET_FIND = "watch_found_quietly"
+PAGE_WATCH_DIGEST_HOURS = 24
 
 _VALID_OUTCOMES = frozenset({
     OUTCOME_ALERTED,
+    OUTCOME_HELD_DIGEST,
+    OUTCOME_HELD_BRIEF,
     OUTCOME_SUPPRESSED_BASELINE,
     OUTCOME_SUPPRESSED_STALE,
     OUTCOME_SUPPRESSED_DRY_RUN,
@@ -232,6 +275,7 @@ _VALID_OUTCOMES = frozenset({
     OUTCOME_SUPPRESSED_DUP,
     OUTCOME_SUPPRESSED_TRIAGE,
     OUTCOME_SUPPRESSED_LOW_RELEVANCE,
+    OUTCOME_SUPPRESSED_BY_NOTES,
     OUTCOME_FAILED,
 })
 

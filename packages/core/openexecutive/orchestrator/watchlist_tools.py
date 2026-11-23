@@ -18,9 +18,10 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from openexecutive.alerts.models import AlertSeverity
 from openexecutive.audit import log_event as audit_log
+from openexecutive.monitoring import mailbox
 from openexecutive.monitoring import store as ms
+from openexecutive.monitoring.describe import trigger_line, watch_title
 from openexecutive.monitoring.models import (
     DECLINE_KIND_EXPLICIT,
     DECLINE_REASON_NOT_RELEVANT,
@@ -29,6 +30,8 @@ from openexecutive.monitoring.models import (
     ORIGIN_EXECUTIVE,
     ORIGIN_RESEARCH_PROPOSED,
     RESEARCH_ORIGINS,
+    SOURCE_KIND_MAILBOX,
+    SOURCE_KIND_PAGE_WATCH,
     is_valid_cadence,
     is_valid_mode,
 )
@@ -36,15 +39,13 @@ from openexecutive.monitoring.sources import list_registered_kinds
 from openexecutive.monitoring.sources._http import validate_target_url
 from openexecutive.monitoring.target_validation import (
     WatchlistTargetError,
+    page_watch_target_problem,
     validate_and_normalize_target,
-)
-from openexecutive.monitoring.validation import (
-    VALID_SEVERITY_VALUES as _VALID_SEVERITY_VALUES,
 )
 from openexecutive.monitoring.validation import (
     WATCHLIST_SLUG_RE as _SLUG_RE,
 )
-from openexecutive.monitoring.validation import normalize_target
+from openexecutive.monitoring.validation import display_label_config, normalize_target
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,11 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
         "the principal asks the Executive to watch a stock ticker, a vendor "
         "status page, an RSS / Atom feed, a competitor's changelog, or a "
         "standing web-search query (e.g. 'Acme Corp layoffs OR funding') for "
-        "developments that no single feed publishes."
+        "developments that no single feed publishes. Also the person's own "
+        "inbox (signal_type 'mailbox'): \"tell me every time a sign-up email "
+        "comes in\", \"let me know when Pat replies\". It tells them about "
+        "every email that matches, until they turn it off; never answer that "
+        "with a reminder or a scheduled check."
     ),
     "input_schema": {
         "type": "object",
@@ -88,7 +93,7 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                 "type": "string",
                 "enum": [
                     "vendor_status", "rss", "stock", "query", "edgar",
-                    "page_watch",
+                    "page_watch", "mailbox",
                 ],
                 "description": (
                     "Which adapter handles this entry. vendor_status polls "
@@ -100,7 +105,8 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "company's new filings (8-K / 10-K / 10-Q / Form 4) by "
                     "ticker or CIK; page_watch detects content changes on an "
                     "arbitrary web page that has no feed (e.g. a pricing or "
-                    "careers page)."
+                    "careers page); mailbox reads the person's own inbox "
+                    "(Act as me) and tells them about each email that matches."
                 ),
             },
             "target": {
@@ -111,6 +117,8 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "For query: the natural-language search to watch "
                     "(e.g. 'Acme Corp layoffs OR restructuring OR funding'). "
                     "For edgar: a ticker (e.g. 'AAPL') or CIK (e.g. '320193'). "
+                    "For mailbox: what it watches for, in their words "
+                    "(e.g. 'sign-up emails', 'Pat's reply'). "
                     "URLs must be public http/https — the SSRF guard "
                     "rejects file://, private IPs, link-local, etc."
                 ),
@@ -132,35 +140,42 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "{'keywords': ['pricing', 'launch']} fires only on "
                     "matching entries. For edgar: {'forms': ['8-K', '10-K']} "
                     "limits to those filing types (default 8-K/10-K/10-Q). "
-                    "Pass {} for the per-adapter default."
+                    "For mailbox (required, at least one): {'from': "
+                    "['pat@example.com']} for mail from those senders, "
+                    "{'keywords': ['sign up', 'signed up']} for mail whose "
+                    "subject or sender names one; both means both. Words "
+                    "are matched as written, so list the few ways the "
+                    "subject could say it. "
+                    "Add 'only_big': true (any type but stock) only when the "
+                    "principal wants to hear about big changes only. The "
+                    "trigger is the one filter: whatever meets it is told to "
+                    "them. Pass {} for the per-adapter default."
                 ),
             },
             "cadence": {
                 "type": "string",
                 "enum": ["real_time", "15min", "hourly", "daily", "weekly"],
                 "description": (
-                    "Desired surfacing cadence label. Stored as metadata; "
-                    "PR-C uses this to bucket signals into morning brief vs "
-                    "real-time DM. Defaults to '15min'."
+                    "How often to check. Never faster than the source "
+                    "allows. Defaults to '15min' ('real_time' for mailbox)."
                 ),
             },
-            "severity_floor": {
-                "type": "string",
-                "enum": ["low", "medium", "high", "urgent"],
+            "for_goal_id": {
+                "type": "integer",
                 "description": (
-                    "Suppress signals BELOW this severity. The adapter "
-                    "computes a per-signal severity_hint; signals below the "
-                    "floor are recorded in audit but never promoted to an "
-                    "alert. Defaults to 'low' (everything surfaces)."
+                    "The id of the goal this watch serves, from "
+                    "list_department_goals. Set it whenever the watch is "
+                    "there because of a goal."
                 ),
             },
-            "severity_ceiling": {
-                "type": "string",
-                "enum": ["low", "medium", "high", "urgent"],
+            "for_person_id": {
+                "type": "integer",
                 "description": (
-                    "Cap signal severity at this level. Useful for noisy "
-                    "sources where you want acknowledgements but never a "
-                    "real-time DM. Defaults to 'urgent' (no cap)."
+                    "The People id of the teammate this watch is for: what "
+                    "it finds is told to them. Leave out for the person "
+                    "asking (a teammate's own watch tells them; otherwise "
+                    "the principal). An email watch always tells the person "
+                    "whose inbox it reads, so it has no effect on one."
                 ),
             },
             "route_to_specialist": {
@@ -176,10 +191,11 @@ ADD_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                 "type": "string",
                 "enum": ["active", "dry_run"],
                 "description": (
-                    "'active' (default) surfaces signals normally. "
-                    "'dry_run' captures + scores but never promotes — use "
-                    "this when adding a new source you want to calibrate "
-                    "before the principal sees the noise."
+                    "'active' (default) tells the person on a card when its "
+                    "trigger is met. 'dry_run' is Watch quietly: never a "
+                    "card; what it finds goes only in their next brief. Use "
+                    "it when they ask to hear about it only in the brief, or "
+                    "quietly."
                 ),
             },
             "notes": {
@@ -197,8 +213,9 @@ LIST_WATCHLIST_TOOL: dict[str, Any] = {
     "description": (
         "List external-monitor watchlist entries. Use to resolve a slug or "
         "answer 'what are we currently watching?'. Returns a compact JSON "
-        "list including slug, signal_type, target, mode, severity_floor, "
-        "fired_count, and last_polled_at."
+        "list including slug, title, signal_type, target, mode, "
+        "tells_you_when, last_check (what the last check found), "
+        "for_goal_id, for_person_id, fired_count, and last_polled_at."
     ),
     "input_schema": {
         "type": "object",
@@ -207,7 +224,7 @@ LIST_WATCHLIST_TOOL: dict[str, Any] = {
                 "type": "string",
                 "enum": [
                     "vendor_status", "rss", "stock", "query", "edgar",
-                    "page_watch",
+                    "page_watch", "mailbox",
                 ],
                 "description": "Filter by adapter kind. Omit for all kinds.",
             },
@@ -253,8 +270,10 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
     "name": "tune_watchlist_entry",
     "description": (
         "Modify an existing watchlist entry. Use to disable a noisy source, "
-        "raise the severity floor, flip into dry_run mode, or change the "
-        "trigger threshold. Pass only the fields you want to change."
+        "flip into dry_run mode (Watch quietly: only in the brief, never a card), change the trigger (its threshold, keywords, "
+        "or 'only_big': true for big changes only), set the goal or "
+        "person it is for, or rewrite its notes when the person corrects it. "
+        "Pass only the fields you want to change."
     ),
     "input_schema": {
         "type": "object",
@@ -267,15 +286,18 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
             "mode": {
                 "type": "string",
                 "enum": ["active", "dry_run"],
-                "description": "Switch between active surfacing and dry-run capture.",
+                "description": "'active' tells the person on a card; 'dry_run' (Watch quietly) puts it only in their next brief.",
             },
-            "severity_floor": {
-                "type": "string",
-                "enum": ["low", "medium", "high", "urgent"],
+            "for_goal_id": {
+                "type": ["integer", "null"],
+                "description": "Goal id this watch serves (list_department_goals); null clears it.",
             },
-            "severity_ceiling": {
-                "type": "string",
-                "enum": ["low", "medium", "high", "urgent"],
+            "for_person_id": {
+                "type": ["integer", "null"],
+                "description": (
+                    "People id of the teammate it is for; null means the principal. "
+                    "No effect on an email watch, which tells only the person whose inbox it reads."
+                ),
             },
             "cadence": {
                 "type": "string",
@@ -289,7 +311,17 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
                     "merge — keep all fields you want preserved)."
                 ),
             },
-            "notes": {"type": "string"},
+            "notes": {
+                "type": "string",
+                "description": (
+                    "What you know about this watch (its What I know). Every "
+                    "check reads it before deciding whether to tell anyone, so "
+                    "when the person corrects a watch (e.g. 'that's our own "
+                    "repo, skip it') put it here: keep what still holds, add "
+                    "the correction, short lines. Replaces the whole note "
+                    "(max ~500 chars)."
+                ),
+            },
         },
         "required": ["slug"],
     },
@@ -323,7 +355,11 @@ PROPOSE_WATCH_TOOL: dict[str, Any] = {
                 "description": (
                     "Concrete, real target: a ticker (stock/edgar), a feed or page URL "
                     "taken from a finding's urls (rss/vendor_status/page_watch), or a "
-                    "search query (query). Never invent a URL."
+                    "search query (query). Never invent a URL. For a news source, "
+                    "watch the page that lists new items (a news, insights or press "
+                    "page) or its RSS feed: never one article, a PDF or other "
+                    "document, or a social profile (those never change and are "
+                    "refused)."
                 ),
             },
             "grounding_entity": {
@@ -354,7 +390,18 @@ PROPOSE_WATCH_TOOL: dict[str, Any] = {
                     "'unsure' can only turn an add into a suggestion — never the reverse."
                 ),
             },
-            "display_label": {"type": "string"},
+            "display_label": {
+                "type": "string",
+                "description": "The source's plain name, as a person would say it, e.g. 'GitHub status'.",
+            },
+            "card_line": {
+                "type": "string",
+                "description": (
+                    "One short line the principal reads on the approval card: the plain name, a colon, and why "
+                    "it matters to the company, under 15 words, no ids, codes or jargon. E.g. 'GitHub status: "
+                    "outages could break our deploys.'"
+                ),
+            },
             "trigger": {"type": "object", "description": "Optional adapter trigger; policy adds quiet defaults."},
             "route_to_specialist": {"type": "string"},
         },
@@ -378,12 +425,17 @@ WATCHLIST_TOOLS: list[dict[str, Any]] = [
 # --------------------------------------------------------------------- #
 
 
-def _audit(tool: str, ok: bool, summary: str, details: dict[str, Any]) -> None:
+def _audit(
+    tool: str, ok: bool, summary: str, details: dict[str, Any], privacy: dict[str, Any] | None = None,
+) -> None:
+    """``privacy``: an email watch's rows are its owner's alone
+    (``mailbox.audit_privacy``)."""
     audit_log(
         "tool_invocation",
         summary,
         actor="executive",
         details={"tool": tool, "ok": ok, **details},
+        **(privacy or {}),
     )
 
 
@@ -395,21 +447,6 @@ def _err(tool: str, msg: str) -> str:
 # --------------------------------------------------------------------- #
 # Handlers
 # --------------------------------------------------------------------- #
-
-
-def _display_label_config(signal_type: str, display_label: Any) -> dict[str, Any]:
-    """Map the user-facing label onto the adapter-specific config key."""
-    config: dict[str, Any] = {}
-    if display_label:
-        if signal_type == "vendor_status":
-            config["vendor_label"] = display_label
-        elif signal_type == "rss":
-            config["feed_label"] = display_label
-        elif signal_type == "stock":
-            config["display_name"] = display_label
-        elif signal_type in ("query", "edgar", "page_watch"):
-            config["label"] = display_label
-    return config
 
 
 async def _validated_target(
@@ -438,6 +475,8 @@ async def _validated_target(
     if not isinstance(trigger, dict):
         return _err(tool, "trigger must be a JSON object")
 
+    if signal_type == SOURCE_KIND_MAILBOX:
+        slug = mailbox.own_slug(slug)
     if ms.get_watchlist_item_by_slug(slug) is not None:
         return _err(tool, f"slug {slug!r} already exists; use tune_watchlist_entry to modify")
 
@@ -450,7 +489,7 @@ async def _validated_target(
         if not ok:
             return _err(tool, f"target {target!r} is not a fetchable public URL: {reason}")
 
-    config = _display_label_config(signal_type, tool_input.get("display_label"))
+    config = display_label_config(signal_type, tool_input.get("display_label"))
     # Validate the target before it lands: a non-feed rss URL is converted
     # to a page_watch (when the page has readable text) or rejected, so the
     # research workflow can't seed the watchlist with dead feed rows.
@@ -463,18 +502,174 @@ async def _validated_target(
     return slug, signal_type, target, config, trigger
 
 
+def _principal_asked() -> bool:
+    from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    return is_principal_on_verified_surface(current_session.get())
+
+
+def _teammate_asking() -> Any:
+    """The rostered teammate asking on a surface that verified them, else
+    None (``people_tools.teammate_on_verified_surface``). Fails closed."""
+    from openexecutive.orchestrator.people_tools import teammate_on_verified_surface
+    from openexecutive.orchestrator.schedule_tools import current_session
+
+    try:
+        return teammate_on_verified_surface(current_session.get())
+    except Exception:
+        logger.warning("watchlist_tools: teammate lookup failed", exc_info=True)
+        return None
+
+
+def _default_person(for_ids: dict[str, int | None]) -> int | None:
+    """Who a new watch tells: the person the call named, else the teammate
+    who asked for it (what it finds is theirs), else the principal (None)."""
+    if "route_to_person_id" in for_ids:
+        return for_ids["route_to_person_id"]
+    teammate = _teammate_asking()
+    return getattr(teammate, "id", None) if teammate is not None else None
+
+
+def _speaker_id() -> int | None:
+    """The People id of whoever this turn is for, when a surface verified
+    them (a teammate, or the principal), else None."""
+    teammate = _teammate_asking()
+    if teammate is not None:
+        return getattr(teammate, "id", None)
+    if _principal_asked():
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+        return principal.id if principal is not None else None
+    return None
+
+
+def _shown(item: Any) -> bool:
+    """Whether the person this turn is for may see this watch: an email
+    watch is its owner's alone (``monitoring.mailbox.shown_to``)."""
+    return item is not None and mailbox.shown_to(item, _speaker_id())
+
+
+async def _own_mailbox(
+    tool: str, trigger: dict[str, Any], config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | str:
+    """``(config, trigger)`` for an email watch on the speaker's own inbox,
+    or the JSON string to return. Whose inbox is never an argument: it is
+    the speaker's, through Act as me (``delegation_tools._writer``)."""
+    from openexecutive.delegation.gmail import STATUS_MESSAGES, gmail_status
+    from openexecutive.orchestrator.delegation_tools import _writer
+
+    writer = _writer(tool)
+    if isinstance(writer, str):
+        # Their mailbox can't be opened in this conversation (Act as me off,
+        # a shared channel, an unattended turn, no one to say whose it is):
+        # a plain reason of its own, not the writer's "not available, do not
+        # retry", with words for the reply that never blame "a tool" or ask
+        # them to try again in a new chat.
+        return json.dumps({"error": "No watch was set: their inbox can't be opened here.", "note": NOT_HERE_NOTE})
+    cleaned = mailbox.clean_trigger(trigger)
+    if not cleaned:
+        return _err(tool, "say who the email is from (trigger.from) or words its subject has (trigger.keywords)")
+    # Only whether the mailbox can be read: nothing in it is opened on this
+    # turn, so setting a watch never counts as having read their mail.
+    status = await gmail_status(writer.email, gmail=writer.mailbox)
+    if status != "connected":
+        return _no_mailbox(STATUS_MESSAGES[status], status)
+    return mailbox.owner_config(config, int(writer.person.id)), cleaned
+
+
+NO_MAILBOX_NOTE = (
+    "No watch was set: an email watch reads their own inbox, and it can't be read. Tell them so in a line,"
+    " with how to connect it (the error says how). Say that an email that comes to you, the Executive,"
+    " still shows up on Today for whoever it is for. Don't say a tool was unavailable or ask them to try"
+    " again in another chat."
+)
+
+
+NOT_HERE_NOTE = (
+    "No watch was set: an email watch reads their own inbox, and it can't be opened in this conversation"
+    " (Act as me may be off for them, or the conversation isn't private to them). Tell them so in a line."
+    " Say that an email that comes to you, the Executive, still shows up on Today for whoever it is for."
+    " Don't say a tool was unavailable or ask them to try again in another chat."
+)
+
+
+def _no_mailbox(error: str, status: str) -> str:
+    return json.dumps({"error": error, "status": status, "note": NO_MAILBOX_NOTE})
+
+
+def _scan_soon() -> None:
+    """Bring the monitor's next pass forward so a new watch gets its first
+    check within a minute, not up to a whole scan interval later."""
+    from openexecutive.monitoring.pipeline import scan_soon
+
+    try:
+        scan_soon()
+    except Exception:
+        logger.warning("watchlist_tools: couldn't bring the next scan forward", exc_info=True)
+
+
+def _own_words(note: str) -> str:
+    """A watch's last-check note when it is the scan's own wording. A note
+    that quotes what a feed or page said ("Told you: ...", "Noticed: ...")
+    is left out: that text comes from outside and this tool's result is
+    read as the Executive's own data."""
+    return "" if note.startswith(("Told you:", "Noticed:")) else note
+
+
+def _for_ids(tool: str, tool_input: dict[str, Any]) -> dict[str, int | None] | str:
+    """The ``for_goal_id`` / ``for_person_id`` a call passed, checked against
+    the goals and the team, as watchlist columns. Returns the JSON error
+    string when one names nothing."""
+    out: dict[str, int | None] = {}
+    for key, column in (("for_goal_id", "goal_id"), ("for_person_id", "route_to_person_id")):
+        if key not in tool_input:
+            continue
+        raw = tool_input[key]
+        if raw is None:
+            out[column] = None
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return _err(tool, f"{key} must be an integer id")
+        if column == "route_to_person_id" and not _principal_asked():
+            # What a watch finds is sent to that person, so only the
+            # principal, on a surface that verified them, picks who.
+            return _err(tool, "only the principal can choose who a watch tells; they can set it on the watch's page")
+        if column == "goal_id":
+            from openexecutive.departments import store as departments
+
+            if departments.get_goal(raw) is None:
+                return _err(tool, f"no goal has id {raw}; use list_department_goals")
+        else:
+            from openexecutive.people import store as people
+
+            person = people.get_person(raw)
+            if person is None or person.archived or person.kind != "team":
+                return _err(tool, f"no teammate has id {raw}")
+        out[column] = raw
+    return out
+
+
 async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
-    from openexecutive.delegation.lockdown import outside_reach_refusal
+    from openexecutive.delegation.lockdown import outside_reach_reason, outside_reach_refusal
 
     tool = "add_watchlist_entry"
-    if (refused := outside_reach_refusal(tool)) is not None:
+    # A watch on their own inbox fetches nothing outside, so their own mail
+    # read never holds it (lockdown.own_inbox_watch); a sender's words do.
+    if outside_reach_reason(tool, tool_input) and (refused := outside_reach_refusal(tool)) is not None:
         return refused
     validated = await _validated_target(tool, tool_input)
     if isinstance(validated, str):
         return validated
     slug, signal_type, target, config, trigger = validated
+    if signal_type == SOURCE_KIND_MAILBOX:
+        own = await _own_mailbox(tool, trigger, config)
+        if isinstance(own, str):
+            return own
+        config, trigger = own
 
-    cadence = str(tool_input.get("cadence", "15min"))
+    cadence = str(tool_input.get("cadence") or ("real_time" if signal_type == SOURCE_KIND_MAILBOX else "15min"))
     if not is_valid_cadence(cadence):
         return _err(tool, f"unknown cadence {cadence!r}")
 
@@ -482,14 +677,9 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
     if not is_valid_mode(mode):
         return _err(tool, f"unknown mode {mode!r}")
 
-    floor_str = str(tool_input.get("severity_floor", "low"))
-    ceiling_str = str(tool_input.get("severity_ceiling", "urgent"))
-    if floor_str not in _VALID_SEVERITY_VALUES:
-        return _err(tool, f"unknown severity_floor {floor_str!r}")
-    if ceiling_str not in _VALID_SEVERITY_VALUES:
-        return _err(tool, f"unknown severity_ceiling {ceiling_str!r}")
-    floor = AlertSeverity(floor_str)
-    ceiling = AlertSeverity(ceiling_str)
+    for_ids = _for_ids(tool, tool_input)
+    if isinstance(for_ids, str):
+        return for_ids
 
     try:
         new_id = ms.insert_watchlist_item(
@@ -499,14 +689,9 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
             config=config,
             trigger=trigger,
             cadence=cadence,
-            severity_floor=floor,
-            severity_ceiling=ceiling,
-            # route_to_department and route_to_person_id are not yet
-            # exposed via the chat tool schema — the routing UX in PR-C
-            # will introduce them with proper validation. For now the
-            # specialist hint is the only routing field the Executive
-            # can set from a chat turn.
             route_to_specialist=str(tool_input.get("route_to_specialist", "")),
+            route_to_person_id=_default_person(for_ids),
+            goal_id=for_ids.get("goal_id"),
             mode=mode,
             notes=str(tool_input.get("notes", ""))[:500],
             origin=ORIGIN_EXECUTIVE,
@@ -514,7 +699,11 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
     except Exception as exc:
         logger.exception("add_watchlist_entry: insert failed")
         return _err(tool, f"insert failed: {exc}")
+    _scan_soon()
 
+    privacy = (
+        {"private": True, "private_to_person": config[mailbox.OWNER_KEY]} if signal_type == SOURCE_KIND_MAILBOX else None
+    )
     _audit(
         tool, True,
         f"add_watchlist_entry: created {slug!r} ({signal_type})",
@@ -525,6 +714,7 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
             "target": target,
             "mode": mode,
         },
+        privacy,
     )
     return json.dumps({
         "ok": True,
@@ -543,6 +733,7 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
     declined is refused HERE so a new slug cannot route around the decline.
     """
     from openexecutive.monitoring.research.watch_policy import (
+        MAX_CARD_LINE,
         WatchProposal,
         entity_declined,
     )
@@ -552,6 +743,8 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
     # validation, so a declined source is never even requested again.
     raw_type = str(tool_input.get("signal_type", "")).strip()
     raw_target = str(tool_input.get("target", "")).strip()
+    if raw_type == SOURCE_KIND_MAILBOX:
+        return _err(tool, "research watches the outside world; a person's inbox is theirs to watch (add_watchlist_entry)")
     if raw_target and ms.is_declined(normalize_target(raw_type, raw_target)):
         return _err(tool, f"target {raw_target!r} was declined by the principal — do not re-propose it")
     entity = str(tool_input.get("grounding_entity", ""))[:120]
@@ -562,6 +755,16 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
     if isinstance(validated, str):
         return validated
     slug, signal_type, target, config, trigger = validated
+
+    if signal_type == SOURCE_KIND_PAGE_WATCH and (problem := page_watch_target_problem(target)):
+        # A research watch on a page that never changes polls forever and
+        # reports nothing. Say what to watch instead so the model can
+        # re-propose in the same turn.
+        return _err(
+            tool,
+            f"target {target!r} would never report anything: {problem}. Propose the "
+            "site's news, insights or press page, or its RSS feed, instead.",
+        )
 
     normalized = normalize_target(signal_type, target)
     if ms.is_declined(normalized):
@@ -596,6 +799,9 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
         trigger=trigger,
         route_to_specialist=str(tool_input.get("route_to_specialist", ""))[:32],
         display_label=str(tool_input.get("display_label", ""))[:120],
+        # Over-long lines are dropped, never cut mid-word: the card then says
+        # what it watches in its own words.
+        card_line=line if len(line := " ".join(str(tool_input.get("card_line", "")).split())) <= MAX_CARD_LINE else "",
     ))
     return json.dumps({"ok": True, "queued": slug, "signal_type": signal_type})
 
@@ -608,6 +814,7 @@ async def handle_list_watchlist(tool_input: dict[str, Any]) -> str:
         items = ms.list_watchlist(
             enabled_only=enabled_only,
             signal_type=signal_type,
+            for_person=_speaker_id(),
         )
     except Exception as exc:
         logger.exception("list_watchlist: failed")
@@ -622,8 +829,11 @@ async def handle_list_watchlist(tool_input: dict[str, Any]) -> str:
             "cadence": i.cadence,
             "mode": i.mode,
             "enabled": i.enabled,
-            "severity_floor": i.severity_floor.value,
-            "severity_ceiling": i.severity_ceiling.value,
+            "title": watch_title(i),
+            "tells_you_when": trigger_line(i.signal_type, i.trigger_json),
+            "last_check": _own_words(i.last_check_note),
+            "for_goal_id": i.goal_id,
+            "for_person_id": i.route_to_person_id,
             "route_to_specialist": i.route_to_specialist,
             "fired_count": i.fired_count,
             "last_polled_at": i.last_polled_at,
@@ -649,7 +859,7 @@ async def handle_remove_watchlist_entry(tool_input: dict[str, Any]) -> str:
         return _err(tool, "slug is required and cannot be empty")
 
     item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
+    if item is None or not _shown(item):
         return _err(tool, f"slug {slug!r} not found")
 
     try:
@@ -679,15 +889,18 @@ async def handle_remove_watchlist_entry(tool_input: dict[str, Any]) -> str:
         tool, removed,
         f"remove_watchlist_entry: {slug} ({'deleted' if removed else 'no-op'})",
         {"slug": slug, "watchlist_id": item.id, "removed": removed},
+        mailbox.audit_privacy(item),
     )
-    return json.dumps({"ok": removed, "slug": slug})
+    return json.dumps({"ok": removed, "slug": slug, "signal_type": item.signal_type})
 
 
 async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
-    from openexecutive.delegation.lockdown import outside_reach_refusal
+    from openexecutive.delegation.lockdown import outside_reach_reason, outside_reach_refusal
 
     tool = "tune_watchlist_entry"
-    if (refused := outside_reach_refusal(tool)) is not None:
+    # A watch on their own inbox fetches nothing outside, so their own mail
+    # read never holds it (lockdown.own_inbox_watch); a sender's words do.
+    if outside_reach_reason(tool, tool_input) and (refused := outside_reach_refusal(tool)) is not None:
         return refused
     try:
         slug = str(tool_input["slug"]).strip()
@@ -697,7 +910,7 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
         return _err(tool, "slug is required and cannot be empty")
 
     item = ms.get_watchlist_item_by_slug(slug)
-    if item is None:
+    if item is None or not _shown(item):
         return _err(tool, f"slug {slug!r} not found")
     assert item.id is not None
 
@@ -711,7 +924,7 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
     changes: list[str] = []
 
     if item.origin == ORIGIN_RESEARCH_PROPOSED and any(
-        k in tool_input for k in ("mode", "enabled", "cadence", "severity_floor", "severity_ceiling", "trigger")
+        k in tool_input for k in ("mode", "enabled", "cadence", "trigger", "for_person_id")
     ):
         # A pending research suggestion leaves the pending state only through
         # the principal's approve / decline — never by a tune from a model —
@@ -732,18 +945,12 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
             return _err(tool, f"unknown mode {mode!r}")
         fields["mode"] = mode
         changes.append(f"mode={mode}")
-    if "severity_floor" in tool_input:
-        v = str(tool_input["severity_floor"])
-        if v not in _VALID_SEVERITY_VALUES:
-            return _err(tool, f"unknown severity_floor {v!r}")
-        fields["severity_floor"] = v
-        changes.append(f"severity_floor={v}")
-    if "severity_ceiling" in tool_input:
-        v = str(tool_input["severity_ceiling"])
-        if v not in _VALID_SEVERITY_VALUES:
-            return _err(tool, f"unknown severity_ceiling {v!r}")
-        fields["severity_ceiling"] = v
-        changes.append(f"severity_ceiling={v}")
+    for_ids = _for_ids(tool, tool_input)
+    if isinstance(for_ids, str):
+        return for_ids
+    for column, value in for_ids.items():
+        fields[column] = value
+        changes.append(f"{column}={value}")
     if "cadence" in tool_input:
         v = str(tool_input["cadence"])
         if not is_valid_cadence(v):
@@ -754,6 +961,10 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
         trig = tool_input["trigger"] or {}
         if not isinstance(trig, dict):
             return _err(tool, "trigger must be a JSON object")
+        if mailbox.is_mailbox(item):
+            trig = mailbox.clean_trigger(trig)
+            if not trig:
+                return _err(tool, "say who the email is from (trigger.from) or words its subject has (trigger.keywords)")
         fields["trigger_json"] = json.dumps(trig)
         changes.append("trigger replaced")
     if "notes" in tool_input:
@@ -775,8 +986,32 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
         tool, True,
         f"tune_watchlist_entry: {slug} -> {', '.join(changes)}",
         {"slug": slug, "watchlist_id": item.id, "changes": changes},
+        mailbox.audit_privacy(item),
     )
-    return json.dumps({"ok": True, "slug": slug, "changes": changes})
+    return json.dumps({"ok": True, "slug": slug, "signal_type": item.signal_type, "changes": changes})
+
+
+def speakers_own_row(tool_name: str, tool_input: Any, result: Any = None) -> bool:
+    """Whether the Executive's dispatch row for a watch-list call is the
+    speaker's alone: it sets up or changes a watch on their own inbox, or
+    its result names one (every result here names the kind of each watch
+    it touched). Such a row quotes who the email is from and what it says,
+    like every row the watch writes itself (``mailbox.audit_privacy``).
+    Never raises; False when unsure."""
+    if tool_name not in WATCHLIST_TOOL_HANDLERS:
+        return False
+    from openexecutive.delegation.lockdown import own_inbox_watch
+
+    if own_inbox_watch(tool_name, tool_input):
+        return True
+    try:
+        data = json.loads(result) if isinstance(result, str) else None
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    touched = [data, *(w for w in data.get("watchlist") or [] if isinstance(w, dict))]
+    return any(w.get("signal_type") == SOURCE_KIND_MAILBOX for w in touched)
 
 
 WATCHLIST_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] = {
@@ -798,4 +1033,5 @@ __all__ = [
     "handle_list_watchlist",
     "handle_remove_watchlist_entry",
     "handle_tune_watchlist_entry",
+    "speakers_own_row",
 ]

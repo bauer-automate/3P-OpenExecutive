@@ -1,0 +1,253 @@
+"""A change to a saved workflow that waits for its person's tap.
+
+A person's own ask in chat is their yes, for a change as for a new workflow
+(``workflow_authoring_tools._person_asked``): on any surface that verified it
+is them (``orchestrator.speaker``) the change is saved in the turn, and each
+step still goes through the three checks when it runs. A change waits on a
+card only when nobody on the team asked for it this turn (say, it came from
+mail it read), below Hands-off, for a switched-on workflow with action steps;
+and, at every level, when the workflow reads or sends email as its creator
+or uses their browser and its creator didn't ask for the change themselves.
+
+The card (decision class ``app_action``, hidden action ``change_workflow``)
+spells out every step it adds, removes or changes, tools included. It goes
+where every app card goes (``app_control.leave_card``): under the reply in a
+chat that shows cards, else on the person's Needs you. Tapping Approve is the
+person seeing the change, as turning it on from its review card is: the
+change is saved and the workflow keeps its on/off state. On the tap:
+
+- the workflow must still be the version the card was made from, else
+  nothing changes and the person is asked to look again;
+- the new definition is validated again, tools included;
+- one that reads or sends as its creator is saved only for that creator,
+  verified (``workflow_email.save_refusal``): a signed web sign-in, or a tap
+  a chat app proved was theirs.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+ACTION = "change_workflow"
+# The longest card a chat app shows whole (Discord's 2000 characters, with
+# room for the outcome line). A change that needs more isn't staged: a card
+# never cuts a line short, so every step, goal and tool it saves is on it.
+MAX_CARD_CHARS = 1800
+
+
+def needs_card(existing: Any, defn: Any, *, asked: bool = False) -> bool:
+    """Whether replacing ``existing`` with ``defn`` from chat waits for a tap.
+    ``asked``: a person on the team asked for this change themselves this
+    turn, verified (``workflow_authoring_tools._asked_by_its_owner``).
+
+    - A workflow that reads or sends email as its creator or uses their
+      browser (before or after the change) runs as that person: only their
+      own ask saves it, at every level; anyone else's waits on a card.
+    - Below Hands-off, a switched-on workflow with action steps waits when
+      nobody asked for the change this turn."""
+    from openexecutive.delegation.workflow_email import as_creator
+    from openexecutive.workflows.dynamic_models import ActionStepSpec
+
+    if existing is None:
+        return False
+    if as_creator(existing) or as_creator(defn):
+        return not (asked and _asked_by_creator(existing.name))
+    approved = existing.is_active and any(isinstance(s, ActionStepSpec) for s in existing.steps)
+    return bool(approved) and not asked and not hands_off()
+
+
+def _asked_by_creator(name: str) -> bool:
+    """Whether the person asking this turn is workflow ``name``'s creator
+    (the account owner for one saved before creators were recorded). Never
+    raises: an error is no."""
+    from openexecutive.workflows.dynamic_store import get_owner
+
+    try:
+        person = _speaker()
+        if person is None or getattr(person, "id", None) is None:
+            return False
+        owner = get_owner(name)
+        if owner is None:
+            return bool(getattr(person, "is_principal", False))
+        return bool(owner == person.id)
+    except Exception:
+        logger.warning("workflow_change: couldn't tell who created %r", name, exc_info=True)
+        return False
+
+
+def hands_off() -> bool:
+    """Whether Approvals is on Hands-off for the turn in progress
+    (``levels.relaxed``). Never raises: an error is False."""
+    try:
+        from openexecutive.orchestrator import levels
+
+        return levels.relaxed()
+    except Exception:
+        logger.warning("workflow_change: couldn't read the level", exc_info=True)
+        return False
+
+
+def _tools(step: Any) -> list[str]:
+    from openexecutive.workflows.action_step import plain_tool_name
+
+    return [plain_tool_name(t) for t in getattr(step, "tools", None) or []]
+
+
+def _flat(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _does(step: Any) -> str:
+    """What a step does, in full, for the card."""
+    kind = getattr(step, "kind", "")
+    if kind in ("action", "specialist"):
+        return _flat(step.goal)
+    if kind == "approval_gate":
+        return f"Asks person {step.person_id}: {_flat(step.question)}"
+    return _flat(getattr(step, "instructions", "") or "Writes the result.")
+
+
+def _what(step: Any) -> str:
+    if getattr(step, "kind", "") == "action":
+        return f"{_does(step)} Tools: {', '.join(_tools(step)) or 'none'}."
+    return _does(step)
+
+
+def change_lines(old: Any, new: Any) -> list[str]:
+    """One line per difference between two versions of a workflow, written
+    from the definitions, so the card says exactly what a tap saves."""
+    lines: list[str] = []
+    before = {s.id: s for s in old.steps}
+    after = {s.id: s for s in new.steps}
+    for sid, step in after.items():
+        was = before.get(sid)
+        if was is None:
+            lines.append(f"New step “{_flat(step.title)}”: {_what(step)}")
+            continue
+        if was.model_dump() == step.model_dump():
+            continue
+        parts: list[str] = []
+        if _tools(was) != _tools(step):
+            added = [t for t in _tools(step) if t not in _tools(was)]
+            removed = [t for t in _tools(was) if t not in _tools(step)]
+            if added:
+                parts.append("now uses " + ", ".join(added))
+            if removed:
+                parts.append("no longer uses " + ", ".join(removed))
+        if _does(was) != _does(step):
+            parts.append("now: " + _does(step))
+        if not parts:
+            parts.append("its settings change")
+        lines.append(f"Step “{_flat(step.title)}”: " + "; ".join(parts))
+    for sid, step in before.items():
+        if sid not in after:
+            lines.append(f"Removed step “{_flat(step.title)}”")
+    if [s.id for s in old.steps if s.id in after] != [s.id for s in new.steps if s.id in before]:
+        lines.append("Steps run in a new order")
+    if (old.cadence, old.cadence_person_id) != (new.cadence, new.cadence_person_id):
+        lines.append(
+            f"Schedule: {new.cadence or 'none'}"
+            + (f", delivered to person {new.cadence_person_id}" if new.cadence else "")
+        )
+    if old.title != new.title:
+        lines.append(f"Renamed to “{_flat(new.title)}”")
+    rest = {"description", "section", "estimated_minutes", "input_fields"}
+    if old.model_dump(include=rest) != new.model_dump(include=rest):
+        lines.append("Its description or form fields change")
+    return lines
+
+
+def card_text(old: Any, new: Any) -> str:
+    head = f"Change the workflow “{_flat(old.title)}”"
+    lines = change_lines(old, new)
+    if not lines:
+        return head + "\nNothing else changes."
+    return head + "\n" + "\n".join(f"- {line}" for line in lines)
+
+
+def _speaker() -> Any:
+    from openexecutive.orchestrator.speaker import speaker
+
+    return speaker()
+
+
+def may_read(name: str) -> str | None:
+    """Why this turn may not read or change workflow ``name``, or None: it
+    needs a verified speaker, in a conversation only they read, who is the
+    account owner or the workflow's creator."""
+    from openexecutive.orchestrator.app_control import _NOT_PRIVATE
+    from openexecutive.orchestrator.speaker import own_private_speaker
+    from openexecutive.workflows.dynamic_store import get_owner
+
+    person = _speaker()
+    if person is None or getattr(person, "id", None) is None:
+        return (
+            "I can only do this with a saved workflow when I know who is asking: in the web "
+            "app signed in, a call with me, or your own chat app."
+        )
+    if own_private_speaker() is None:
+        return _NOT_PRIVATE
+    if not getattr(person, "is_principal", False) and get_owner(name) != person.id:
+        return "Only the account owner or the person who created this workflow can do that."
+    return None
+
+
+def stage(defn: Any, existing: Any) -> dict[str, Any]:
+    """Leave the card for changing ``existing`` into ``defn``. Returns the
+    tool result for save_workflow."""
+    from openexecutive.orchestrator import app_control, app_control_catalog
+
+    app_control_catalog.install()  # where the hidden action is registered
+    refused = may_read(defn.name)
+    if refused is not None:
+        return {"error": refused}
+    person = _speaker()
+    text = card_text(existing, defn)
+    if len(text) > MAX_CARD_CHARS:
+        return {"error": (
+            "That change is too big to show on one card. Change a few steps at a time, or "
+            "edit it on the Workflows page."
+        )}
+    value = json.dumps({
+        "definition": defn.model_dump(mode="json", exclude={"is_active", "created_at", "updated_at"}),
+        "base": existing.model_dump(mode="json", exclude={"is_active", "created_at", "updated_at"}),
+    })
+    decision_id = app_control.leave_card(person.id, ACTION, defn.name, value, existing.title, text)
+    return {
+        "status": "waiting_for_approval",
+        "decision_id": decision_id,
+        "card": text,
+        "note": (
+            app_control.waiting_note()
+            + " It is saved when they tap Approve, keeping the workflow on or off as it is."
+        ),
+    }
+
+
+def _tapper(request: Any) -> Any:
+    """Who tapped: a chat app's proven tap, else the request's own caller."""
+    from openexecutive.api import caller as api_caller
+
+    tap = getattr(getattr(request, "state", None), "chat_tap", None)
+    return tap if tap is not None else api_caller.caller(request)
+
+
+async def run(request: Any, name: str, value: str) -> str:
+    """Carry out a change card on its person's tap (``app_control.carry_out``)."""
+    from openexecutive.api.routes.workflows import apply_chat_change
+    from openexecutive.orchestrator.app_control import Refused
+
+    try:
+        staged = json.loads(value)
+    except ValueError:
+        staged = None
+    if not isinstance(staged, dict) or not isinstance(staged.get("definition"), dict):
+        raise Refused("This card can't be read any more. Ask again in chat.")
+    stored = await apply_chat_change(name, staged["definition"], staged.get("base"), _tapper(request))
+    return f"Changed the workflow “{stored.title}”"
+
+
+__all__ = ["ACTION", "card_text", "change_lines", "may_read", "needs_card", "run", "stage"]

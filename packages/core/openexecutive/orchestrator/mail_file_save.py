@@ -58,7 +58,7 @@ _NAME_BAD = re.compile(r'[\x00-\x1f\x7f"*:<>?/\\|#%]')
 _MIME_RE = re.compile(r"^[A-Za-z0-9.+_-]+/[A-Za-z0-9.+_-]+$")
 _GOOGLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 _GOOGLE_LINK_PREFIXES = ("https://drive.google.com/", "https://docs.google.com/")
-# workspace-mcp's create_drive_file / create_drive_folder answer (1.29.0, unchanged in 2.1.0):
+# workspace-mcp's create_drive_file / create_drive_folder answer (1.29.0, unchanged in 2.4.2):
 # "Successfully created file '<name>' (ID: <id>) in folder '<folder>' for
 # <email>. Link: <link>". The name comes first and may hold anything, so the
 # greedy match takes the last "' (ID: " — the real one.
@@ -88,6 +88,9 @@ class Saved:
     name: str
     link: str
     shared: bool
+    # The share is on an Approve card (the gateway's roster check holds it
+    # below Hands-off): saved, not shared yet.
+    held: bool = False
 
 
 def clean_name(raw: str, index: int) -> str:
@@ -139,6 +142,24 @@ def _lock() -> asyncio.Lock:
     return lock
 
 
+# Saves of named files into a named Drive folder: Drive keeps two files of
+# one name side by side, so these need no lock, only a cap on how many go to
+# the workspace server at once. A turn filing a whole email's attachments
+# otherwise spent ~4s per file in a row and ran out of time.
+GOOGLE_PARALLEL_SAVES = 4
+_GOOGLE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _google_slot() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    slots = _GOOGLE_SLOTS.get(loop)
+    if slots is None:
+        slots = _GOOGLE_SLOTS[loop] = asyncio.Semaphore(GOOGLE_PARALLEL_SAVES)
+    return slots
+
+
 async def _call(gateway: Any, name: str, arguments: dict[str, Any]) -> str:
     """One code-built gateway call (``code_built_call``), discovering the tool
     first if this gateway session hasn't yet."""
@@ -153,6 +174,14 @@ async def _call(gateway: Any, name: str, arguments: dict[str, Any]) -> str:
     return text if isinstance(text, str) else ""
 
 
+def _held(text: str) -> bool:
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("status") == "waiting_for_approval"
+
+
 def _failed(text: str) -> bool:
     head = text.lstrip()
     if not head:
@@ -162,7 +191,7 @@ def _failed(text: str) -> bool:
             parsed = json.loads(head)
         except ValueError:
             return False
-        return isinstance(parsed, dict) and "error" in parsed
+        return isinstance(parsed, dict) and ("error" in parsed or _held(head))
     return head.lower().startswith(("error", "tool error"))
 
 
@@ -174,6 +203,15 @@ def _folder_missing(text: str) -> bool:
     folder made. A quota, server or file-type error returns at once, so a
     failing save doesn't leave a new empty folder each time."""
     return _failed(text) and bool(_MISSING_RE.search(text))
+
+
+# The refusal for a remembered folder the Executive can no longer reach: one
+# made in a Drive it no longer signs in to (the gateway can't read its owner).
+_UNREACHABLE = ("could not read who owns",)
+
+
+def _folder_unreachable(text: str) -> bool:
+    return any(marker in text for marker in _UNREACHABLE)
 
 
 def _why(text: str) -> str:
@@ -262,9 +300,10 @@ async def _google(gateway: Any, data: bytes, name: str, mime: str, owner_id: int
         arguments["folder_id"], fresh = await _google_folder(gateway, account)
         made = await _call(gateway, "google_workspace__create_drive_file", arguments)
         created = None if _failed(made) else _CREATED_RE.search(made)
-        if created is not None or fresh or not _folder_missing(made):
+        if created is not None or fresh or not (_folder_missing(made) or _folder_unreachable(made)):
             break
-        # The remembered folder may be gone: make a new one, once.
+        # The remembered folder may be gone, or out of reach (one made in a
+        # Drive the Executive no longer signs in to): make a new one, once.
         saved_files.forget_folder(GOOGLE, account)
     if created is None:
         raise SaveFailed(f"Google Drive didn't take the file: {_why(made)}")
@@ -286,9 +325,9 @@ async def _google(gateway: Any, data: bytes, name: str, mime: str, owner_id: int
         "send_notification": False,
     })
     ok = not _failed(shared)
-    if not ok:
+    if not ok and not _held(shared):
         logger.warning("save_my_email_attachment: sharing the Drive copy failed: %s", _why(shared)[:120])
-    return Saved(GOOGLE, file_id, name, link, ok)
+    return Saved(GOOGLE, file_id, name, link, ok, _held(shared))
 
 
 # --------------------------------------------------------------------------- #
@@ -388,6 +427,6 @@ async def _microsoft(gateway: Any, data: bytes, name: str, owner_id: int, owner_
         },
     })
     ok = not _failed(shared)
-    if not ok:
+    if not ok and not _held(shared):
         logger.warning("save_my_email_attachment: sharing the OneDrive copy failed: %s", _why(shared)[:120])
-    return Saved(MICROSOFT, file_id, str(parsed.get("name") or name), str(link), ok)
+    return Saved(MICROSOFT, file_id, str(parsed.get("name") or name), str(link), ok, _held(shared))

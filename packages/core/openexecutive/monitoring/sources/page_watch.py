@@ -38,7 +38,9 @@ import html
 import logging
 import re
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -57,6 +59,7 @@ from openexecutive.monitoring.sources._http import (
     fetch_bounded,
     validate_target_url,
 )
+from openexecutive.monitoring.sources.base import COULD_NOT_REACH, observe
 from openexecutive.utils.html_tags import strip_tags
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,19 @@ _MAX_DIFF_WORDS = 8_000
 # Bounds on the change summary written into the alert / persisted payload.
 _SUMMARY_SNIPPET_CHARS = 160
 _ADDED_TEXT_CHARS = 1_000
+# Each side of a "was … now …" line, so the whole line fits a summary.
+_CHANGE_SIDE_CHARS = 60
+# Headline links: an anchor counts when its text reads like a title (at
+# least this many words and characters), which leaves out menus, buttons
+# and "Read more". Bounded per page and per change.
+_HEADLINE_MIN_WORDS = 4
+_HEADLINE_MIN_CHARS = 20
+_HEADLINE_MAX_CHARS = 200
+_MAX_LINKS_PER_PAGE = 300
+_MAX_NEW_LINKS = 10
+# Headlines sit near the top of a listing page; the link parse reads only
+# this much of the body, on top of the full-text reduction.
+_LINK_SCAN_BYTES = 512_000
 
 # <script>/<style>/<noscript> blocks: drop content, not just tags, so inline
 # JS/CSS never counts as "visible text". Removed by a linear scan
@@ -108,10 +124,12 @@ class PageWatchSource:
             logger.warning("page_watch: rejecting %r target — %s", item.slug, reason)
             return []
 
-        text = await self._fetch_text_httpx(item)
-        if text is None:
+        fetched = await self._fetch_httpx(item)
+        if fetched is None:
             # Fetch failed (already logged at the fetch site) — drop this tick.
+            observe(item, COULD_NOT_REACH)
             return []
+        text, links = fetched
         if not text:
             # An empty extraction (e.g. a JS-only shell or a fetch that returned
             # no markup) is not a meaningful baseline — skip rather than store
@@ -136,29 +154,66 @@ class PageWatchSource:
         )
         if prior is None or legacy_baseline:
             # First observation — record the baseline, do not alert.
-            store.upsert_page_watch_state(item.slug, content_hash, snapshot, db_path=db_path)
+            store.upsert_page_watch_state(
+                item.slug, content_hash, snapshot, links=links, db_path=db_path,
+            )
             if legacy_baseline:
                 self._clear_legacy_marker(item, db_path=db_path)
             logger.debug("page_watch: %s baseline captured", item.slug)
+            observe(item, "First look: it noted the page as it is now. It tells you about changes from here on.")
             return []
 
         if prior.get("content_hash") == content_hash:
+            if links and not prior.get("links"):
+                # A baseline from before links were kept: record them now so
+                # the next change can name its new headlines.
+                store.upsert_page_watch_state(
+                    item.slug, content_hash, prior.get("text_snapshot") or snapshot,
+                    links=links, db_path=db_path,
+                )
+            observe(item, "No change on the page.")
             return []  # unchanged
 
         # Changed — summarise (one diff pass), advance the baseline, emit one Signal.
         old_snapshot = prior.get("text_snapshot") or ""
-        pct, added = _diff(old_snapshot, snapshot)
+        pct, added, changes = _diff(old_snapshot, snapshot)
         # NOTE: at-most-once. We advance the stored baseline here, before the
         # pipeline inserts the Signal. If the process dies between this write
         # and the insert, this one change is not re-emitted (the next poll sees
         # the new hash as current). Acceptable for a monitoring poller; the
         # alternative (advance-after-insert) needs insertion feedback the
         # adapter doesn't have. The dedup_key still prevents double-emit.
-        store.upsert_page_watch_state(item.slug, content_hash, snapshot, db_path=db_path)
+        store.upsert_page_watch_state(
+            item.slug, content_hash, snapshot, links=links, db_path=db_path,
+        )
 
-        snippet = added[:_SUMMARY_SNIPPET_CHARS].strip()
-        summary_detail = f"~{pct}% of text differs" + (f"; new: {snippet}" if snippet else "")
+        # What the change added, in words a person can act on: the headline
+        # links that were not on the page last time (a news or listing page),
+        # else the added text itself (a pricing or about page). A baseline
+        # with no stored links (written before they were kept) reports none
+        # as new, or every link on the page would read as news.
+        new_links = new_headline_links(prior.get("links") or [], links)
+        snippet = _without_links(added[:_SUMMARY_SNIPPET_CHARS].strip())
         label = item.config_json.get("label") or _host_label(item.target)
+        # Words replaced or removed say what the page used to say too.
+        rewrote = changes and not all(line.startswith("added ") for line in changes.splitlines())
+        if new_links:
+            titles = "; ".join(link["text"] for link in new_links[:3])
+            more = len(new_links) - 3
+            summary_detail = f"new: {titles}" + (f" (+{more} more)" if more > 0 else "")
+        elif rewrote:
+            lines = changes.splitlines()
+            # The rewrite, not an addition that happens to come first.
+            pick = next((line for line in lines if not line.startswith("added ")), lines[0])
+            first = _without_links(pick)[:_SUMMARY_SNIPPET_CHARS]
+            summary_detail = f"changed: {first}"
+        elif snippet:
+            summary_detail = f"new text: {snippet}"
+        else:
+            summary_detail = "text removed"
+        readable = "\n".join(
+            f"- {link['text']} ({link['url']})" for link in new_links[:_MAX_NEW_LINKS]
+        ) or (changes if rewrote else added)[:_ADDED_TEXT_CHARS]
         return [Signal(
             watchlist_id=item.id or 0,
             source_kind=self.kind,
@@ -170,18 +225,26 @@ class PageWatchSource:
                 "target_url": item.target,
                 "content_hash": content_hash,
                 "change_summary": summary_detail,
+                "changed_pct": pct,
                 "added_text": added[:_ADDED_TEXT_CHARS],
+                "changes": changes[:_ADDED_TEXT_CHARS],
+                "new_links": new_links[:_MAX_NEW_LINKS],
+                # Read by capture-time enrichment as the signal's detail.
+                "summary": readable,
             },
             provenance_url=item.target,
             severity_hint=AlertSeverity.LOW,
             dedup_key=_make_dedup_key(item.slug, content_hash),
         )]
 
-    async def _fetch_text_httpx(self, item: WatchlistItem) -> str | None:
-        """Fetch via the keyless bounded httpx fetcher → normalized text.
+    async def _fetch_httpx(
+        self, item: WatchlistItem,
+    ) -> tuple[str, list[dict[str, str]]] | None:
+        """Fetch via the keyless bounded httpx fetcher.
 
-        Returns the normalized visible text, ``""`` when the page yields no
-        extractable text, or ``None`` when the fetch itself failed.
+        Returns ``(normalized visible text, headline links)`` — the text is
+        ``""`` when the page yields none — or ``None`` when the fetch itself
+        failed.
         """
         max_bytes = get_settings().external_monitor_max_fetch_bytes
         try:
@@ -197,7 +260,7 @@ class PageWatchSource:
                 "page_watch: %s exceeded byte cap — dropping tick", item.target,
             )
             return None
-        return html_to_text(body)
+        return html_to_text(body), extract_headline_links(body, item.target)
 
     @staticmethod
     def _clear_legacy_marker(item: WatchlistItem, *, db_path: Path | None) -> None:
@@ -235,6 +298,124 @@ class PageWatchSource:
 # --------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------- #
+
+
+class _AnchorParser(HTMLParser):
+    """Collect ``(href, visible text)`` for each <a> outside script/style.
+
+    ``html.parser`` is a linear tokenizer, so a hostile page can't make this
+    quadratic the way a regex over raw markup could."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.anchors: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _DROP_BLOCK_TAGS:
+            self._skip += 1
+        elif tag == "a":
+            self._flush()
+            self._href = next((v for k, v in attrs if k == "href" and v), None)
+            self._text = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _DROP_BLOCK_TAGS:
+            self._skip = max(0, self._skip - 1)
+        elif tag == "a":
+            self._flush()
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None and not self._skip:
+            self._text.append(data)
+
+    def _flush(self) -> None:
+        if self._href is not None and len(self.anchors) < _MAX_LINKS_PER_PAGE * 4:
+            self.anchors.append((self._href, " ".join(self._text)))
+        self._href = None
+        self._text = []
+
+
+def extract_headline_links(body: bytes, base_url: str) -> list[dict[str, str]]:
+    """The page's title-like links as ``[{"text", "url"}]``, in page order.
+
+    Absolute http(s) URLs on the watched page's own site only (its
+    registrable domain), fragment and query stripped, one entry per URL: a
+    link to another site is not the page's news and is never put in front of
+    the person. Only the head of the body is parsed (``_LINK_SCAN_BYTES``).
+    Best effort: a parse failure returns what was collected so far."""
+    try:
+        site = _bare_host(urlsplit(base_url).hostname)
+    except ValueError:
+        return []
+    try:
+        markup = body[:_LINK_SCAN_BYTES].decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    parser = _AnchorParser()
+    try:
+        parser.feed(markup)
+        parser.close()
+    except Exception:  # noqa: BLE001 — malformed markup never sinks a poll
+        logger.debug("page_watch: anchor parse stopped early on %s", base_url)
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for href, raw_text in parser.anchors:
+        # Page text, shown on cards and in chat: links and addresses in it go.
+        text = _without_links(_WS_RE.sub(" ", raw_text).strip())
+        if len(text) < _HEADLINE_MIN_CHARS or len(text.split()) < _HEADLINE_MIN_WORDS:
+            continue
+        try:
+            url = urljoin(base_url, href.strip())
+            parts = urlsplit(url)
+        except ValueError:
+            continue
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            continue
+        if not site or not _same_site(_bare_host(parts.hostname), site):
+            continue
+        url = urlunsplit((parts.scheme, parts.netloc, quote(parts.path, safe="/%:@!$&'()*+,;=-._~"), "", ""))
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append({"text": text[:_HEADLINE_MAX_CHARS], "url": url})
+        if len(out) >= _MAX_LINKS_PER_PAGE:
+            break
+    return out
+
+
+def _without_links(text: str) -> str:
+    """``text`` with links and email addresses removed, so a planted one in
+    the page can't reach a card or a chat message."""
+    from openexecutive.delegation.reminders import clean_text
+
+    return " ".join(clean_text(text).replace("[link]", " ").split()) if text else ""
+
+
+def _bare_host(host: str | None) -> str:
+    host = (host or "").lower().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _same_site(host: str, site: str) -> bool:
+    """``host`` is the watched site or a subdomain of it (or it of
+    ``host``): news.acme.example belongs to acme.example and back."""
+    if not host:
+        return False
+    return host == site or host.endswith("." + site) or site.endswith("." + host)
+
+
+def new_headline_links(
+    old: list[dict[str, str]], new: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Links in ``new`` whose URL was not in ``old``. Empty when ``old`` is
+    empty: with no record of last time, nothing can be called new."""
+    if not old:
+        return []
+    old_urls = {str(link.get("url") or "") for link in old if isinstance(link, dict)}
+    return [link for link in new if link.get("url") not in old_urls]
 
 
 def html_to_text(body: bytes) -> str:
@@ -300,8 +481,14 @@ def _strip_blocks(markup: str) -> str:
     return "".join(out)
 
 
-def _diff(old: str, new: str) -> tuple[int, str]:
-    """Return (percent-changed, added-text) in a single diff pass.
+def _diff(old: str, new: str) -> tuple[int, str, str]:
+    """Return (percent-changed, added-text, changes) in a single diff pass.
+
+    ``changes`` says what each change was, a line each: ``was "…" now "…"``
+    for replaced words, ``removed "…"`` and ``added "…"``. The added text
+    alone can't tell "only with written permission" turning into "without
+    needing permission" from a new sentence, so whoever reads the change
+    gets both sides.
 
     Word lists are capped at ``_MAX_DIFF_WORDS`` before the (O(N·M),
     autojunk-off) SequenceMatcher runs, so a high-entropy page can't make the
@@ -313,12 +500,26 @@ def _diff(old: str, new: str) -> tuple[int, str]:
     sm = difflib.SequenceMatcher(None, old_words, new_words, autojunk=False)
     pct = int(round((1.0 - sm.ratio()) * 100))
     chunks: list[str] = []
-    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
-        if tag in ("insert", "replace"):
-            chunk = " ".join(new_words[j1:j2])
-            if chunk:
-                chunks.append(chunk)
-    return pct, " … ".join(chunks)
+    changes: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        was = " ".join(old_words[i1:i2])
+        now = " ".join(new_words[j1:j2])
+        if tag in ("insert", "replace") and now:
+            chunks.append(now)
+        # Each side is cut on its own, so a long passage never pushes the
+        # other side off a line that is cut later.
+        was, now = _side(was), _side(now)
+        if tag == "replace":
+            changes.append(f'was "{was}" now "{now}"')
+        elif tag == "delete" and was:
+            changes.append(f'removed "{was}"')
+        elif tag == "insert" and now:
+            changes.append(f'added "{now}"')
+    return pct, " … ".join(chunks), "\n".join(changes)
+
+
+def _side(text: str) -> str:
+    return text if len(text) <= _CHANGE_SIDE_CHARS else text[: _CHANGE_SIDE_CHARS - 1].rstrip() + "…"
 
 
 def _host_label(url: str) -> str:

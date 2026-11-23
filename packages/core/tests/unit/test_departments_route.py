@@ -49,7 +49,8 @@ def test_get_known_department(client: TestClient) -> None:
     data = resp.json()
     assert data["config"]["slug"] == "finance"
     assert data["config"]["specialist_key"] == "cfo"
-    assert data["config"]["authority_level"] == "propose_only"
+    # The level its work runs at: Approvals (the suite runs at Careful).
+    assert data["config"]["authority_level"] == "escalate"
     assert data["config"]["charter"]["mission"]
     assert data["goals"] == []
 
@@ -63,23 +64,20 @@ def test_get_unknown_department(client: TestClient) -> None:
 # Patch
 # --------------------------------------------------------------------------- #
 
-def test_patch_authority_and_headcount(client: TestClient) -> None:
+def test_how_it_acts_is_gone_and_approvals_shows(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import outside_mode
+
     resp = client.patch(
         "/departments/finance",
         json={"authority_level": "auto_execute", "headcount": 3},
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["config"]["authority_level"] == "auto_execute"
+    assert data["config"]["authority_level"] == "escalate"  # not stored: Approvals decides
     assert data["headcount"] == 3
-
-
-def test_patch_rejects_invalid_authority(client: TestClient) -> None:
-    resp = client.patch(
-        "/departments/finance",
-        json={"authority_level": "do_whatever"},
-    )
-    assert resp.status_code == 422
+    monkeypatch.setattr(outside_mode, "get_mode", lambda **_: outside_mode.TRUST)
+    listed = {d["config"]["slug"]: d for d in client.get("/departments").json()}
+    assert listed["finance"]["config"]["authority_level"] == "auto_execute"
 
 
 def test_patch_watched_entities_cleans_and_validates(client: TestClient) -> None:
@@ -94,6 +92,16 @@ def test_patch_watched_entities_cleans_and_validates(client: TestClient) -> None
     assert client.patch("/departments/finance", json={"watched_entities": []}).json()["config"]["watched_entities"] == []
     assert client.patch("/departments/finance", json={"watched_entities": ["x" * 129]}).status_code == 422
     assert client.patch("/departments/finance", json={"watched_entities": [f"e{i}" for i in range(51)]}).status_code == 422
+
+
+def test_patch_google_chat_space_sets_and_clears(client: TestClient) -> None:
+    resp = client.patch("/departments/finance", json={"google_chat_space": "spaces/AAAAfin"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["config"]["google_chat_space"] == "spaces/AAAAfin"
+    # Omitting it leaves it alone; null clears it; anything not a space is refused.
+    assert client.patch("/departments/finance", json={"headcount": 2}).json()["config"]["google_chat_space"] == "spaces/AAAAfin"
+    assert client.patch("/departments/finance", json={"google_chat_space": "users/123"}).status_code == 422
+    assert client.patch("/departments/finance", json={"google_chat_space": None}).json()["config"]["google_chat_space"] is None
 
 
 @pytest.mark.parametrize("spec", ["mondays@09:00", "daily@25:00", "weekly@xyz@09:00", "quarterly@00-09:00", " "])
@@ -415,20 +423,23 @@ def test_patch_invalidates_registry_cache(client: TestClient) -> None:
     # Warm the cache, then assert the warm state actually populated module
     # state — otherwise this test would pass even if the cache were broken.
     before = registry.list_states()
-    assert all(s.config.authority_level.value == "propose_only" for s in before)
+    # Every read says the level that applies now (the company's Approvals).
+    from openexecutive.departments.authority import department_level
+
+    assert all(s.config.authority_level == department_level(s.config.slug) for s in before)
     assert registry._cache is not None
     assert registry._cache_expires_at > 0.0
 
     resp = client.patch(
         "/departments/finance",
-        json={"authority_level": "auto_execute"},
+        json={"headcount": 4},
     )
     assert resp.status_code == 200
     # Mutation must have cleared the cache, not just overwritten its value.
     assert registry._cache is None
 
-    after = {s.config.slug: s.config.authority_level.value for s in registry.list_states()}
-    assert after["finance"] == "auto_execute"
+    after = {s.config.slug: s.headcount for s in registry.list_states()}
+    assert after["finance"] == 4
 
 
 # --------------------------------------------------------------------------- #
@@ -445,7 +456,9 @@ def test_create_department(client: TestClient) -> None:
     assert body["config"]["slug"] == "customer-success"
     assert body["config"]["title"] == "Customer Success"
     assert body["config"]["specialist_key"] is None
-    assert body["config"]["authority_level"] == "propose_only"
+    from openexecutive.departments.authority import department_level
+
+    assert body["config"]["authority_level"] == department_level("customer-success").value
     assert body["goals"] == []
 
 
@@ -528,17 +541,17 @@ def empty_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(app)
 
 
-def test_goal_with_no_area_named_goes_under_general(empty_client: TestClient) -> None:
+def test_goal_with_no_area_named_has_no_department(empty_client: TestClient) -> None:
+    """Goals stand on their own: naming no area creates no department."""
     resp = empty_client.post("/goals", json={"key_result": "Launch the product", "area": "  "})
     assert resp.status_code == 201, resp.text
     assert resp.json()["key_result"] == "Launch the product"
-    areas = empty_client.get("/departments").json()
-    assert [a["config"]["title"] for a in areas] == ["General"]
-    assert areas[0]["goals"][0]["id"] == resp.json()["id"]
-    # A second goal with no area joins it rather than making "General 2".
+    assert resp.json()["department_slug"] is None
     assert empty_client.post("/goals", json={"key_result": "Hire a designer"}).status_code == 201
-    areas = empty_client.get("/departments").json()
-    assert len(areas) == 1 and len(areas[0]["goals"]) == 2
+    assert empty_client.get("/departments").json() == []
+    listed = empty_client.get("/goals").json()
+    assert [g["key_result"] for g in listed] == ["Launch the product", "Hire a designer"]
+    assert all(g["department_slug"] is None and g["department_title"] is None for g in listed)
 
 
 def test_goal_names_a_new_area_or_matches_an_existing_one(empty_client: TestClient) -> None:

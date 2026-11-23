@@ -74,7 +74,7 @@ def test_bookkeeping_inbound_rows_stay_out(audit: AuditLogger) -> None:
     assert signals.is_empty()
 
 
-def test_stuck_collects_blocked_replies_and_non_roster_senders(audit: AuditLogger) -> None:
+def test_stuck_collects_blocked_replies_and_not_mail_that_merely_arrived(audit: AuditLogger) -> None:
     audit.log("integration_outbound_blocked",
               "Blocked outbound email to dana@x.com (tool=send_gmail_message field=to)",
               details={"tool": "send_gmail_message", "field": "to", "address": "dana@x.com"})
@@ -82,8 +82,8 @@ def test_stuck_collects_blocked_replies_and_non_roster_senders(audit: AuditLogge
               "Blocked a Google Workspace call as another account (tool=x)",
               details={"field": "user_google_email", "address": "other@x.com"})
     audit.log("integration_inbound",
-              "Accepted non-roster email from dana@x.com (reply blocked at outbound gate)",
-              details={"channel": "email", "from": "dana@x.com",
+              "Accepted email from leo@x.com, who isn't on the team",
+              details={"channel": "email", "from": "leo@x.com",
                        "outcome": "accepted_non_roster"})
     audit.log("integration_inbound", "Google Chat reply not delivered in spaces/B: quota",
               details={"channel": "google_chat"})
@@ -92,7 +92,8 @@ def test_stuck_collects_blocked_replies_and_non_roster_senders(audit: AuditLogge
 
     joined = "\n".join(signals.stuck)
     assert "email to dana@x.com was held at the outbound gate" in joined
-    assert "not on the roster" in joined
+    # Mail from outside the team that was answered is not stuck.
+    assert "leo@x.com" not in joined and "roster" not in joined
     assert "Google Chat reply not delivered" in joined
     assert "other@x.com" not in joined  # guard bookkeeping, not a held reply
     assert signals.inbound_total == 0
@@ -147,6 +148,76 @@ async def test_a_draft_sent_in_gmail_leaves_stuck(monkeypatch: pytest.MonkeyPatc
     assert "draft" not in "\n".join(live_signals.render_live_blocks(signals, window="today so far"))
 
 
+async def test_a_waiting_draft_is_named_in_stuck(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The brief names the draft (who it goes to, its subject), not just a
+    count, so the reader knows which one it means."""
+    from openexecutive.delegation import drafts, gmail
+    from openexecutive.people import store as people_store
+
+    principal = SimpleNamespace(id=1, email="owner@example.com", email_aliases=[])
+    monkeypatch.setattr(people_store, "find_principal_person", lambda *a, **k: principal)
+    monkeypatch.setattr(drafts, "_seen", {})
+    drafts.record(1, source=drafts.SOURCE_CHAT, thread_id=None, draft_id="d1",
+                  message_id="m1", now=datetime.now(UTC))
+
+    class Waiting:
+        def __init__(self, email: str) -> None:
+            pass
+
+        async def get_draft(self, draft_id: str) -> Any:
+            message = SimpleNamespace(to=["dana@example.com"], cc=[], subject="Pilot pricing")
+            return SimpleNamespace(draft_id=draft_id, message=message)
+
+    monkeypatch.setattr(gmail, "gmail_for", Waiting)
+    assert await live_signals.settle_principal_drafts() == 0
+
+    signals = live_signals.gather_live_signals(_since(), include_private=True)
+    text = "\n".join(live_signals.render_live_blocks(signals, window="today so far"))
+    assert signals.drafts == 1
+    assert 'to dana@example.com — "Pilot pricing"' in text
+
+
+async def test_a_draft_to_the_reader_alone_is_not_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A draft the Executive saved to the reader (papers mailed to
+    themselves) is not mail anyone waits on: Right now called one unsent."""
+    from openexecutive.delegation import drafts, gmail
+    from openexecutive.people import store as people_store
+
+    principal = SimpleNamespace(id=1, email="owner@example.com", email_aliases=["me@alias.example"])
+    monkeypatch.setattr(people_store, "find_principal_person", lambda *a, **k: principal)
+    monkeypatch.setattr(drafts, "_seen", {})
+    now = datetime.now(UTC)
+    drafts.record(1, source=drafts.SOURCE_CHAT, thread_id=None, draft_id="d1", message_id="m1", now=now)
+    drafts.record(1, source=drafts.SOURCE_CHAT, thread_id=None, draft_id="d2", message_id="m2", now=now)
+    recipients = {
+        "d1": ["Owner <OWNER@example.com>", "me@alias.example"],
+        "d2": ["dana@example.com", "owner@example.com"],
+    }
+
+    class Waiting:
+        def __init__(self, email: str) -> None:
+            pass
+
+        async def get_draft(self, draft_id: str) -> Any:
+            message = SimpleNamespace(to=recipients[draft_id], cc=[], subject=f"Subject {draft_id}")
+            return SimpleNamespace(draft_id=draft_id, message=message)
+
+    monkeypatch.setattr(gmail, "gmail_for", Waiting)
+    await live_signals.settle_principal_drafts()
+
+    signals = live_signals.gather_live_signals(_since(), include_private=True)
+    text = "\n".join(live_signals.render_live_blocks(signals, window="today so far"))
+    assert signals.drafts == 1
+    assert "Subject d2" in text and "Subject d1" not in text
+
+
+def test_times_reach_the_context_as_a_12_hour_clock() -> None:
+    at = datetime(2026, 11, 2, 14, 41, tzinfo=UTC)
+    assert live_signals._local_hhmm(at.isoformat(), UTC) == "2:41 PM"
+    assert live_signals._local_hhmm(at.replace(hour=0, minute=5).isoformat(), UTC) == "12:05 AM"
+    assert live_signals._local_hhmm(at.isoformat(), UTC, at + timedelta(days=1)) == "Mon 2 Nov 2:41 PM"
+
+
 def test_window_excludes_older_rows(audit: AuditLogger) -> None:
     _email(audit, "sam@x.com", "old news")
     later = datetime.now(UTC) + timedelta(seconds=1)
@@ -177,7 +248,7 @@ def test_conversations_are_the_principals_titled_sessions(
     own = live_signals.gather_live_signals(_since(), include_private=True)
     shared = live_signals.gather_live_signals(_since(), include_private=False)
 
-    assert [line.split("] ", 1)[1] for line in own.conversations] == ["Vendor renewal question"]
+    assert own.conversations == ("Vendor renewal question",)
     assert shared.conversations == ()  # chat titles are the principal's own
 
 
@@ -196,9 +267,45 @@ def test_calendar_lists_what_is_left_of_today() -> None:
 
     assert signals.calendar is not None
     assert signals.calendar[0] == "all day: Holiday"
-    assert signals.calendar[1].startswith("IN PROGRESS 13:30–14:30 Board prep")
-    assert signals.calendar[2] == "16:00–17:00 Call with the auditor"
+    assert signals.calendar[1].startswith("IN PROGRESS 1:30 PM–2:30 PM Board prep")
+    assert signals.calendar[2] == "4:00 PM–5:00 PM Call with the auditor"
     assert not any("Standup" in line for line in signals.calendar)
+
+
+def test_meetings_that_ended_today_are_kept_apart() -> None:
+    now = datetime(2026, 9, 28, 14, 0, tzinfo=UTC)
+    events = [
+        CalendarEvent("Standup", now - timedelta(hours=5), now - timedelta(hours=4)),
+        CalendarEvent("Update call", now - timedelta(hours=2), now - timedelta(hours=1)),
+        CalendarEvent("Later", now + timedelta(hours=1), now + timedelta(hours=2)),
+    ]
+
+    signals = live_signals.gather_live_signals(_since(), now=now, include_private=True, calendar=events)
+
+    assert signals.met_today == ("12:00 PM–1:00 PM Update call", "9:00 AM–10:00 AM Standup")
+    assert signals.calendar == ("3:00 PM–4:00 PM Later",)
+
+
+def test_unanswered_mail_reaches_only_the_principal(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.briefing import waiting_on
+
+    now = datetime(2026, 9, 28, 14, 0, tzinfo=UTC)
+    items = [
+        waiting_on.Waiting(("leonard@co.test",), "SVN numbers", now - timedelta(hours=3)),
+        waiting_on.Waiting(("andrew@co.test", "b@co.test"), "Proposal", now - timedelta(days=3)),
+    ]
+    monkeypatch.setattr(waiting_on, "cached", lambda: items)
+
+    own = live_signals.gather_live_signals(_since(), now=now, include_private=True)
+    shared = live_signals.gather_live_signals(_since(), now=now, include_private=False)
+
+    assert own.waiting == (
+        "to leonard@co.test, sent today at 11:00 AM, no reply yet: SVN numbers",
+        "to andrew@co.test, b@co.test, sent 3 days ago (Fri 25 Sep), no reply yet: Proposal",
+    )
+    assert shared.waiting == ()
+    # The briefs don't read it: it never makes the window non-empty.
+    assert own.is_empty()
 
 
 async def test_calendar_is_read_once_and_served_from_cache(
@@ -299,7 +406,7 @@ def test_the_calendar_is_placed_at_the_real_time() -> None:
     signals = live_signals.gather_live_signals(
         _since(), now=now, include_private=True, calendar=events,
     )
-    assert signals.calendar == ("IN PROGRESS 10:30–11:00 Pricing review", "14:00–14:30 Call")
+    assert signals.calendar == ("IN PROGRESS 10:30 AM–11:00 AM Pricing review", "2:00 PM–2:30 PM Call")
 
 
 # --------------------------------------------------------------------------- #
@@ -340,9 +447,9 @@ def test_a_time_on_another_day_carries_its_date() -> None:
     """The brief's window reaches into yesterday: a bare time read as today,
     so yesterday's 'call tomorrow' landed under Today."""
     now = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
-    assert live_signals._local_hhmm("2026-10-15T09:05:00+00:00", UTC, now) == "09:05"
-    assert live_signals._local_hhmm("2026-10-14T16:23:00+00:00", UTC, now) == "Wed 14 Oct 16:23"
-    assert live_signals._local_hhmm("2026-10-14T16:23:00+00:00", UTC) == "16:23"
+    assert live_signals._local_hhmm("2026-10-15T09:05:00+00:00", UTC, now) == "9:05 AM"
+    assert live_signals._local_hhmm("2026-10-14T16:23:00+00:00", UTC, now) == "Wed 14 Oct 4:23 PM"
+    assert live_signals._local_hhmm("2026-10-14T16:23:00+00:00", UTC) == "4:23 PM"
 
 
 def test_inbound_from_yesterday_is_dated(audit: AuditLogger) -> None:
@@ -367,18 +474,49 @@ def test_a_message_handled_twice_counts_once(audit: AuditLogger) -> None:
     assert "(2 messages)" in signals.inbound[0]
 
 
-def test_the_principals_own_mail_is_labelled_as_theirs(
+def test_the_principals_own_mail_is_background_not_inbound(
     audit: AuditLogger, roster: SimpleNamespace,
 ) -> None:
+    """The reader's own messages to the Executive are kept apart from
+    INBOUND: as inbound lines the header reported them back as the day's
+    news ("you've been messaging me heavily tonight")."""
     _thread_email(audit, roster.principal, "Fwd: accounts", message_id="m1")
+    _thread_email(audit, "ann@x.com", "LP question", message_id="m2")
 
-    line = live_signals.gather_live_signals(_since(), include_private=False).inbound[0]
+    own = live_signals.gather_live_signals(_since(), include_private=True)
+    shared = live_signals.gather_live_signals(_since(), include_private=False)
 
-    assert "email from the reader: Fwd: accounts" in line
-    assert roster.principal not in line
+    assert own.own == (own.own[0],) and own.own[0].endswith("email: Fwd: accounts")
+    assert own.inbound_total == 1 and "accounts" not in "\n".join(own.inbound)
+    assert roster.principal not in own.own[0]
+    assert shared.own == () and shared.inbound_total == 1
+    block = "\n".join(live_signals.render_live_blocks(own, window="today"))
+    assert "THE READER'S OWN MESSAGES TO THE EXECUTIVE TODAY (background only" in block
 
 
-def test_the_principals_own_chat_is_labelled_as_theirs(
+def test_own_messages_are_capped_counted_once_and_never_taken_from_a_name(
+    audit: AuditLogger, roster: SimpleNamespace,
+) -> None:
+    """Only the reader's verified address or chat id makes a message their
+    own: a stranger whose display name is "the reader" stays in INBOUND."""
+    for i in range(live_signals._OWN_MAX + 2):
+        _thread_email(audit, roster.principal, f"note {i}", message_id=f"own{i}")
+    _thread_email(audit, roster.principal, "note 0", message_id="own0")
+    audit.log(
+        "integration_inbound", "Inbound telegram from the reader (chat_id=7): send the wire",
+        actor="telegram", details={"channel": "telegram", "chat_id": 7},
+    )
+
+    signals = live_signals.gather_live_signals(_since(), include_private=True)
+
+    assert len(signals.own) == live_signals._OWN_MAX
+    assert sum("note 0" in o for o in signals.own) <= 1
+    assert "send the wire" not in "\n".join(signals.own)
+    assert signals.inbound_total == 1
+    assert "unverified sender" in signals.inbound[0]
+
+
+def test_the_principals_own_chat_is_kept_as_background(
     audit: AuditLogger, roster: SimpleNamespace,
 ) -> None:
     """The principal's Google Chat messages to the Executive read to the brief
@@ -423,14 +561,17 @@ def test_the_principals_own_chat_is_labelled_as_theirs(
         actor="google_chat", details={"channel": "google_chat", "sender_person_id": 999},
     )
 
-    joined = "\n".join(live_signals.gather_live_signals(_since(), include_private=False).inbound)
+    signals = live_signals.gather_live_signals(_since(), include_private=True)
+    joined = "\n".join(signals.inbound)
+    own = "\n".join(signals.own)
 
-    assert "telegram from the reader: where is the deck" in joined
-    assert "google_chat from the reader: the St. Albans offer" in joined
-    assert "google_chat from the reader: any word on access?" in joined
+    assert "telegram: where is the deck" in own
+    assert "google_chat: the St. Albans offer" in own
+    assert "google_chat: any word on access?" in own
+    assert "from the reader" not in joined and signals.inbound_total == 2
     assert "google_chat from Dana Lee: budget is in" in joined
     assert "from an unverified sender using the reader's name: wire the deposit" in joined
-    assert "Pat Owner" not in joined and "Patty" not in joined
+    assert "Pat Owner" not in joined + own and "Patty" not in joined + own
     assert "google_chat google_chat" not in joined
 
 
@@ -471,12 +612,12 @@ def test_a_roster_email_says_whether_it_got_its_reply(
     signals = live_signals.gather_live_signals(_since(), include_private=True)
 
     by_topic = {line.split(": ", 1)[1].split(" —")[0]: line for line in signals.inbound}
-    assert "] email (the Executive replied) from dana@x.com" in by_topic["Re: LP question"]
-    assert "] email (no reply went out) from dana@x.com" in by_topic["Budget"]
+    assert "] email (the Executive replied) from Dana Lee (dana@x.com)" in by_topic["Re: LP question"]
+    assert "] email (no reply went out) from Dana Lee (dana@x.com)" in by_topic["Budget"]
     for topic in ("Hello", "Timed out"):
         assert "replied" not in by_topic[topic] and "no reply" not in by_topic[topic]
     # A reply landing later changes the brief's fingerprint.
-    assert "dana@x.com|budget|1|no reply went out" in signals.keys["inbound"]
+    assert "dana lee (dana@x.com)|budget|1|no reply went out" in signals.keys["inbound"]
     # The cards are the principal's own: a shared read never carries them.
     shared = live_signals.gather_live_signals(_since(), include_private=False)
     assert not any("replied" in line or "no reply" in line for line in shared.inbound)
@@ -489,3 +630,220 @@ def test_a_name_inside_a_longer_name_is_not_an_impostor() -> None:
     assert _uses_principal_name("Ann Lee (CEO)", ann)
     assert not _uses_principal_name("Joann Lee", ann)
     assert not _uses_principal_name("Ann Leeds", ann)
+
+
+def test_the_readers_own_messages_never_change_the_brief_fingerprint(
+    audit: AuditLogger, roster: SimpleNamespace,
+) -> None:
+    """Chatting with the Executive is not news, so it must not make the
+    morning brief's "unchanged" check send a brief."""
+    before = live_signals.gather_live_signals(_since(), include_private=True)
+    _thread_email(audit, roster.principal, "one more thought", message_id="own1")
+    after = live_signals.gather_live_signals(_since(), include_private=True)
+
+    assert after.own and after.keys == before.keys
+
+
+def test_an_own_email_keeps_whether_its_reply_went_out(
+    audit: AuditLogger, roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rule shows an ask only while it is open, so the line must still
+    say when the Executive's reply never went out."""
+    from openexecutive.integrations import unanswered_mail
+
+    monkeypatch.setattr(unanswered_mail, "open_thread_keys", lambda: {"t9"})
+    _thread_email(audit, roster.principal, "send me the deck", message_id="m1", thread_id="t9")
+
+    own = live_signals.gather_live_signals(_since(), include_private=True).own
+
+    assert own[0].endswith("email (no reply went out): send me the deck")
+
+
+def test_contacts_and_teammates_are_named_not_just_addressed(
+    audit: AuditLogger, roster: SimpleNamespace,
+) -> None:
+    """The header calls people by name instead of guessing one from the
+    address (a contact's "mquinn@" read as "Mquinn")."""
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Mara Quinn", email="mquinn@acme.test", kind="contact")
+    _email(audit, "mquinn@acme.test", "Tax bills", private=True)
+    _email(audit, roster.teammate, "Budget")
+    audit.log("integration_outbound_blocked",
+              "Blocked outbound email to mquinn@acme.test (tool=send_gmail_message field=to)",
+              details={"tool": "send_gmail_message", "field": "to", "address": "mquinn@acme.test"},
+              private=True)
+
+    own = live_signals.gather_live_signals(_since(), include_private=True)
+    shared = live_signals.gather_live_signals(_since(), include_private=False)
+
+    assert "from Mara Quinn (mquinn@acme.test): Tax bills" in "\n".join(own.inbound)
+    assert "email to Mara Quinn (mquinn@acme.test) was held" in "\n".join(own.stuck)
+    # A teammate is named in the shared read too; a contact never reaches it.
+    assert "from Dana Lee (dana@x.com): Budget" in "\n".join(shared.inbound)
+    assert "Mara Quinn" not in "\n".join(shared.inbound + shared.stuck)
+
+
+def test_a_drafts_recipient_is_named_when_they_are_a_contact(roster: SimpleNamespace) -> None:
+    from openexecutive.people import store as people_store
+
+    people_store.upsert_person(full_name="Mara Quinn", email="mquinn@acme.test", kind="contact")
+    draft = SimpleNamespace(
+        created_at=datetime.now(UTC).isoformat(),
+        to=["MQuinn@acme.test", "nobody@else.test"],
+        subject="Property tax",
+    )
+
+    line = live_signals.draft_line(draft, UTC)
+
+    assert 'to Mara Quinn (MQuinn@acme.test), nobody@else.test — "Property tax"' in line
+
+
+# --------------------------------------------------------------------------- #
+# Own inbox (the Act as me watcher's notes)
+# --------------------------------------------------------------------------- #
+
+
+def _mail(mid: str, sender: str, name: str, subject: str, at: datetime, thread: str = "") -> Any:
+    from openexecutive.delegation.gmail import MailMessage
+
+    return MailMessage(
+        id=mid, thread_id=thread or f"t-{mid}", from_addr=sender, from_name=name, subject=subject,
+        received_at=at.isoformat(),
+    )
+
+
+@pytest.fixture()
+def principal(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    me = SimpleNamespace(id=7, email="me@co.test", email_aliases=[], full_name="Pat Lee")
+    monkeypatch.setattr(live_signals, "_principal", lambda: me)
+    return me
+
+
+def test_own_inbox_splits_people_they_deal_with_from_the_rest(
+    principal: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation import inbox
+
+    now = datetime(2026, 10, 26, 18, 0, tzinfo=UTC)
+    since = now - timedelta(hours=12)
+    at = now - timedelta(hours=1)
+    inbox._note_mail(7, _mail("m1", "andy@svn.test", "Andy Agee", "Re: loan figures", at), relation="contact")
+    inbox._note_mail(7, _mail("m2", "promo@yardi.test", "Yardi", "Webinar", at), relation="stranger")
+    inbox._note_mail(7, _mail("m3", "kim@co.test", "Kim", "All hands", at), relation="team", reason="not_addressed")
+    # Not news: list mail, the reader's own mail, and mail from before the window.
+    inbox._note_mail(7, _mail("m7", "news@list.test", "Weekly", "Issue 9", at), relation="", reason="mailing_list")
+    inbox._note_mail(7, _mail("m4", "me@co.test", "Pat", "Mine", at), relation="", reason="from_you")
+    inbox._note_mail(7, _mail("m5", "old@co.test", "Old", "Old", now - timedelta(days=2)), relation="contact")
+    # A teammate's own inbox never reaches the principal's header.
+    inbox._note_mail(9, _mail("m6", "x@co.test", "X", "Theirs", at), relation="contact")
+    monkeypatch.setattr(inbox, "outcomes", lambda pid, ids: {"m1": inbox.DRAFTED})
+
+    mail = live_signals.own_inbox(since, UTC, now)
+
+    assert len(mail.lines) == 1
+    assert 'from Andy Agee (andy@svn.test): "Re: loan figures"' in mail.lines[0]
+    assert "on a card waiting" in mail.lines[0]
+    assert sorted(mail.others) == ["Kim: All hands", "Yardi: Webinar"]
+    assert mail.others_total == 2
+    # Which email the line is, for Home to open it.
+    assert len(mail.refs) == 1
+    assert mail.refs[0]["kind"] == "mail" and mail.refs[0]["message_id"] == "m1"
+
+
+def test_own_inbox_leaves_out_mail_they_answered_since(
+    principal: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.briefing import waiting_on
+    from openexecutive.delegation import inbox
+
+    now = datetime(2026, 10, 26, 18, 0, tzinfo=UTC)
+    at = now - timedelta(hours=2)
+    # Judged no reply needed, so no card ever looked for their answer.
+    inbox._note_mail(7, _mail("m1", "andy@svn.test", "Andy Agee", "Re: loan figures", at, "t1"), relation="contact")
+    inbox._note_mail(7, _mail("m2", "dana@co.test", "Dana Fox", "Lease terms", at, "t2"), relation="contact")
+    inbox._note_mail(7, _mail("m3", "lee@co.test", "Lee Park", "Budget", at, "t3"), relation="contact")
+    monkeypatch.setattr(inbox, "outcomes", lambda pid, ids: {m: inbox.NOT_NEEDED for m in ids})
+    sent = {"t1": now - timedelta(hours=1), "t3": at - timedelta(hours=1)}  # t3: before it came
+    monkeypatch.setattr(waiting_on, "replied", lambda: sent)
+
+    mail = live_signals.own_inbox(now - timedelta(hours=12), UTC, now)
+
+    assert sorted(r["message_id"] for r in mail.refs) == ["m2", "m3"]
+    assert mail.total == 2
+    assert not any("loan figures" in line for line in mail.lines)
+
+
+def test_own_inbox_counts_a_send_to_the_sender_from_another_thread(
+    principal: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.briefing import waiting_on
+    from openexecutive.delegation import inbox
+
+    now = datetime(2026, 10, 30, 19, 0, tzinfo=UTC)
+    at = now - timedelta(hours=1)
+    after = now - timedelta(minutes=5)
+    # Signed contracts, nothing needed back; the reader sent them on to
+    # someone else in that person's thread with Mara on copy.
+    inbox._note_mail(7, _mail("m1", "Mara.Quinn@co.test", "Mara Quinn", "Signed contracts", at, "t1"), relation="team")
+    # Dana asked for something; the reader wrote to Dana about lunch: still open.
+    inbox._note_mail(7, _mail("m2", "dana@co.test", "Dana Fox", "Lease terms", at, "t2"), relation="contact")
+    # Lee asked; the reader answered fresh, on the same subject: dealt with.
+    inbox._note_mail(7, _mail("m3", "lee@co.test", "Lee Park", "Budget", at, "t3"), relation="contact")
+    # Kim's FYI came after the reader last wrote to Kim: still news.
+    inbox._note_mail(7, _mail("m4", "kim@co.test", "Kim Ono", "Heads up", at, "t4"), relation="contact")
+    monkeypatch.setattr(inbox, "outcomes", lambda pid, ids: {
+        "m1": inbox.NOT_NEEDED, "m2": "", "m3": "", "m4": inbox.NOT_NEEDED,
+    })
+    monkeypatch.setattr(waiting_on, "replied", lambda: {})
+    monkeypatch.setattr(waiting_on, "wrote_to", lambda: {
+        "mara.quinn@co.test": [(after, "Re: figures")],
+        "dana@co.test": [(after, "Lunch Friday?")],
+        "lee@co.test": [(after, "Re: Budget")],
+        "kim@co.test": [(at - timedelta(hours=1), "Hello")],
+    })
+
+    mail = live_signals.own_inbox(now - timedelta(hours=12), UTC, now)
+
+    assert sorted(r["message_id"] for r in mail.refs) == ["m2", "m4"]
+
+
+def test_newer_mail_on_an_open_card_is_news_and_noted_once(
+    principal: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.delegation import inbox
+
+    now = datetime(2026, 10, 26, 18, 0, tzinfo=UTC)
+    monkeypatch.setattr(inbox, "_NOTED_LATER", set())
+    card = SimpleNamespace(id=39)
+    payload = {"relation": "contact"}
+    later = [
+        _mail("r1", "andy@svn.test", "Andy Agee", "Re: loan figures", now - timedelta(hours=2), "t1"),
+        _mail("r2", "me@co.test", "Pat", "Re: loan figures", now - timedelta(hours=1), "t1"),
+    ]
+    inbox._note_later(7, card, payload, later, {"me@co.test"})
+    inbox._note_later(7, card, payload, later, {"me@co.test"})  # the next scan reads it again
+    monkeypatch.setattr(inbox, "outcomes", lambda pid, ids: {})
+
+    mail = live_signals.own_inbox(now - timedelta(hours=12), UTC, now)
+
+    assert len(mail.lines) == 1
+    assert "reply card is still open" in mail.lines[0]
+    assert mail.refs[0] == {"kind": "mail", "message_id": "r1", "thread_id": "t1", "decision_id": 39}
+    rows = live_signals._audit_rows(inbox.MAIL_SEEN_EVENT, now - timedelta(days=1), True)
+    assert len([r for r in rows if r.details.get("message_id") == "r1"]) <= 1
+
+
+def test_own_inbox_is_the_principals_alone(principal: SimpleNamespace) -> None:
+    from openexecutive.delegation import inbox
+
+    now = datetime.now(UTC)
+    inbox._note_mail(7, _mail("m1", "andy@svn.test", "Andy", "Hi", now - timedelta(minutes=30)), relation="contact")
+
+    shared = live_signals.gather_live_signals(now - timedelta(hours=6), now=now, include_private=False)
+    own = live_signals.gather_live_signals(now - timedelta(hours=6), now=now, include_private=True)
+
+    assert shared.inbox == ()
+    assert len(own.inbox) == 1
+    # Right now's alone: the briefs don't count it.
+    assert own.is_empty()

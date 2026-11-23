@@ -6,6 +6,8 @@ import { useEffect, useState } from "react";
 
 import { AskOEProvider, useAskOE } from "@/components/askoe/AskOEContext";
 import AskOEPanel from "@/components/askoe/AskOEPanel";
+import EmbeddedShell from "@/components/embed/EmbeddedShell";
+import { useEmbed } from "@/components/embed/EmbedProvider";
 import Icon from "@/components/Icon";
 import PausedBanner from "@/components/executive/PausedBanner";
 import AppSidebar from "@/components/shell/AppSidebar";
@@ -23,27 +25,31 @@ import HubTabs from "@/components/ui/HubTabs";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 
 // Routes that own their full layout and should not be wrapped by the
-// shell — sign-in, the onboarding wizard (full-screen flow), and the
+// shell — sign-in, the onboarding wizard (full-screen flow), a shared
+// document's public page (opened by people with no account), and the
 // chat home (`/`), which keeps its own top bar and debug panel but
 // renders the same `AppSidebar` as every other route.
-const EXEMPT_PREFIXES = ["/signin", "/onboard", "/api"];
+const EXEMPT_PREFIXES = ["/signin", "/onboard", "/api", "/shared"];
 const EXEMPT_EXACT = new Set(["/"]);
 
 // Human-readable labels for path segments shown in the breadcrumb.
-// Dynamic segments (slugs / ids) are rendered raw and truncated by CSS.
+// A dynamic segment shows the name its page gives it (``usePageCrumb``); one
+// that is only an id (``looksLikeId``) and has no name is left out, never
+// shown raw. Other slugs render as they are, truncated by CSS.
 // `company-profile` is the team label; TopBar names it for the mode and
 // role, as the sidebar does.
 const SEGMENT_LABELS: Record<string, string> = {
   today: "Today",
   review: "Review",
+  shared: "Shared with you",
   proposals: "Proposals",
   people: "People",
   departments: "Departments",
   goals: "Goals",
-  memories: "Pulse",
+  memories: "Memory",
   knowledge: "Knowledge",
   jobs: "Workflows",
-  artifacts: "Documents",
+  artifacts: "Made for you",
   chats: "Chats",
   runs: "Runs",
   new: "New",
@@ -56,22 +62,30 @@ const SEGMENT_LABELS: Record<string, string> = {
   demo: "Company Simulator",
   onboard: "Setup",
   watchlist: "Watch list",
+  schedule: "Schedule",
+  tasks: "Tasks",
   settings: "Settings",
   status: "Setup status",
   executive: "Your Executive",
-  "act-as-me": "Act as me",
   delegate: "Delegate",
-  "what-it-may-do": "What it may do",
-  "handle-it": "Handle it for me",
-  "take-the-lead": "Take the lead",
   memory: "About you",
   workspace: "Workspace",
   advanced: "Advanced",
-  tools: "Custom tools",
+  tools: "Tools I built",
   about: "About",
   guide: "User Guide",
   clients: "Client Companies",
+  cards: "Card",
 };
+
+// A record's id in the URL (a chat, a run, a person's number), never a name.
+function looksLikeId(segment: string): boolean {
+  return (
+    /^\d+$/.test(segment) ||
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment) ||
+    /^[0-9a-f]{16,}$/i.test(segment)
+  );
+}
 
 function labelFor(segment: string): string {
   return SEGMENT_LABELS[segment] ?? segment;
@@ -114,8 +128,31 @@ function useFirstRunGate(pathname: string): boolean {
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "/";
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const { mode, role } = useWorkspace();
+  const { mode, role, hasDepartments } = useWorkspace();
   const redirecting = useFirstRunGate(pathname);
+  const { embedded } = useEmbed();
+
+  // In a host's frame (components/embed/EmbedProvider.tsx): the host has its
+  // own navigation, header and help, so this shell's sidebar, top bar,
+  // bottom bar and Ask OE panel are left out; the hub's tabs, the paused
+  // banner and the page stay.
+  if (embedded) {
+    const top = pathname.split("/").filter(Boolean)[0];
+    return (
+      <AskOEProvider>
+        <PageCrumbProvider>
+          <EmbeddedShell
+            pathname={pathname}
+            title={top ? labelFor(top) : "Home"}
+            hub={hubForPath(pathname, { mode, roleKind: role.role_kind })}
+            bare={isExempt(pathname) || redirecting}
+          >
+            {redirecting ? <div className="h-full bg-surface" /> : children}
+          </EmbeddedShell>
+        </PageCrumbProvider>
+      </AskOEProvider>
+    );
+  }
 
   if (isExempt(pathname)) {
     return <>{children}</>;
@@ -125,12 +162,20 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   const segments = pathname.split("/").filter(Boolean);
-  const hub = hubForPath(pathname, { mode, roleKind: role.role_kind });
+  const hub = hubForPath(pathname, { mode, roleKind: role.role_kind, hasDepartments });
 
   return (
     <AskOEProvider>
       <PageCrumbProvider>
-      <div className="flex h-full bg-surface text-fg">
+      {/* relative + overflow-clip: an absolutely positioned element inside a
+          page (Tailwind's sr-only labels, for one) has no positioned
+          ancestor in the scroll slot, so it escapes the slot's overflow and
+          stretches the document. On a phone that made the whole page
+          scrollable: the bottom bar slid up off the bottom edge, and
+          scrolling the drawer chained to the page behind it. This box is
+          their containing block now, and clip (unlike hidden) can't be
+          scrolled by script or focus either. */}
+      <div className="relative flex h-full overflow-clip bg-surface text-fg">
         {/* Mobile backdrop */}
         {drawerOpen && (
           <div
@@ -193,18 +238,20 @@ function TopBar({
   // navigable pages, so we render them as plain text to avoid linking
   // to a 404. Dynamic segments (slugs/uuids) also render as-is — pages
   // own their own H1 with the entity name.
-  const pageCrumbs = segments.map((segment, idx) => {
+  const pageCrumbs = segments.flatMap((segment, idx) => {
     const linkable = idx === 0;
     const href = linkable ? "/" + segment : null;
-    return {
+    const named = idx === segments.length - 1 && idx > 0 && pageLabel;
+    // An id with no name from its page is left out rather than shown raw.
+    if (!named && idx > 0 && looksLikeId(segment)) return [];
+    return [{
       href,
-      label:
-        idx === segments.length - 1 && idx > 0 && pageLabel
-          ? pageLabel
-          : idx === 0 && segment === "company-profile"
-            ? profileLabel
-            : labelFor(segment),
-    };
+      label: named
+        ? pageLabel
+        : idx === 0 && segment === "company-profile"
+          ? profileLabel
+          : labelFor(segment),
+    }];
   });
   // The Advanced pages (Agent Council, Audit log, ...) live at their own
   // paths but are opened from Settings → Advanced: show that way back.

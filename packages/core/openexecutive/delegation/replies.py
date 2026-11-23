@@ -41,8 +41,8 @@ class ReplyCard:
     # "follow_up" when the draft chases the person's own unanswered email
     # (delegation.follow_ups); "" for a reply to someone else's.
     source: str = ""
-    # Send + allow: Replies (Follow-ups, on a follow-up) is in training and
-    # this sender (these people) isn't allowed yet (delegation.training).
+    # In training: "Send to them on its own next time" (this sender, or a
+    # follow-up's people, aren't allowed yet; delegation.training).
     can_allow: bool = False
     # Drafts is in training: "Do it like this next time" keeps a draft they
     # changed as how they write to this person.
@@ -52,6 +52,40 @@ class ReplyCard:
     in_mailbox: bool = True
     # Which of their mailboxes it sends from: "Gmail" or "Outlook".
     mailbox: str = "Gmail"
+    # The open questions with what can be tapped to answer each
+    # (delegation.answers.questions_for): text, choices, source, answer.
+    questions: list[dict[str, Any]] = field(default_factory=list)
+    # Changed by hand on the card: what is left open no longer holds Send.
+    questions_settled: bool = False
+    # Everyone else the email went to: the card's Reply to choice adds them
+    # (delegation.card_drafts.set_recipients). Empty: no choice to make.
+    reply_others: list[str] = field(default_factory=list)
+    # What the email asks and what the draft says, in a line or two, for the
+    # card's closed view; "" on a card drafted before it (the card falls back
+    # to the start of what they wrote).
+    gist: str = ""
+    # What happened on the card since the draft was written, in order
+    # (delegation.answers.conversation): newer email in the conversation,
+    # what they asked to change, and what the Executive said it did.
+    conversation: list[dict[str, Any]] = field(default_factory=list)
+    # When it was last brought up to date with newer mail ("" never): Send
+    # passes it back, so a version the card never showed asks again.
+    caught_up_at: str = ""
+    # The Executive is doing what the email asks right now
+    # (delegation.card_work); the card shows it working.
+    working: bool = False
+    # While it works: the steps it did so far, and what it is doing now.
+    work_steps: list[str] = field(default_factory=list)
+    work_now: str = ""
+    # The files the reply carries, by name (delegation.card_work).
+    files: list[str] = field(default_factory=list)
+    # Who it goes from (delegation.send_from): the Executive, from its own
+    # mailbox with the person on cc, or the person (False).
+    from_executive: bool = False
+    # The Executive's name, for the card's From choice.
+    executive_name: str = ""
+    # Undo can take back the last change they asked for (card_drafts.undo).
+    can_undo: bool = False
 
 
 def _strings(value: Any) -> list[str]:
@@ -60,10 +94,12 @@ def _strings(value: Any) -> list[str]:
 
 def cards(person: Any) -> list[ReplyCard]:
     """``person``'s open reply cards, newest first."""
-    from openexecutive.delegation import training
+    from openexecutive.delegation import card_drafts, card_work, send_from, training
+    from openexecutive.delegation.answers import conversation, questions_for
+    from openexecutive.delegation.card_drafts import QUESTIONS_SETTLED, version
     from openexecutive.delegation.gmail import credential_provider, mailbox_link
     from openexecutive.delegation.handle_it import REASONS
-    from openexecutive.delegation.inbox import card_payload, ledger_flags, open_cards
+    from openexecutive.delegation.inbox import REPLY_OTHERS, card_payload, ledger_flags, open_cards
 
     open_ = open_cards(person.id)
     payloads = [(c, card_payload(c)) for c in open_]
@@ -75,6 +111,7 @@ def cards(person: Any) -> list[ReplyCard]:
     for card, payload in payloads:
         thread_id = str(payload.get("thread_id") or "")
         draft_id = str(payload.get("draft_id") or "")
+        working = payload.get(card_work.WORK_KEY) == card_work.WORKING and card_work.running(card.id)
         flags = list(dict.fromkeys([
             *_strings(payload.get("flags")), *added.get(str(payload.get("message_id") or ""), []),
         ]))
@@ -101,22 +138,28 @@ def cards(person: Any) -> list[ReplyCard]:
             ),
             waited_because=REASONS.get(str(payload.get("handle_it_reason") or ""), ""),
             source="follow_up" if payload.get("source") == "follow_up" else "",
-            can_allow=_can_allow(person.id, payload, trained),
+            can_allow=training.can_allow_reply(person.id, payload, trained),
             learns_style=trained.drafts,
             in_mailbox=bool(draft_id),
             mailbox=mailbox,
+            questions=questions_for(payload),
+            questions_settled=payload.get(QUESTIONS_SETTLED) is True,
+            reply_others=[] if payload.get("source") == "follow_up" else _strings(payload.get(REPLY_OTHERS)),
+            gist=str(payload.get("gist") or ""),
+            conversation=conversation(payload),
+            caught_up_at=version(payload),
+            working=working,
+            work_steps=card_work.steps(payload) if working else [],
+            work_now=str(payload.get(card_work.NOW_KEY) or "") if working else "",
+            files=[
+                str(f.get("name") or "") for f in payload.get(card_work.FILES_KEY) or []
+                if isinstance(f, dict) and f.get("name")
+            ],
+            from_executive=send_from.is_from_executive(payload),
+            executive_name=send_from.executive_name(),
+            can_undo=card_drafts.can_undo(payload),
         ))
     return out
-
-
-def _can_allow(person_id: int, payload: dict[str, Any], trained: Any) -> bool:
-    from openexecutive.delegation import handle_it
-
-    if payload.get("source") == "follow_up":
-        going = _strings(payload.get("draft_to"))
-        return bool(trained.follow_ups and going and not handle_it.follow_up_allowed(person_id, going))
-    sender = str(payload.get("from_email") or "")
-    return bool(trained.replies and sender and not handle_it.allowed_in_training(person_id, sender))
 
 
 async def dismiss(instance: Any, *, gmail: Any = None) -> str:

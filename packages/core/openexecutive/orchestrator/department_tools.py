@@ -8,8 +8,10 @@ setback ("we lost the Acme deal"). They close the loop that Phase A's
 the same `last_reviewed_at` column the cadence-driven review writes to.
 
 `create_goal` starts tracking a NEW goal the principal states ("20
-paying clients by the end of Q4"), filed under an area / department named
-by slug or title — creating that area when none matches. Only the
+paying clients by the end of Q4"), with an owner from the team and,
+optionally, an area / department named by slug or title — creating that
+area when none matches. A goal with no area stands on its own: it renders
+under its owner and the weekly ``goal_review`` grades it. Only the
 principal, on a surface that verified it is them, may call it (the roster
 tools' rule): a goal renders in every turn's org block as one of the
 principal's own, so a goal from an inbound email, a teammate or an
@@ -39,7 +41,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_VALID_GOAL_STATUSES = ("on_track", "at_risk", "off_track")
+_VALID_GOAL_STATUSES = ("on_track", "at_risk", "off_track", "done")
 _VALID_PERIOD_TYPES = ("week", "month", "quarter", "year", "ongoing")
 
 # Field caps — the same limits the goal and department routes enforce
@@ -67,11 +69,13 @@ _goals_created_by_turn: dict[tuple[str | None, str], int] = {}
 LIST_DEPARTMENT_GOALS_TOOL: dict[str, Any] = {
     "name": "list_department_goals",
     "description": (
-        "List a department's Goals with their ids, key_results, current "
-        "progress, statuses, and last-reviewed timestamps. Use this to "
-        "resolve a verbal goal reference ('the migration goal', "
-        "'our Q2 ARR target') to a goal_id before calling "
-        "update_department_goal. Returns a compact JSON list."
+        "List Goals with their ids, owners, departments, key_results, "
+        "current progress, statuses, and last-reviewed timestamps. Pass "
+        "department_slug for one department's goals; omit it for every "
+        "goal, including those with no department. Use this to resolve a "
+        "verbal goal reference ('the migration goal', 'our Q2 ARR target') "
+        "to a goal_id before calling update_department_goal. Returns a "
+        "compact JSON list."
     ),
     "input_schema": {
         "type": "object",
@@ -79,12 +83,13 @@ LIST_DEPARTMENT_GOALS_TOOL: dict[str, Any] = {
             "department_slug": {
                 "type": "string",
                 "description": (
-                    "Lowercase slug from the department registry "
-                    "(e.g. 'engineering', 'finance', 'marketing')."
+                    "Optional. Lowercase slug from the department registry "
+                    "(e.g. 'engineering', 'finance', 'marketing'). Omit to "
+                    "list every goal."
                 ),
             },
         },
-        "required": ["department_slug"],
+        "required": [],
     },
 }
 
@@ -92,13 +97,14 @@ LIST_DEPARTMENT_GOALS_TOOL: dict[str, Any] = {
 UPDATE_DEPARTMENT_GOAL_TOOL: dict[str, Any] = {
     "name": "update_department_goal",
     "description": (
-        "Update a department Goal's status, current-progress text, or "
-        "both — based on something the user just told you. Call this "
+        "Update a Goal's status, current-progress text, owner, or "
+        "several — based on something the user just told you. Call this "
         "when the user reports concrete progress on (or a setback to) a "
         "tracked Goal: 'we shipped the billing migration' (likely a "
         "current update + bump to on_track), 'lost the Acme deal' "
         "(status to at_risk or off_track), 'closed 40% of the ARR "
-        "target' (current update). Use `list_department_goals` first "
+        "target' (current update), 'the launch is finished' (status to "
+        "done, which takes the goal out of the weekly reviews). Use `list_department_goals` first "
         "if you don't already have the goal_id from earlier in the "
         "conversation. Do NOT use this to refuse and redirect to the "
         "UI — the user expects the update to just happen. Do NOT use "
@@ -116,7 +122,11 @@ UPDATE_DEPARTMENT_GOAL_TOOL: dict[str, Any] = {
         "properties": {
             "department_slug": {
                 "type": "string",
-                "description": "Lowercase department slug owning the goal.",
+                "description": (
+                    "Optional. Lowercase slug of the department the goal is "
+                    "in; omit for a goal with no department. When given it "
+                    "must match the goal's department."
+                ),
             },
             "goal_id": {
                 "type": "integer",
@@ -139,6 +149,14 @@ UPDATE_DEPARTMENT_GOAL_TOOL: dict[str, Any] = {
                     "`current`."
                 ),
             },
+            "owner_person_id": {
+                "type": "integer",
+                "description": (
+                    "Optional. Who owns the goal from now on: a teammate's id "
+                    "from list_people (someone on the team, never a contact). "
+                    "Use when the user says who owns it now ('Jordan owns it')."
+                ),
+            },
             "rationale": {
                 "type": "string",
                 "description": (
@@ -151,7 +169,7 @@ UPDATE_DEPARTMENT_GOAL_TOOL: dict[str, Any] = {
                 ),
             },
         },
-        "required": ["department_slug", "goal_id", "rationale"],
+        "required": ["goal_id", "rationale"],
     },
 }
 
@@ -163,9 +181,12 @@ CREATE_GOAL_TOOL: dict[str, Any] = {
         "target in their own words: 'get to 20 paying clients by the end of "
         "Q4', 'ship the mobile app this quarter'. Only the principal can set "
         "goals, and only from a conversation that confirms it is them; for "
-        "anyone else it is refused. Files it under an area (a department) "
-        "named by slug or title; an area that does not exist yet is created. "
-        "If the goal may "
+        "anyone else it is refused. The goal is the principal's unless they "
+        "name someone on the team to own it (resolve the name with "
+        "list_people). Leave area out unless the principal names one or the "
+        "goal clearly belongs to an existing department: a goal needs no "
+        "department. When given, area is a department named by slug or "
+        "title, and one that does not exist yet is created. If the goal may "
         "already be tracked, check with list_department_goals first and "
         "use update_department_goal to change an existing goal's status or "
         "progress instead. Creates ONE goal per call, each backed by a "
@@ -182,9 +203,19 @@ CREATE_GOAL_TOOL: dict[str, Any] = {
             "area": {
                 "type": "string",
                 "description": (
-                    "The area or department the goal belongs to: its slug "
-                    "('finance') or its title ('Marketing', 'Client work'). "
-                    "When none matches, a new area with this title is created."
+                    "Optional. The area or department the goal belongs to: "
+                    "its slug ('finance') or its title ('Marketing', 'Client "
+                    "work'). When none matches, a new area with this title is "
+                    "created. Omit for a goal with no department."
+                ),
+            },
+            "owner_person_id": {
+                "type": "integer",
+                "description": (
+                    "Optional. The person_id (from list_people) of the team "
+                    "member who owns the goal, when the principal named "
+                    "someone. Omit and it follows its department's lead, "
+                    "else the principal."
                 ),
             },
             "key_result": {
@@ -234,7 +265,7 @@ CREATE_GOAL_TOOL: dict[str, Any] = {
                 ),
             },
         },
-        "required": ["area", "key_result", "target", "rationale"],
+        "required": ["key_result", "target", "rationale"],
     },
 }
 
@@ -284,19 +315,14 @@ def _audit(
 
 
 async def handle_list_department_goals(tool_input: dict[str, Any]) -> str:
-    from openexecutive.departments import store as dept_store
+    from openexecutive.departments.goals import list_goal_views
 
-    slug = str(tool_input.get("department_slug", "")).strip()
-    if not slug:
-        _audit(
-            "list_department_goals", "read", False,
-            "list_department_goals bad input: empty department_slug",
-            {"error": "department_slug required"},
-        )
-        return json.dumps({"error": "department_slug is required"})
-
+    # Blank or omitted lists every goal, with or without a department.
+    slug = str(tool_input.get("department_slug") or "").strip() or None
     try:
-        goals = dept_store.list_goals(slug)
+        views = [
+            v for v in list_goal_views() if slug is None or v.goal.department_slug == slug
+        ]
     except Exception as exc:
         logger.exception("list_department_goals: failed slug=%s", slug)
         _audit(
@@ -309,19 +335,22 @@ async def handle_list_department_goals(tool_input: dict[str, Any]) -> str:
 
     out = [
         {
-            "id": g.id,
-            "key_result": g.key_result,
-            "target": g.target,
-            "current": g.current,
-            "status": g.status,
-            "period": f"{g.period_type} {g.period_value}".strip(),
-            "last_reviewed_at": g.last_reviewed_at,
+            "id": v.goal.id,
+            "key_result": v.goal.key_result,
+            "target": v.goal.target,
+            "current": v.goal.current,
+            "status": v.goal.status,
+            "period": f"{v.goal.period_type} {v.goal.period_value}".strip(),
+            "owner_person_id": v.owner_id,
+            "owner": v.owner_name or None,
+            "department_slug": v.goal.department_slug,
+            "last_reviewed_at": v.goal.last_reviewed_at,
         }
-        for g in goals
+        for v in views
     ]
     _audit(
         "list_department_goals", "read", True,
-        f"list_department_goals {slug}: {len(out)} goal(s)",
+        f"list_department_goals {slug or 'all'}: {len(out)} goal(s)",
         {"department_slug": slug, "count": len(out)},
         department=slug,
     )
@@ -344,9 +373,8 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
         return json.dumps({"error": err})
 
     # ---- Input validation ----
-    slug = str(tool_input.get("department_slug", "")).strip()
-    if not slug:
-        return _bad("department_slug is required")
+    # Optional: a goal with no department is named by its id alone.
+    slug = str(tool_input.get("department_slug") or "").strip() or None
 
     raw_goal_id = tool_input.get("goal_id")
     try:
@@ -367,16 +395,49 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
 
     status_in = tool_input.get("status")
     current_in = tool_input.get("current")
-    if status_in is None and current_in is None:
+    owner_in = tool_input.get("owner_person_id")
+    if status_in is None and current_in is None and owner_in is None:
         return _bad(
-            "must supply at least one of `status` or `current`",
+            "must supply at least one of `status`, `current` or `owner_person_id`",
             department_slug=slug, goal_id=goal_id,
         )
+    owner_id: int | None = None
+    if owner_in is not None:
+        from openexecutive.people import store as people_store
+
+        try:
+            if isinstance(owner_in, bool):
+                raise TypeError("owner_person_id must be an integer")
+            owner_id = int(owner_in)
+        except (TypeError, ValueError):
+            return _bad("owner_person_id must be an integer", department_slug=slug, goal_id=goal_id)
+        owner = people_store.get_person(owner_id)
+        # A goal is owned by someone on the team, never an outside contact
+        # (as on the Goals page).
+        if owner is None or owner.archived or owner.kind != "team":
+            return _bad(
+                "owner_person_id must be someone on the team (list_people)",
+                department_slug=slug, goal_id=goal_id,
+            )
 
     if status_in is not None and status_in not in _VALID_GOAL_STATUSES:
         return _bad(
             f"status must be one of {list(_VALID_GOAL_STATUSES)}; got {status_in!r}",
             department_slug=slug, goal_id=goal_id,
+        )
+
+    # Marking a goal done takes it out of every review, so nothing regrades
+    # a wrong call. Only the principal makes it, as with a new goal.
+    if status_in == "done" and not _principal_asked():
+        from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
+        return _bad(
+            "refused: only the principal can mark a goal done, and this request "
+            "did not come from a conversation that confirms it is them. Tell "
+            "whoever asked, plainly, that the principal can do it on the Goals "
+            "page, or by asking in the web app or their own Slack or Discord. "
+            f"{PASS_ON_NOTHING}",
+            department_slug=slug, goal_id=goal_id, refused=True,
         )
 
     current_str: str | None = None
@@ -392,16 +453,37 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
     if existing is None:
         return _bad(f"goal {goal_id} not found",
                     department_slug=slug, goal_id=goal_id)
-    if existing.department_slug != slug:
+    if slug is not None and existing.department_slug != slug:
+        where = (
+            f"department {existing.department_slug!r}"
+            if existing.department_slug else "no department"
+        )
         return _bad(
-            f"goal {goal_id} belongs to department "
-            f"{existing.department_slug!r}, not {slug!r}",
+            f"goal {goal_id} belongs to {where}, not {slug!r}",
             department_slug=slug, goal_id=goal_id,
+        )
+    # Audit and report the goal's real department, given or not.
+    slug = existing.department_slug
+    # Reopening a goal the principal closed is their call too.
+    if (
+        existing.status == "done"
+        and status_in not in (None, "done")
+        and not _principal_asked()
+    ):
+        from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
+        return _bad(
+            "refused: this goal is marked done, and only the principal can "
+            "reopen it. Tell whoever asked, plainly, that the principal can do it "
+            "on the Goals page, or by asking in the web app or their own Slack "
+            f"or Discord. {PASS_ON_NOTHING}",
+            department_slug=slug, goal_id=goal_id, refused=True,
         )
 
     # ---- Persist ----
     prior_status = existing.status
     prior_current = existing.current
+    prior_owner = existing.owner_person_id
     prior_updated_at = existing.updated_at
     now_iso = datetime.now(UTC).isoformat()
 
@@ -409,12 +491,21 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
         # `update_goal` accepts an optional `last_reviewed_at` so we record
         # the chat-driven review in the same SQL transaction — single row
         # mutation, single Honcho mirror, single `updated_at` bump.
-        updated = dept_store.update_goal(
-            goal_id,
-            status=status_in if status_in is not None else None,
-            current=current_str,
-            last_reviewed_at=now_iso,
-        )
+        if owner_id is not None:
+            updated = dept_store.update_goal(
+                goal_id,
+                status=status_in if status_in is not None else None,
+                current=current_str,
+                last_reviewed_at=now_iso,
+                owner_person_id=owner_id,
+            )
+        else:
+            updated = dept_store.update_goal(
+                goal_id,
+                status=status_in if status_in is not None else None,
+                current=current_str,
+                last_reviewed_at=now_iso,
+            )
     except Exception as exc:
         logger.exception("update_department_goal: store.update_goal failed id=%s", goal_id)
         _audit(
@@ -441,9 +532,10 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
 
     new_status = status_in if status_in is not None else prior_status
     summary = (
-        f"update_department_goal {slug}/{goal_id}: "
+        f"update_department_goal {slug or 'goal'}/{goal_id}: "
         f"{prior_status}->{new_status}"
         + ("" if current_str is None else " (current updated)")
+        + ("" if owner_id is None else f" (owner person {owner_id})")
     )
     _audit(
         "update_department_goal", "write", True, summary,
@@ -454,6 +546,8 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
             "to_status": new_status,
             "prior_current": prior_current,
             "new_current": current_str,
+            "prior_owner_person_id": prior_owner,
+            "owner_person_id": owner_id if owner_id is not None else prior_owner,
             "prior_updated_at": prior_updated_at,
             "rationale": rationale[:280],
         },
@@ -467,6 +561,7 @@ async def handle_update_department_goal(tool_input: dict[str, Any]) -> str:
         "from_status": prior_status,
         "to_status": new_status,
         "current_updated": current_str is not None,
+        **({"owner_person_id": owner_id} if owner_id is not None else {}),
     })
 
 
@@ -560,9 +655,9 @@ def _caller_context() -> dict[str, Any]:
 def _principal_asked() -> bool:
     """Whether this turn is the principal on a surface that verified it is
     them — the roster tools' rule (``people_tools.is_principal_on_verified_
-    surface``): the web chat, their own Slack or Discord, a private Telegram
-    chat with a valid webhook secret. Email, Google Chat, the CLI, the MCP
-    server, teammates and unattended runs are not. Fails closed."""
+    surface``): the web chat, their own Slack, Discord or Google Chat, a
+    private Telegram chat with a valid webhook secret. Email, the CLI, the
+    MCP server, teammates and unattended runs are not. Fails closed."""
     from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
     from openexecutive.orchestrator.schedule_tools import current_session
 
@@ -592,18 +687,19 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
     # so only they set one: never an inbound email, a teammate, or a run
     # nobody is watching.
     if not _principal_asked():
+        from openexecutive.orchestrator.speaker import PASS_ON_NOTHING
+
         return _bad(
             "refused: only the principal can set a goal, and this request did "
             "not come from a conversation that confirms it is them. Tell whoever "
-            "asked that the principal needs to add it — in the web app, or by "
-            "asking there or in their own Slack or Discord.",
+            "asked, plainly, that the principal can add it in the web app, or by "
+            f"asking there or in their own Slack or Discord. {PASS_ON_NOTHING}",
             refused=True, **_caller_context(),
         )
 
     # ---- Input validation ----
+    # Optional: blank means the goal has no department.
     area = _optional_text(tool_input, "area")
-    if not area:
-        return _bad("area is required (an area / department slug or title)")
     if len(area) > _AREA_MAX:
         return _bad(f"area must be at most {_AREA_MAX} characters")
 
@@ -636,6 +732,8 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
             f"status must be one of {list(_VALID_GOAL_STATUSES)}; got {raw_status!r}",
             area=area,
         )
+    if raw_status == "done":
+        return _bad("a new goal can't start as done", area=area)
     status = cast("GoalStatus", raw_status)
     period_value = _optional_text(tool_input, "period_value")
     if not period_value:
@@ -645,6 +743,25 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
             period_value = default_period_value(period_type, datetime.now(UTC).date())
     if len(period_value) > _PERIOD_VALUE_MAX:
         return _bad(f"period_value must be at most {_PERIOD_VALUE_MAX} characters", area=area)
+
+    owner_id: int | None = None
+    raw_owner = tool_input.get("owner_person_id")
+    if raw_owner is not None:
+        if isinstance(raw_owner, bool):
+            return _bad("owner_person_id must be an integer", area=area)
+        try:
+            owner_id = int(raw_owner)
+        except (TypeError, ValueError):
+            return _bad("owner_person_id must be an integer", area=area)
+        from openexecutive.people import store as people_store
+
+        owner = people_store.get_person(owner_id)
+        if owner is None or owner.archived or owner.kind != "team":
+            return _bad(
+                f"owner_person_id {owner_id} is not on the team — resolve the "
+                "name with list_people, or leave the owner out",
+                area=area,
+            )
 
     turn = _turn_key()
     if _turn_cap_reached(turn):
@@ -659,31 +776,14 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
     try:
         dept_store.initialize_db()
         existing = dept_store.list_departments()
-        match = dept_store.match_department(area, [d.config for d in existing])
+        match = (
+            dept_store.match_department(area, [d.config for d in existing]) if area else None
+        )
         created = False
         specialist_key: str | None = None
-        if match is not None:
-            slug, title = match.slug, match.title
-            state = next(d for d in existing if d.config.slug == slug)
-            wanted = _norm_goal_text(key_result)
-            dupe = next(
-                (g for g in state.goals if _norm_goal_text(g.key_result) == wanted), None
-            )
-            if dupe is not None:
-                return _bad(
-                    f"goal {dupe.id} in {slug!r} already tracks {dupe.key_result!r} — "
-                    "call update_department_goal with that goal_id to change it",
-                    department_slug=slug, goal_id=dupe.id,
-                )
-            if len(state.goals) >= _MAX_GOALS_PER_AREA:
-                return _bad(
-                    f"refused: {title!r} already tracks {len(state.goals)} goals "
-                    f"(the most this tool adds to one area is {_MAX_GOALS_PER_AREA}). "
-                    "Ask the principal which existing goal this replaces, or to "
-                    "add it on the Goals page.",
-                    department_slug=slug, refused=True,
-                )
-        else:
+        slug: str | None = None
+        title: str | None = None
+        if area and match is None:
             title = _area_title(area)
             candidate = dept_store.specialist_key_for_area(title)
             # One department per specialist: a second would make the
@@ -693,9 +793,43 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
             new_state = dept_store.create_department(title, specialist_key=specialist_key)
             slug, title = new_state.config.slug, new_state.config.title
             created = True
+        else:
+            if match is not None:
+                slug, title = match.slug, match.title
+                siblings = next(d for d in existing if d.config.slug == slug).goals
+                group = f"the {title!r} area"
+            else:
+                siblings = dept_store.list_goals(None)
+                group = "the goals with no department"
+            wanted = _norm_goal_text(key_result)
+            dupe = next(
+                # A finished goal doesn't block the same goal for a new period.
+                (
+                    g for g in siblings
+                    if g.status != "done" and _norm_goal_text(g.key_result) == wanted
+                ),
+                None,
+            )
+            if dupe is not None:
+                return _bad(
+                    f"goal {dupe.id} already tracks {dupe.key_result!r} — "
+                    "call update_department_goal with that goal_id to change it",
+                    department_slug=slug, goal_id=dupe.id,
+                )
+            # Finished goals don't count toward the cap.
+            open_count = sum(1 for g in siblings if g.status != "done")
+            if open_count >= _MAX_GOALS_PER_AREA:
+                return _bad(
+                    f"refused: {open_count} goals are already tracked in {group} "
+                    f"(the most this tool adds to one group is {_MAX_GOALS_PER_AREA}). "
+                    "Ask the principal which existing goal this replaces, or to "
+                    "add it on the Goals page.",
+                    department_slug=slug, refused=True,
+                )
 
         goal_id = dept_store.insert_goal(
             slug,
+            owner_person_id=owner_id,
             period_type=period_type,
             period_value=period_value,
             key_result=key_result,
@@ -720,12 +854,13 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
 
     _audit(
         "create_goal", "write", True,
-        f"create_goal {slug}/{goal_id}"
+        f"create_goal {slug or 'goal'}/{goal_id}"
         + (" (new area)" if created else "")
         + f": {key_result[:80]}",
         {
             "department_slug": slug,
             "goal_id": goal_id,
+            "owner_person_id": owner_id,
             "area_created": created,
             "specialist_key": specialist_key,
             "key_result": key_result[:280],
@@ -742,6 +877,7 @@ async def handle_create_goal(tool_input: dict[str, Any]) -> str:
         "area_slug": slug,
         "area_title": title,
         "area_created": created,
+        "owner_person_id": owner_id,
         "period": f"{period_type} {period_value}",
     })
 

@@ -87,6 +87,11 @@ def gather_engagement_activity(
     if not db_path.exists():
         return activity
 
+    if not read_only:
+        # Decisions are standing facts now; this copies an older DB's in once.
+        from openexecutive.memory import facts
+
+        facts.ensure_ready(db_path)
     if read_only:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     else:
@@ -101,16 +106,33 @@ def gather_engagement_activity(
         }
         rng = (since_iso, until_iso)
 
-        if "decisions" in tables:
+        # Decisions live as standing facts once the store copied them in
+        # (facts_meta); a parked slot from before that still has its own table.
+        copied = "facts_meta" in tables and conn.execute(
+            "SELECT 1 FROM facts_meta WHERE key = 'decisions_copied_to_facts'"
+        ).fetchone() is not None
+        # The team's decisions only. A parked slot from before private
+        # decisions has no such column, and none to leave out.
+        fact_cols = (
+            {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()} if copied else set()
+        )
+        team_only = " AND private_to_person_id IS NULL" if "private_to_person_id" in fact_cols else ""
+        source = (
+            "(SELECT created_at AS timestamp, CASE WHEN department != '' THEN department "
+            "ELSE 'general' END AS domain, statement AS summary, outcome FROM facts "
+            f"WHERE decision = 1 AND status = 'active'{team_only})"
+            if copied else "decisions"
+        )
+        if copied or "decisions" in tables:
             activity.decisions_total = _count(
                 conn,
-                "SELECT COUNT(*) FROM decisions "
+                f"SELECT COUNT(*) FROM {source} "  # noqa: S608 - one of two fixed sources
                 "WHERE timestamp >= ? AND timestamp <= ? "
                 "AND TRIM(COALESCE(summary, '')) != ''",
                 rng,
             )
             rows = conn.execute(
-                "SELECT timestamp, domain, summary, outcome FROM decisions "
+                f"SELECT timestamp, domain, summary, outcome FROM {source} "  # noqa: S608
                 "WHERE timestamp >= ? AND timestamp <= ? "
                 "ORDER BY timestamp DESC LIMIT ?",
                 (*rng, _MAX_LISTED),

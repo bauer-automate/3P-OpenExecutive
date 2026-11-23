@@ -1,7 +1,7 @@
 """Tables for Always in the loop (``memory.history``), in the episodic DB.
 
 Per company, like the roster the notes are keyed on: they swap with a client
-slot (``clients.slots._BLANK_WIPE_TABLES``) and a factory reset clears them
+slot (``clients.slots._wipe_per_client_tables``) and a factory reset clears them
 (``cli.fixture_loader``).
 
 Kept free of imports so ``memory.episodic.initialize_db`` can create them

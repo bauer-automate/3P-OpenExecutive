@@ -179,10 +179,9 @@ def _reaches(lesson: dict[str, Any], row: sqlite3.Row) -> bool:
     matches the person's words and reaches their turns."""
     if lesson["turn_row_id"] is not None and int(lesson["turn_row_id"]) == int(row["id"]):
         return True
-    mine = int(lesson["person_id"]) == int(row["person_id"])
-    if not mine and not lesson["shared"]:
+    if int(lesson["person_id"]) != int(row["person_id"]):
         return False
-    return lessons._matches(lesson, lessons._content_words(str(row["message"])))
+    return lessons._matches(lesson, str(row["message"]))
 
 
 def due_cases(
@@ -405,6 +404,17 @@ async def replay_case(
     person = get_person(int(row["person_id"]))
     if person is None or person.id is None or person.archived:
         return None
+    # A chat that read mail is its person's alone: so is every audit row the
+    # replay writes about it (the judge's notes quote the chat).
+    with chat_review._own_rows(chat_review.mail_private_turns([row], db_path=db_path), int(person.id)):
+        return await _replay_case(row, why, person, executive=executive, now=now,
+                                  new_lessons=new_lessons, db_path=db_path)
+
+
+async def _replay_case(
+    row: sqlite3.Row, why: str, person: Any, *, executive: Any, now: datetime,
+    new_lessons: list[dict[str, Any]], db_path: Path | None,
+) -> dict[str, Any]:
     protect = why == WHY_PROTECT
     reached = [lesson["id"] for lesson in lessons.lessons_for(int(person.id), str(row["message"]), db_path=db_path)]
     try:
@@ -659,10 +669,10 @@ def _faked(tool: str, tool_input: Any, session: Any) -> str:
 
 def faked_handlers(handlers: dict[str, Handler], session: Any) -> dict[str, Handler]:
     """The turn's handlers for a replay session: reads run, and every tool
-    a read-only turn is denied (``schedule_tools.MCP_CLIENT_WITHHELD_TOOLS``,
+    a read-only turn is denied (``schedule_tools.READ_ONLY_WITHHELD_TOOLS``,
     the ones that send, post, book, schedule, run or change stored state)
     returns "done" and is recorded on the session instead."""
-    from openexecutive.orchestrator.schedule_tools import MCP_CLIENT_WITHHELD_TOOLS
+    from openexecutive.orchestrator.schedule_tools import READ_ONLY_WITHHELD_TOOLS
 
     def fake(name: str) -> Handler:
         async def handler(tool_input: dict[str, Any]) -> str:
@@ -670,17 +680,17 @@ def faked_handlers(handlers: dict[str, Handler], session: Any) -> dict[str, Hand
 
         return handler
 
-    return {name: fake(name) if name in MCP_CLIENT_WITHHELD_TOOLS else h for name, h in handlers.items()}
+    return {name: fake(name) if name in READ_ONLY_WITHHELD_TOOLS else h for name, h in handlers.items()}
 
 
 def faked_call_tool(call_tool: Handler, session: Any) -> Handler:
     """The gateway's ``call_tool`` for a replay: the reads a read-only turn
-    may make (``MCP_CLIENT_MCP_TOOLS``) run; anything else is recorded."""
-    from openexecutive.orchestrator.schedule_tools import mcp_client_allows_mcp_tool
+    may make (``READ_ONLY_MCP_TOOLS``) run; anything else is recorded."""
+    from openexecutive.orchestrator.schedule_tools import read_only_allows_mcp_tool
 
     async def handler(tool_input: dict[str, Any]) -> Any:
         name = tool_input.get("name") if isinstance(tool_input, dict) else None
-        if mcp_client_allows_mcp_tool(name):
+        if read_only_allows_mcp_tool(name):
             return await call_tool(tool_input)
         return _faked(str(name or "call_tool"), tool_input.get("arguments") if isinstance(tool_input, dict) else {}, session)
 

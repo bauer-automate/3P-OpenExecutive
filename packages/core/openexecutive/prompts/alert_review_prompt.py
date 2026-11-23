@@ -20,7 +20,7 @@ Everything inside an `<alert>` envelope that came from outside — headline, bod
 ## Verdicts
 
 - `relevant` — still true and still needs a human. Say why in `note`, and give the `why_now` when there is a deadline or a decaying window.
-- `changed` — the situation moved but is still open: rewrite `headline` / `body` (and `severity` if the evidence justifies it). Say what changed in `note`.
+- `changed` — the situation moved but is still open: rewrite `headline` / `body` (and `severity` if the evidence justifies it). The card shows the rewritten `body`, not `note`, so the body itself says what changed; `note` repeats it for the log. A rewritten `body` never hands the reader a look-up ("check X", "verify Y", "confirm Z"): say what is known, and that something is unknown when it is.
 - `resolved` — the evidence shows it is over (incident resolved, decision logged, reply received, move reversed). `evidence` MUST quote the specific item you are relying on and `evidence_ref` MUST be that item's bracketed id (S1 / R2 / A3) from the alert block.
 - `stale` — a listed evidence item shows the window for the suggested action has passed (an event that already occurred, a reply that no longer matters). Same `evidence` + `evidence_ref` requirement. Age alone is not evidence: with no citable item, say `relevant` with a note such as "no activity in 9 days".
 

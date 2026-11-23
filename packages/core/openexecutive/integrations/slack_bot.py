@@ -171,7 +171,7 @@ def _slack_session_id(
     - Mention that starts a thread → ``slack:channel:{channel}:{user_id}``, a
       rolling per-(channel, person) session. The reply also roots a Slack
       thread at this message's ``ts``, so the turn is double-written to
-      ``slack:thread:{channel}:{ts}`` (see `_persist_turn`) — otherwise the
+      ``slack:thread:{channel}:{ts}`` (see the save after the reply) — otherwise the
       first continuation inside that thread would start cold.
     """
     if mode == "dm":
@@ -202,42 +202,6 @@ def _session_title(person: object, mode: str) -> str:
     )
     surface = {"dm": "DM", "mention": "channel", "thread_continuation": "thread"}
     return f"Slack {surface.get(mode, mode)} — {name}"
-
-
-def _persist_turn(
-    *,
-    session_id: str,
-    title: str,
-    created_at: str,
-    owner_person_id: int | None,
-    user_text: str,
-    assistant_text: str,
-    also_session_id: str | None = None,
-    sender_person_id: int | None = None,
-) -> None:
-    """Write one Q+A to the session store, best-effort.
-
-    Sync (SQLite) — call it via ``asyncio.to_thread``. Never raises: the user
-    already has their reply, so a persistence failure must not turn a
-    successful turn into the generic error path. ``also_session_id`` is the
-    double-write target for a mention that roots a new Slack thread.
-    """
-    from openexecutive.memory.session_store import (
-        create_session,
-        save_message,
-        update_session_timestamp,
-    )
-
-    for sid in (session_id, also_session_id):
-        if not sid:
-            continue
-        try:
-            create_session(sid, title, created_at, caller_person_id=owner_person_id)
-            save_message(sid, "user", user_text, sender_person_id=sender_person_id)
-            save_message(sid, "assistant", assistant_text)
-            update_session_timestamp(sid)
-        except Exception:
-            logger.exception("Slack: failed to persist turn for session %s", sid)
 
 
 def _find_slack_sender(slack_user_id: str) -> object:
@@ -323,7 +287,7 @@ def _session_id_aliases(
     person rooted: the bot answers an @mention in a channel by replying in a
     thread hung off that mention, so the conversation also lives under the
     rolling `slack:channel:{channel}:{user}` session — the same pair
-    `_persist_turn` double-writes history to. Without the parent id, a gate
+    the save after the reply double-writes history to. Without the parent id, a gate
     raised on the mention can never be answered in the thread it was asked in.
 
     The root-author check is what keeps that from being a hole. Widening on
@@ -383,6 +347,30 @@ def _count_distinct_humans(
     return len(humans)
 
 
+def _thread_root_context(
+    thread_replies: list[dict] | None, event: dict, bot_user_id: str | None
+) -> str:
+    """The message a reply in a Slack thread was written under: the thread's
+    first message (``integrations.reply_context``). "" when the reply isn't
+    in a thread, or Slack didn't hand the thread back."""
+    from openexecutive.integrations import reply_context
+
+    if not thread_replies:
+        return ""
+    root = thread_replies[0]
+    if not isinstance(root, dict) or str(root.get("ts") or "") == str(event.get("ts") or ""):
+        return ""
+    # Only a post by this bot's own user is the Executive's: another app's
+    # post (a bot id with no user) is just "an earlier message".
+    author = str(root.get("user") or "")
+    by_executive = bool(bot_user_id) and author == bot_user_id
+    writer = reply_context.whose(
+        by_executive=by_executive,
+        by_sender=bool(author) and author == str(event.get("user") or ""),
+    )
+    return reply_context.quote(writer, str(root.get("text") or ""))
+
+
 def _replies_to_gate_history(
     messages: list[dict], bot_user_id: str | None
 ) -> list[dict]:
@@ -431,7 +419,9 @@ def _file_name(file: dict) -> str:
     return str(file.get("name") or file.get("title") or "file")
 
 
-async def _read_shared_files(files: list[dict]) -> tuple[str, list[dict]]:
+async def _read_shared_files(
+    files: list[dict], heard: list[str] | None = None
+) -> tuple[str, list[dict]]:
     """Download and read the files a rostered sender shared — documents to
     text (a scanned PDF converted), images to vision blocks — through the
     same ``process_attachments`` path Discord uses. Needs the bot's
@@ -459,17 +449,308 @@ async def _read_shared_files(files: list[dict]) -> tuple[str, list[dict]]:
                 content_type=str(f.get("mimetype") or ""),
                 size=size if isinstance(size, int) else 0,
                 headers={"Authorization": f"Bearer {token}"},
+                # A clip recorded in Slack; an uploaded audio file is not.
+                voice_note=f.get("subtype") == "slack_audio",
             )
         )
     text = ""
     blocks: list[dict] = []
     if items:
         try:
-            text, blocks = await process_attachments(items)
+            text, blocks = await process_attachments(items, heard=heard)
         except Exception:
             logger.exception("Slack: attachment processing failed")
             notes.append("(Could not process the attached files)")
     return "\n\n".join(p for p in (*notes, text) if p), blocks
+
+
+# A card's buttons (integrations.channel_cards): one action id per choice,
+# the card's id and choice in the button's value.
+_CARD_ACTIONS = {"a": "oe_card_approve", "s": "oe_card_skip", "n": "oe_card_allow", "x": "oe_card_switch"}
+_CARD_ACTION_RE = re.compile(rf"^({'|'.join(_CARD_ACTIONS.values())})$")
+_MAX_CARD_TEXT = 2900
+
+
+def _card_blocks(
+    text: str, decision_id: int | None = None, options: tuple[tuple[str, str], ...] = (), *, tell_me: bool = False,
+) -> list[dict[str, Any]]:
+    """A card as Slack blocks: its text as plain text (it may quote what
+    someone else wrote, so never mrkdwn), with its buttons while it waits,
+    the Executive's pick first (``channel_cards.card_options``), and, on one
+    that takes words (``tell_me``, ``channel_cards.takes_words``), how to
+    say them: a reply in its thread (``_say_on_card``)."""
+    from openexecutive.integrations import channel_cards
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "plain_text", "text": text[:_MAX_CARD_TEXT], "emoji": False}},
+    ]
+    if decision_id is not None and options:
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "action_id": _CARD_ACTIONS[channel_cards.choice_of(data)],
+             "text": {"type": "plain_text", "text": label}, "value": data,
+             **({"style": "primary"} if i == 0 else {})}
+            for i, (label, data) in enumerate(options)
+        ]})
+        if tell_me:
+            blocks.append({"type": "context", "elements": [
+                {"type": "plain_text", "text": channel_cards.TELL_ME, "emoji": False},
+            ]})
+    return blocks
+
+
+async def _send_cards(client: Any, channel: str, cards: list[int]) -> None:
+    """Post each card a DM reply left, with Approve and Skip buttons."""
+    from openexecutive.integrations import channel_cards
+
+    if not channel:
+        return
+    for decision_id in cards[: channel_cards.MAX_CARDS]:
+        try:
+            text = await asyncio.to_thread(channel_cards.card_text, decision_id)
+            if text:
+                options = await asyncio.to_thread(channel_cards.card_options, decision_id, text)
+                tell_me = await asyncio.to_thread(channel_cards.takes_words, decision_id)
+                await client.chat_postMessage(
+                    channel=channel, text=text[:_MAX_CARD_TEXT],
+                    blocks=_card_blocks(text, decision_id, options, tell_me=tell_me),
+                    unfurl_links=False, unfurl_media=False,
+                )
+        except Exception:
+            logger.exception("Slack: couldn't send card %d", decision_id)
+
+
+async def send_dm_card(
+    slack_user_id: str, decision_id: int, text: str, options: tuple[tuple[str, str], ...],
+) -> None:
+    """Post a card waiting outside any chat to ``slack_user_id``'s DM with the
+    bot (``channel_cards.push_waiting``). Raises when it couldn't."""
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    from openexecutive.config import get_settings
+    from openexecutive.integrations import channel_cards
+
+    token = get_settings().slack_bot_token
+    if not token or not slack_user_id:
+        raise RuntimeError("slack is not configured")
+    client = AsyncWebClient(token=token)
+    opened: Any = await client.conversations_open(users=slack_user_id)
+    channel = str(((opened or {}).get("channel") or {}).get("id") or "")
+    if not channel:
+        raise RuntimeError("slack did not open a DM")
+    tell_me = await asyncio.to_thread(channel_cards.takes_words, decision_id)
+    await client.chat_postMessage(
+        channel=channel, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text, decision_id, options, tell_me=tell_me),
+        unfurl_links=False, unfurl_media=False,
+    )
+
+
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+async def note_chat_ask(event: dict[str, Any], client: Any) -> None:
+    """A message in a channel the bot is in: keep it when it mentions the
+    principal, and mark the asks it answers when the principal wrote it
+    (``integrations.chat_asks``). Never raises."""
+    from openexecutive.integrations import chat_asks
+    from openexecutive.people.store import find_person_by_slack_id, find_principal_person
+
+    try:
+        user = str(event.get("user") or "")
+        channel = str(event.get("channel") or "")
+        ts = str(event.get("ts") or "")
+        if not user or not channel or not ts:
+            return
+        thread = str(event.get("thread_ts") or ts)
+        principal = await asyncio.to_thread(find_principal_person)
+        own_id = str(getattr(principal, "slack_user_id", "") or "") if principal is not None else ""
+        if principal is None or principal.id is None or not own_id:
+            return
+        if user == own_id:
+            await asyncio.to_thread(
+                chat_asks.note_spoke, "slack", place=channel, thread=thread, top_level=thread == ts,
+                person_id=principal.id,
+            )
+            return
+        text = str(event.get("text") or "")
+        if own_id not in _MENTION_RE.findall(text):
+            return
+        author = await asyncio.to_thread(find_person_by_slack_id, user)
+        from_name = str(getattr(author, "full_name", "") or "")
+        if not from_name:
+            try:
+                info = await client.users_info(user=user)
+                profile = ((info or {}).get("user") or {})
+                from_name = str(profile.get("real_name") or profile.get("name") or "")
+            except Exception:
+                from_name = ""
+        place_name = ""
+        link = ""
+        try:
+            info = await client.conversations_info(channel=channel)
+            name = str(((info or {}).get("channel") or {}).get("name") or "")
+            place_name = f"#{name}" if name else ""
+        except Exception:
+            logger.info("Slack: couldn't name channel %s for an ask", channel, exc_info=True)
+        try:
+            found = await client.chat_getPermalink(channel=channel, message_ts=ts)
+            link = str((found or {}).get("permalink") or "")
+        except Exception:
+            logger.info("Slack: couldn't link an ask in %s", channel, exc_info=True)
+        first = (principal.full_name or "").split(" ")[0] or "you"
+        shown = _MENTION_RE.sub(lambda m: f"@{first}" if m.group(1) == own_id else "@someone", text)
+        await asyncio.to_thread(
+            chat_asks.note_ask, "slack", place=channel, thread=thread, message_ref=f"{channel}:{ts}",
+            person_id=principal.id, from_name=from_name or "Someone", text=shown, link=link,
+            place_name=place_name,
+        )
+    except Exception:
+        logger.warning("Slack: couldn't note a chat ask", exc_info=True)
+
+
+async def _is_own_dm(client: Any, user_id: str, channel_id: str) -> bool:
+    """Whether ``channel_id`` is the bot's DM with ``user_id``: Slack's own
+    answer, not the payload's."""
+    if not user_id or not channel_id.startswith("D"):
+        return False
+    try:
+        opened = await client.conversations_open(users=user_id)
+    except Exception:
+        logger.warning("Slack: couldn't check the DM for a card tap", exc_info=True)
+        return False
+    return str(((opened or {}).get("channel") or {}).get("id") or "") == channel_id
+
+
+async def handle_card_tap(body: dict[str, Any], client: Any) -> None:
+    """A tap on one of a card's buttons (``channel_cards``). Slack signed
+    it; it counts only in the tapper's own DM with the bot, from someone on
+    the roster, and ``decisions.resolve_in_chat`` decides whether the card
+    is theirs."""
+    from openexecutive.audit import log_event as audit_log
+    from openexecutive.integrations import channel_cards
+    from openexecutive.people.store import find_person_by_slack_id
+
+    user_id = str((body.get("user") or {}).get("id") or "")
+    channel_id = str((body.get("channel") or {}).get("id") or "")
+    message = body.get("message") or {}
+    ts = str((body.get("container") or {}).get("message_ts") or message.get("ts") or "")
+    actions = body.get("actions") or []
+    parsed = channel_cards.parse_choice(actions[0].get("value") if actions else None)
+    person = await asyncio.to_thread(find_person_by_slack_id, user_id) if user_id else None
+    if parsed is None or person is None or not await _is_own_dm(client, user_id, channel_id):
+        logger.warning("Slack: ignored a card tap that isn't from its own DM")
+        if user_id and channel_id:
+            try:
+                await client.chat_postEphemeral(channel=channel_id, user=user_id,
+                                                text="This card is no longer there.")
+            except Exception:
+                logger.warning("Slack: couldn't answer an ignored card tap", exc_info=True)
+        return
+    decision_id = parsed.decision_id
+    tapped = await channel_cards.tap(parsed, person)
+    name = channel_cards.CHOICE_NAMES[parsed.choice]
+    await asyncio.to_thread(
+        audit_log,
+        "integration_inbound",
+        f"Slack card {decision_id}: tapped {name.capitalize()}: {tapped.line[:120]}",
+        actor="slack",
+        details={"channel": "slack", "slack_user": user_id, "decision_id": decision_id,
+                 "choice": name, "outcome": channel_cards.outcome_of(tapped.line), "person_id": person.id},
+    )
+    if tapped.line == channel_cards.BUSY or not ts:
+        return
+    if tapped.options:
+        # Still waiting, with new words: shown again with its buttons.
+        text = channel_cards.with_line(tapped.text, tapped.line)
+        tell_me = await asyncio.to_thread(channel_cards.takes_words, decision_id)
+        blocks = _card_blocks(text, decision_id, tapped.options, tell_me=tell_me)
+    else:
+        # The card keeps what it said, with the outcome under it and no buttons.
+        shown = ""
+        for block in message.get("blocks") or []:
+            if block.get("type") == "section":
+                shown = str((block.get("text") or {}).get("text") or "")
+                break
+        text = channel_cards.with_line(shown, tapped.line)
+        blocks = _card_blocks(text)
+    try:
+        await client.chat_update(channel=channel_id, ts=ts, text=text[:_MAX_CARD_TEXT], blocks=blocks)
+    except Exception:
+        logger.exception("Slack: couldn't update card %d after the tap", decision_id)
+
+
+def _card_of(message: dict[str, Any]) -> Any:
+    """The card a message of the bot's shows (``channel_cards.Choice`` from
+    any of its buttons), or None."""
+    from openexecutive.integrations import channel_cards
+
+    for block in message.get("blocks") or []:
+        if not isinstance(block, dict) or block.get("type") != "actions":
+            continue
+        for element in block.get("elements") or []:
+            parsed = channel_cards.parse_choice(element.get("value") if isinstance(element, dict) else None)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+async def _say_on_card(
+    event: dict[str, Any], words: str, parent: dict[str, Any] | None, say: Any, client: Any,
+) -> bool:
+    """A reply in a DM to one of the bot's cards (``parent``, the thread's
+    first message): words said on that card ("Or tell me…",
+    ``channel_cards.say``), when they are its person's, in their own DM.
+    The card is shown again as it reads now, and what the Executive said
+    back goes in the thread. False when it isn't such a reply: the words are
+    then an ordinary message."""
+    from openexecutive.audit import log_event as audit_log
+    from openexecutive.integrations import channel_cards
+    from openexecutive.people.store import find_person_by_slack_id
+
+    if not parent or not _bot_user_id or parent.get("user") != _bot_user_id or not parent.get("bot_id"):
+        return False
+    card = _card_of(parent)
+    user_id = str(event.get("user") or "")
+    channel_id = str(event.get("channel") or "")
+    if card is None or not words.strip():
+        return False
+    person = await asyncio.to_thread(find_person_by_slack_id, user_id) if user_id else None
+    if person is None or not await _is_own_dm(client, user_id, channel_id):
+        return False
+    said = await channel_cards.say(card, person, words)
+    if said is None:
+        return False
+    decision_id = card.decision_id
+    await asyncio.to_thread(
+        audit_log,
+        "integration_inbound",
+        f"Slack card {decision_id}: said on it: {said.line[:120]}",
+        actor="slack",
+        details={"channel": "slack", "slack_user": user_id, "decision_id": decision_id,
+                 "choice": "say", "outcome": channel_cards.outcome_of(said.line), "person_id": person.id},
+    )
+    thread_ts = str(event.get("thread_ts") or "")
+    text, blocks = "", None
+    if said.options:
+        # It waits: shown again as it reads now, with its buttons.
+        text = said.text
+        tell_me = await asyncio.to_thread(channel_cards.takes_words, decision_id)
+        blocks = _card_blocks(text, decision_id, said.options, tell_me=tell_me)
+    elif said.settled:
+        # Carried out: the card keeps what it said, with the outcome under it.
+        shown = next((str((b.get("text") or {}).get("text") or "") for b in parent.get("blocks") or []
+                      if isinstance(b, dict) and b.get("type") == "section"), "")
+        text = channel_cards.with_line(shown, said.line)
+        blocks = _card_blocks(text)
+    if blocks is not None:
+        try:
+            await client.chat_update(channel=channel_id, ts=thread_ts, text=text[:_MAX_CARD_TEXT], blocks=blocks)
+        except Exception:
+            logger.exception("Slack: couldn't update card %d after words on it", decision_id)
+    try:
+        await say(text=said.line, thread_ts=thread_ts)
+    except Exception:
+        logger.exception("Slack: couldn't answer words on card %d", decision_id)
+    return True
 
 
 async def create_slack_app():
@@ -654,6 +935,12 @@ async def create_slack_app():
                 )
                 thread_replies = None
 
+        # A reply to one of the bot's cards in its DM: words said on that card.
+        if mode == "dm" and is_threaded_reply and thread_replies and not files:
+            parent = next((m for m in thread_replies if str(m.get("ts") or "") == str(thread_ts)), None)
+            if await _say_on_card(event, cleaned, parent, say, client):
+                return
+
         # Bot-presence guard for thread_continuation mode. If the bot
         # hasn't actually replied in this thread, silently drop — never
         # audit, never trigger alerts, never run the gate. This is what
@@ -664,7 +951,7 @@ async def create_slack_app():
                 # Slack didn't hand back the thread, so the replies can't say
                 # whether the bot is in it. The thread's stored history can:
                 # every turn the bot answers here is persisted under this
-                # session id (`_persist_turn`). With history, the sender is
+                # session id (the save after the reply). With history, the sender is
                 # told after the roster gate below; without, a thread the bot
                 # never joined stays silent as before.
                 from openexecutive.memory.session_store import load_messages
@@ -814,7 +1101,7 @@ async def create_slack_app():
                 # but the bot's reply roots a thread — so the answer arrives
                 # under the THREAD id. Offering only one made that gate
                 # permanently unanswerable, which is #136 one surface over.
-                # Mirrors the history double-write in `_persist_turn`.
+                # Mirrors the history double-write after the reply.
                 session_ids=_session_id_aliases(
                     mode=mode,
                     channel=str(event.get("channel", "")),
@@ -899,56 +1186,29 @@ async def create_slack_app():
         # turn — so no one off the roster can make the bot download anything.
         att_text = ""
         att_image_blocks: list[dict] = []
+        heard: list[str] = []
         if files:
-            att_text, att_image_blocks = await _read_shared_files(files)
+            att_text, att_image_blocks = await _read_shared_files(files, heard)
+            # A voice note's words are the sender's own words.
+            own_words = "\n\n".join(p for p in (*heard, own_words) if p)
 
         try:
-            from openexecutive.integrations.channel_context import (
-                attach_briefing_context,
-                build_channel_context_block,
-            )
-            from openexecutive.knowledge.retriever import retrieve
-            from openexecutive.memory.episodic import format_for_prompt
+            from openexecutive.integrations import channel_turn
             from openexecutive.memory.session_store import load_messages
-            from openexecutive.onboarding.profile_builder import load_or_create_profile
-            from openexecutive.orchestrator.executive import Executive
-            from openexecutive.orchestrator.mcp_gateway import get_active_gateway
-            from openexecutive.orchestrator.session import Session
 
             # Everything from here to the persist below runs under the
             # conversation's lock: two messages in the same thread must not
             # both read history before either writes it.
             async with _session_lock(session_id):
-                profile = await asyncio.to_thread(load_or_create_profile)
-                # Where this conversation is happening, so a workflow that
-                # raises an approval gate mid-turn can record that the
-                # person's next reply HERE answers it (#136).
-                session = Session(
-                    session_id=session_id,
-                    company_profile=profile if not profile.is_empty() else None,
-                    origin_channel="slack",
-                    origin_channel_ref=str(slack_user_id or ""),
-                    caller_person_id=sender_person.id,
-                )
-                # Replay the stored conversation. Slack was the only chat
-                # adapter with no history at all — every turn started cold,
-                # so a multi-turn confirmation could never work (#136).
+                # The conversation so far. Read here because whether a reply's
+                # thread start is quoted depends on it.
                 history = await asyncio.to_thread(load_messages, session_id)
-                if history:
-                    session.conversation_history = history
                 slack_user = event.get("user")
-                if slack_user:
-                    session.seen_channel_refs.add(("slack_dm", str(slack_user)))
 
-                # Sender was already resolved at the roster gate above; reuse it
-                # so we don't hit the DB twice in the hot path.
-                person_id = sender_person.id
-
-                # Multi-peer co-presence: enumerate other thread participants
-                # from the already-fetched conversations_replies payload (one
-                # API call total) and resolve each to a Person via
-                # find_person_by_slack_id. Any client/API failure earlier left
-                # thread_replies as None; that degrades to an empty list.
+                # Every other thread participant on People, from the
+                # already-fetched conversations_replies payload (one API call
+                # total). Any client/API failure earlier left thread_replies
+                # as None; that degrades to an empty list.
                 co_present_person_ids: list[int] = []
                 if thread_replies is not None:
                     seen: set[str] = set()
@@ -963,92 +1223,35 @@ async def create_slack_app():
                         if other and other.id is not None:
                             co_present_person_ids.append(other.id)
 
-                # Offloaded for the same reason api/routes/chat.py offloads them:
-                # both are blocking (ChromaDB query + embedding, SQLite read) and
-                # the handler now awaits on the application event loop, so running
-                # them inline would stall every other request. `get_store()` hands
-                # over the warm ChromaDB client the lifespan built, instead of
-                # constructing a fresh PersistentClient on every message.
-                from openexecutive.mcp_server.server import get_store
+                # A reply under a message in a thread says which message it
+                # answers. A DM is one conversation, so the thread's first
+                # message may be any earlier one; a channel thread's own
+                # history already holds its start, unless it's new to us.
+                reply_quote = ""
+                if is_threaded_reply and (mode == "dm" or not history):
+                    reply_quote = _thread_root_context(thread_replies, event, _bot_user_id)
+                    # A channel thread can be started by anyone: quote its
+                    # start only from the team, the Executive or the sender.
+                    root_author = str((thread_replies or [{}])[0].get("user") or "")
+                    if (
+                        reply_quote
+                        and mode != "dm"
+                        and root_author not in (_bot_user_id, event.get("user"))
+                        and not await asyncio.to_thread(_find_slack_sender, root_author)
+                    ):
+                        reply_quote = ""
 
-                retrieved_context, episodic_context = await asyncio.gather(
-                    asyncio.to_thread(retrieve, query=cleaned, store=get_store()),
-                    # session_id-scoped, matching discord_bot: an unscoped
-                    # call mixes every other conversation's episodes into
-                    # this turn.
-                    asyncio.to_thread(format_for_prompt, session_id=session_id),
-                )
+                # What the model reads: the quote, then the files' text, then
+                # the words, as Discord and Telegram inline them.
+                model_text = f"{att_text}\n\n{cleaned}" if att_text else cleaned
+                if reply_quote:
+                    from openexecutive.integrations.reply_context import with_context
 
-                # The open-alert digest, so the Executive can actually answer
-                # "what's on my plate?" from Slack and can cite a trustworthy
-                # alert_id. Gated to the principal's DMs: the board is
-                # company-wide, and pulling it into a shared channel would
-                # leak every open item to everyone in that channel. Same gate
-                # shape the outbound-context hydration below uses.
-                briefing_context = await asyncio.to_thread(
-                    attach_briefing_context,
-                    session,
-                    is_dm=(mode == "dm"),
-                    person=sender_person,
-                )
+                    model_text = with_context(reply_quote, model_text)
 
-                # On the 1:1 DM path, hydrate with the context of any recent
-                # outbound DM oe sent this user, so a reply oe solicited from
-                # another session arrives with its backstory. One-shot consumed
-                # inside the helper. Gated to DMs: a public-channel reply must not
-                # pull private outbound context into a shared thread.
-                chat_user_message = cleaned
-                if mode == "dm" and slack_user_id:
-                    from openexecutive.integrations.inbound_hydration import (
-                        hydrate_user_message,
-                    )
-
-                    chat_user_message = await asyncio.to_thread(
-                        hydrate_user_message,
-                        channel="slack_dm",
-                        channel_ref=str(slack_user_id),
-                        user_message=cleaned,
-                    )
-
-                if att_text:
-                    # Before the words, as Discord and Telegram inline it.
-                    chat_user_message = f"{att_text}\n\n{chat_user_message}"
-
-                executive = Executive(mcp_gateway=get_active_gateway())
-                response = await executive.chat(
-                    user_message=chat_user_message,
-                    session=session,
-                    retrieved_context=retrieved_context,
-                    episodic_context=episodic_context,
-                    briefing_context=briefing_context,
-                    channel_context_block=build_channel_context_block("slack"),
-                    person_id=person_id,
-                    co_present_person_ids=co_present_person_ids or None,
-                    attachment_blocks=att_image_blocks or None,
-                    # Peer memory records what the sender wrote and the files'
-                    # names, never a document's text as their words.
-                    memory_text=own_words if files else None,
-                )
-
-                # No unfurls: Slack would fetch a link in the reply on its own,
-                # and a reply can quote mail a sender wrote to carry data out in one.
-                from openexecutive.orchestrator.disclosure import with_chat_line
-
-                await say(
-                    text=with_chat_line(response, f"slack:{session_id}"),
-                    thread_ts=thread_ts, unfurl_links=False, unfurl_media=False,
-                )
-
-                # Persist AFTER the reply lands, and never let a persistence
-                # failure trigger the user-facing error path — the user
-                # already has their answer. Discord and Telegram both do the
-                # same. Offloaded because save_message is sync SQLite and
-                # this handler awaits on the application event loop.
-                #
-                # `cleaned`, NOT `chat_user_message`: the latter may carry the
-                # one-shot <outbound_reply_context> block from
-                # hydrate_user_message, and persisting that would replay a
-                # consumed one-shot on every future turn.
+                # What the history keeps: the sender's words (never a file's
+                # text, never the one-shot context block), under their name
+                # in a shared thread.
                 speaker = (
                     None
                     if mode == "dm"
@@ -1058,26 +1261,77 @@ async def create_slack_app():
                         or slack_user_id
                     )
                 )
-                # A mention that starts a thread gets its reply rooted at this
-                # message's ts, so that thread's own session must also carry
-                # the Q+A or its first continuation would start cold.
+                kept_text = _format_user_content(
+                    f"{reply_quote}\n\n{own_words}" if reply_quote else own_words, speaker
+                )
+
+                from openexecutive.mcp_server.server import get_store
+
+                result = await channel_turn.run(
+                    channel_turn.ChannelTurn(
+                        channel="slack",
+                        channel_ref=str(slack_user_id or ""),
+                        session_id=session_id,
+                        own_text=cleaned,
+                        turn_text=kept_text,
+                        model_text=model_text,
+                        person=sender_person,
+                        is_dm=mode == "dm",
+                        # Memory records what the sender wrote and the files'
+                        # names, never a document's text as their words.
+                        memory_text=own_words if (files or reply_quote) else None,
+                        # A public-channel reply must not pull private
+                        # outbound context into a shared thread.
+                        reply_ref=(
+                            ("slack_dm", str(slack_user_id))
+                            if mode == "dm" and slack_user_id
+                            else None
+                        ),
+                        image_blocks=att_image_blocks or None,
+                        co_present_person_ids=co_present_person_ids or None,
+                        # A DM shows the reply's cards with Approve and Skip
+                        # buttons (SLACK_CARD_BUTTONS, integrations.channel_cards).
+                        offers_cards=mode == "dm",
+                        history=history,
+                        # The warm knowledge store the app built at start-up.
+                        store=get_store(),
+                    )
+                )
+                response = result.response
+
+                # No unfurls: Slack would fetch a link in the reply on its own,
+                # and a reply can quote mail a sender wrote to carry data out in one.
+                from openexecutive.orchestrator.disclosure import with_chat_line
+
+                await say(
+                    text=with_chat_line(response, f"slack:{session_id}"),
+                    thread_ts=thread_ts, unfurl_links=False, unfurl_media=False,
+                )
+                if result.cards and client is not None:
+                    await _send_cards(client, str(event.get("channel") or ""), result.cards)
+
+                # Kept after the reply lands. A mention that starts a thread
+                # gets its reply rooted at this message's ts, so that thread's
+                # own conversation also keeps the exchange, or its first
+                # continuation would start cold.
                 also_session_id = None
                 if mode != "dm" and not is_threaded_reply:
                     also_session_id = (
                         f"slack:thread:{event.get('channel', '')}:"
                         f"{event.get('ts', '')}"
                     )
-                await asyncio.to_thread(
-                    _persist_turn,
-                    session_id=session_id,
-                    title=_session_title(sender_person, mode),
-                    created_at=session.created_at.isoformat(),
-                    owner_person_id=person_id,
-                    user_text=_format_user_content(own_words, speaker),
-                    assistant_text=response,
-                    also_session_id=also_session_id,
-                    sender_person_id=sender_person.id,
-                )
+                for sid in (session_id, also_session_id):
+                    if sid:
+                        await asyncio.to_thread(
+                            channel_turn.save_turn,
+                            session_id=sid,
+                            title=_session_title(sender_person, mode),
+                            created_at=result.session.created_at.isoformat(),
+                            owner_person_id=result.person_id,
+                            user_text=kept_text,
+                            assistant_text=response,
+                            sender_person_id=sender_person.id,
+                        )
                 from openexecutive.integrations.conversations import title_after_turn
 
                 title_after_turn(session_id, own_words, response)
@@ -1134,6 +1388,11 @@ async def create_slack_app():
                     session_id,
                 )
 
+    @app.action(_CARD_ACTION_RE)
+    async def card_tap(ack, body: dict, client) -> None:
+        await ack()
+        await handle_card_tap(body, client)
+
     @app.event("app_mention")
     async def handle_mention(event: dict, say, client) -> None:
         # Bolt auto-injects `client` (an AsyncWebClient) when listed in the
@@ -1165,6 +1424,7 @@ async def create_slack_app():
             async with inflight:
                 await _handle_message(event, say, client=client, mode="dm")
             return
+        await note_chat_ask(event, client)
 
         # A failed auth_test at startup left the id unset; try again
         # (rate-limited) so thread auto-continuation comes back on its own.

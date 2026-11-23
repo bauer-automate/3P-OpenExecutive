@@ -397,8 +397,9 @@ async def send_email_ack(gateway: Any, to: str) -> None:
     Raises when the send fails, so the caller can release its claim.
 
     Gmail only: it runs only for a sender Gmail authenticated
-    (``fact_confirmation.sender_authenticated``), which is never the case on
-    an Outlook mailbox, and the grant admits only the Gmail send tool."""
+    (``fact_confirmation.sender_authenticated``) on a Gmail mailbox (the
+    poller withholds it on Outlook), and the grant admits only the Gmail
+    send tool."""
     from openexecutive.config import get_settings
     from openexecutive.orchestrator.mcp_gateway import roster_ack_grant
     from openexecutive.orchestrator.schedule_tools import set_session
@@ -447,6 +448,49 @@ def looks_automated(raw: str, from_addr: str) -> bool:
     if not local or _AUTOMATED_LOCAL.match(local):
         return True
     return _auto_or_bulk_headers(raw)
+
+
+# Mail that fishes for sign-in details or talks to the AI instead of a
+# person. Plain code, no model: a stranger's mail that matches gets no
+# acknowledgement and no "Who is" card, only one alert for the principal,
+# who still sees it. Broad on purpose: a stranger asking for any password
+# or code is worth that alert, and a miss would reach a turn.
+_CREDENTIALS = r"(?:passwords?|passcodes?|log-?in (?:details|credentials)|sign-?in (?:details|credentials)|credentials|(?:2fa|mfa|verification|one-?time|security) codes?)"
+_PHISHING_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        rf"\b(?:send|reply with|provide|enter|confirm|share|give|type|update)\b[^.\n]{{0,80}}\b{_CREDENTIALS}\b"
+        rf"|\b{_CREDENTIALS}\b[^.\n]{{0,40}}\b(?:you can see|you have|on file|below)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:account|mailbox|email|access)\b[^.\n]{0,30}\b(?:will be|has been|is being)\s+"
+        r"(?:suspended|closed|locked|disabled|deactivated|deleted)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:ai assistant|ai agent|language model|system prompt|system note|maintenance mode|you are now in|"
+        r"note to the (?:ai|assistant|executive)|"
+        r"(?:ignore|disregard|forget) (?:all |any )?(?:of )?(?:your |the |my )?(?:previous|prior|earlier|other) "
+        r"(?:instructions|rules|guidelines))\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def looks_like_phishing(raw: str) -> bool:
+    """Whether an email's subject or new text fishes for passwords or codes,
+    threatens to close an account, or gives the AI orders. Never raises."""
+    try:
+        from openexecutive.integrations.email_poller import _new_text_lines, _split_gmail_content
+
+        header, body_lines, _att = _split_gmail_content(raw)
+        subject = next((ln for ln in header if ln.lower().startswith("subject:")), "")
+        new_lines, _fw = _new_text_lines(body_lines)
+        text = " ".join([subject[len("subject:"):], *new_lines])
+        return any(rx.search(text) for rx in _PHISHING_RES)
+    except Exception:
+        logger.debug("roster_intake: couldn't read the mail for phishing", exc_info=True)
+        return False
 
 
 def _auto_or_bulk_headers(raw: str) -> bool:

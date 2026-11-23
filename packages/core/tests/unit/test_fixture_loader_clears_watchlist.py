@@ -29,7 +29,6 @@ import pytest
 from openexecutive.cli.fixture_loader import (
     _apply_state_from_source,
     _delete_all_rows,
-    reset_all_state,
 )
 
 
@@ -95,20 +94,13 @@ def test_delete_clears_watchlist_and_signals_in_fk_order(
         )
 
 
-def test_reset_all_state_wipe_list_includes_monitoring_tables() -> None:
-    """Guard against silently dropping the monitoring tables from reset.
+def test_reset_all_state_keeps_no_monitoring_or_cache_table() -> None:
+    """A reset empties every table but RESET_KEEPS: the monitoring layer and
+    the derived caches must never be kept."""
+    from openexecutive.cli.fixture_loader import PER_CLIENT_CACHE_TABLES, RESET_KEEPS
 
-    ``reset_all_state`` is an expensive async function (ChromaDB, Honcho,
-    file I/O), so assert the table names appear in its source — the same
-    cheap guard pattern used for the run/audit tables.
-    """
-    src = inspect.getsource(reset_all_state)
-    for table in ("external_signals", "watchlist"):
-        assert f'"{table}"' in src, (
-            f"reset_all_state no longer mentions {table!r} — a reset will "
-            "stop clearing the external-monitoring layer and the previous "
-            "company's watchlist monitors will survive the reset."
-        )
+    for table in ("external_signals", "watchlist", *PER_CLIENT_CACHE_TABLES):
+        assert table not in RESET_KEEPS
 
 
 def test_apply_state_from_source_clears_monitoring_tables() -> None:
@@ -289,25 +281,9 @@ def test_fixture_path_cache_wipe_is_unconditional() -> None:
     )
 
 
-def test_reset_and_slot_switch_consume_the_shared_cache_constant() -> None:
-    """The other two company-swapping paths must reference the one constant.
+def test_slot_switch_and_reset_keep_none_of_the_caches() -> None:
+    """A switch into a blank/seed slot and a factory reset empty every table
+    but RESET_KEEPS, so the caches can't be left behind."""
+    from openexecutive.cli.fixture_loader import PER_CLIENT_CACHE_TABLES, RESET_KEEPS
 
-    The original bug was three hand-maintained table lists over one DB: the
-    fix landed in one and the leak stayed live in the other two. Source-grep
-    for the heavy async ``reset_all_state`` (the same cheap guard the
-    monitoring tables use above) and for the shared constant in the slot
-    wipe list.
-    """
-    from openexecutive.cli.fixture_loader import PER_CLIENT_CACHE_TABLES
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
-
-    assert "PER_CLIENT_CACHE_TABLES" in inspect.getsource(reset_all_state), (
-        "reset_all_state no longer consumes PER_CLIENT_CACHE_TABLES — a factory "
-        "reset will leave the previous company's cached briefing narrative."
-    )
-
-    for table in PER_CLIENT_CACHE_TABLES:
-        assert table in _BLANK_WIPE_TABLES, (
-            f"{table!r} dropped out of the client-slot wipe list — switching "
-            "into a blank/seed slot will leak the previous client's cache."
-        )
+    assert not set(PER_CLIENT_CACHE_TABLES) & RESET_KEEPS

@@ -64,6 +64,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 MAX_RULES = 8
@@ -241,10 +243,7 @@ class _Evidence:
 # --------------------------------------------------------------------------- #
 
 
-def _db(db_path: Path | None) -> Path:
-    from openexecutive.memory.episodic import _resolve_db_path
-
-    return _resolve_db_path(db_path)
+_db = db.company_path
 
 
 def _now() -> datetime:
@@ -524,6 +523,8 @@ def _collect_evidence(person_id: int, *, db_path: Path | None) -> list[_Evidence
             "  SELECT MIN(r.id) FROM chat_messages r WHERE r.session_id = u.session_id "
             "    AND r.id > u.id AND r.role = 'assistant') "
             "WHERE u.role = 'user' AND u.sender_person_id = ? "
+            # Nor a line a host origin's page sent: a script may have written it.
+            "  AND u.sender_surface IS NULL "
             # A conversation that read their own mail (Act as me) teaches
             # nothing: its replies quote other people's mail.
             "  AND u.session_id NOT IN (SELECT session_id FROM sessions WHERE mail_private = 1) "

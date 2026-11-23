@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.memory.company_profile import CompanyProfile
+from openexecutive.memory.conversation_ids import is_rolling
 
 if TYPE_CHECKING:
     from openexecutive.memory.workspace_settings import PrincipalRole
@@ -22,16 +23,16 @@ def history_window_start(total: int, max_turns: int = 20, step_turns: int = 10) 
     return ((total - keep) // step) * step
 
 
+# The user turn put before history that opens with the Executive's message.
+CONTINUED_PLACEHOLDER = "(Continuing our chat.)"
+
+
 @dataclass
 class Session:
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     company_profile: CompanyProfile | None = None
     conversation_history: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
-    # (channel, channel_ref) pairs the Executive has seen during this session.
-    # Used by schedule_followup to refuse scheduling sends to refs the user
-    # never actually used — anti-spam guard.
-    seen_channel_refs: set[tuple[str, str]] = field(default_factory=set)
     # Mailbox message and thread ids this conversation was shown by a search
     # that left other teammates' mail out (or the inbound email it answers).
     # The model may reach the Executive's mailbox only by these
@@ -55,6 +56,16 @@ class Session:
     # as the web app's. Inbound vocabulary — see `normalize_channel`.
     origin_channel: str = ""
     origin_channel_ref: str = ""
+    # Where this session's turns count a lesson as used (`memory.lessons`
+    # `SURFACES`): set by a caller whose turns are not a plain chat, such as
+    # a one-to-one call ("one_on_one") or a team meeting ("meeting"). Empty
+    # means a chat, or an email when `origin_channel` says so.
+    memory_surface: str = ""
+    # Whose lessons a turn with no single speaker reads: the person a shared
+    # call belongs to. Only lessons follow this id. Figures the Executive
+    # worked out and what it knows about a person stay with a turn that
+    # person speaks alone (`person_id`).
+    lessons_person_id: int | None = None
     # True only for a session minted by the web chat route. `origin_channel`
     # cannot stand in for this: alert review, the CLI, the MCP server, the
     # scheduler and the unattended workflows all leave it empty while being
@@ -66,14 +77,23 @@ class Session:
     # `content_trust.principal_speaking`, as the web chat is.
     from_cli: bool = False
     # True only for a session minted by Open Executive's own MCP server
-    # (`mcp_server.ask_executive`): another AI app is asking, on behalf of
-    # `caller_person_id`. Such a turn reads and advises but never sends,
-    # posts, books, schedules, runs or changes anything: the chat loop
-    # neither offers nor runs `schedule_tools.MCP_CLIENT_WITHHELD_TOOLS`, Act
-    # as me, recall_history or extension tools, and of the gateway tools only
-    # the reads in `schedule_tools.MCP_CLIENT_MCP_TOOLS`. Never the
-    # principal's own surface for `content_trust.principal_speaking`.
+    # (`mcp_server.ask_executive`): another AI app is asking, signed in as
+    # `caller_person_id`. It is that person's own turn on a verified surface:
+    # Approvals decides each step as in the web chat, and every audit row and
+    # card it writes names the app (`audit.via_app`).
     from_mcp_client: bool = False
+    # Set per turn by the web chat route when a host origin's page sent it
+    # (`api.caller.from_host`: another app that frames Open Executive and may
+    # call a short list of its routes, OE_HOST_ORIGINS, docs/auth.md), or
+    # wrote any earlier line of this conversation
+    # (`session_store.host_wrote`): that line stays in what the model reads.
+    # Its scripts aren't Open Executive's, so such a turn only reads and advises,
+    # as a read-only turn from another AI app does
+    # (`schedule_tools.read_only_turn`): nothing that sends, posts, books,
+    # schedules, runs or changes stored state, no Act as me, recall_history,
+    # script or extension tool, and of the gateway tools only the reads. What
+    # would act, the person does in Open Executive's own pages.
+    from_host: bool = False
     # The rostered Person behind this conversation, when one is resolved. The
     # adapters already pass this to `Executive.chat(person_id=...)`; holding it
     # on the session too lets tool handlers running mid-turn tell "the approver
@@ -87,13 +107,6 @@ class Session:
     # resolved `caller_person_id` from a sender identity the platform
     # authenticated, never from anything the message says, and per turn.
     speaker_verified: bool = False
-    # The sender's People entry on a channel that names its sender but isn't
-    # one `people_tools` verifies (Google Chat, by the Google account email on
-    # its signed event). Read only by the department gate
-    # (`department_gate.speaker`), so the principal there isn't held and a
-    # teammate gets their own department's authority. Never a grant for
-    # anything else, and never set alongside `caller_person_id`.
-    gate_sender_person_id: int | None = None
     # Set by a channel adapter when nobody but the speaker (and the
     # Executive) can read the conversation, e.g. a direct message
     # (`delegation.settings.private_conversation`, which also needs
@@ -122,6 +135,10 @@ class Session:
     # calls (`schedule_tools._FIND_ALERTS_MAX_PER_TURN`). Reset per turn with
     # the trusted set.
     found_alert_ids: set[int] = field(default_factory=set)
+    # An AI app's answer_card turn: the one card it may touch, set by the
+    # server before the turn (``mcp_server.server.answer_card``). The trusted
+    # set holds only that card, and ``find_alerts`` widens nothing.
+    answering_card: int | None = None
     # Pending roster requests ("who is this new sender?") the server showed
     # this turn in its <roster_requests> block — the principal's own verified
     # turn only (`briefing.context.render_and_trust`). `resolve_roster_request`
@@ -188,6 +205,16 @@ class Session:
     # outside content (``orchestrator.outside_content.SENDER``). Set by the
     # email poller only.
     sender_off_team: bool = False
+    # That mail itself looks like it gives the Executive orders or fishes for
+    # passwords (``roster_intake.looks_like_phishing``): the turn starts
+    # flagged, as if the content check had flagged a read, so below
+    # Hands-off its replies wait on a card. Set by the email poller only.
+    sender_gave_orders: bool = False
+    # How many steps this turn put on an Approve card (``note_step_held``).
+    steps_held: int = 0
+    # The thread of the inbound email this turn answers: its cards are about
+    # that thread (``alerts.one_card``). Set by the email poller only.
+    email_thread_id: str = ""
     # Act as me for the turn in progress (``delegation.settings.TurnDelegation``),
     # pinned at its start by ``pin_turn_delegation``: whether the speaker has
     # it on, whether ``ghostwrite_email`` is offered, and whether the turn has
@@ -220,9 +247,14 @@ class Session:
     # pinned to that turn's viewer, so what it drafts is theirs. An
     # ``artifact_records.Viewer``; None derives it from this session.
     documents_viewer: Any = None
-    # Evals and tests only (``delegation.settings.DelegationOverride``): run
-    # as if the speaker had Act as me, against a fake mailbox.
+    # Run as if the speaker had Act as me, against the mailbox it carries
+    # (``delegation.settings.DelegationOverride``): an eval's or test's fake
+    # one, or the person's own for the inbox's work turn
+    # (``delegation.card_work``).
     delegation_override: Any = None
+    # The inbox's work turn (``delegation.card_work``): the reply card whose
+    # email it is doing, which ``update_reply_card`` writes back to.
+    reply_card_work: int | None = None
     # A replay of a graded turn (``memory.replay``): the chat loop runs as it
     # would for the recorded surface and speaker, reads for real, and every
     # tool that sends, posts, books, schedules, runs or changes stored state
@@ -250,8 +282,27 @@ class Session:
         """
         start = history_window_start(len(self.conversation_history), max_turns, step_turns)
         history = self.conversation_history[start:]
-        # Anthropic requires messages to start with a user turn.
-        # Drop a leading assistant message if history length is odd (can happen on error recovery).
+        # Anthropic requires messages to start with a user turn. A chat-app
+        # conversation can open with the Executive's own message (a brief or
+        # digest it sent, ``integrations.conversations.record_delivery``).
+        # Dropping that would hide what the person is answering, so there a
+        # placeholder turn goes first; anywhere else a leading assistant
+        # message (left by error recovery) is dropped.
         if history and history[0]["role"] != "user":
-            history = history[1:]
+            if is_rolling(self.session_id):
+                history = [{"role": "user", "content": CONTINUED_PLACEHOLDER}, *history]
+            else:
+                history = history[1:]
         return history
+
+
+def note_step_held() -> None:
+    """Count a step the current turn put on an Approve card. Never raises."""
+    try:
+        from openexecutive.orchestrator.schedule_tools import current_session
+
+        session = current_session.get()
+        if isinstance(session, Session):
+            session.steps_held += 1
+    except Exception:  # noqa: BLE001 - a count only
+        pass

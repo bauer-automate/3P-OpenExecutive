@@ -321,3 +321,32 @@ def test_server_tool_blocks_are_preserved_and_audited() -> None:
         assert ws_calls[0]["details"]["kind"] == "server_tool"
     finally:
         _reset_settings_cache()
+
+
+def test_a_web_search_is_a_look_for_the_after_reply_checks() -> None:
+    """A turn that searched the web looked: the claim check reads each
+    search with its result, like any other call."""
+    from openexecutive.orchestrator import claim_check, web_search_tool
+
+    blocks = [
+        {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "midwest diesel"}},
+        {"type": "web_search_tool_result", "tool_use_id": "s1",
+         "content": [{"type": "web_search_result", "title": "EIA diesel", "url": "https://example.com"}]},
+        {"type": "server_tool_use", "id": "s2", "name": "web_search", "input": {"query": "I-80 tolls"}},
+        {"type": "web_search_tool_result", "tool_use_id": "s2",
+         "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}},
+    ]
+    calls = web_search_tool.searched(blocks)
+    assert calls == [
+        ("web_search midwest diesel", "1 results: EIA diesel"),
+        ("web_search I-80 tolls", "error: max_uses_exceeded"),
+    ]
+    assert web_search_tool.search_failed(blocks)
+    assert not web_search_tool.search_failed(blocks[:2])
+    bad_query = {"type": "web_search_tool_result", "tool_use_id": "s3",
+                 "content": {"type": "web_search_tool_result_error", "error_code": "query_too_long"}}
+    assert not web_search_tool.search_failed([bad_query])
+    busy = {"type": "web_search_tool_result", "tool_use_id": "s4",
+            "content": {"type": "web_search_tool_result_error", "error_code": "too_many_requests"}}
+    assert not web_search_tool.search_failed([busy])
+    assert "web_search midwest diesel" in claim_check.render_calls(calls)

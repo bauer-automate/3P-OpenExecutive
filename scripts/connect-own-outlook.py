@@ -9,12 +9,14 @@ type the code, from any browser), asking only for your profile and mail
 (read, write drafts, and send the drafts you approve), and writes one file
 named from a hash of your address. A person has one mailbox for Act as me:
 this replaces a Gmail file for the same address. With --calendar it also
-asks to read your calendar (Calendars.Read), for Read my calendar.
+asks for your calendar (Calendars.ReadWrite), for Read my calendar: it reads
+your calendar, and answers a meeting invite as you when you tap Accept or
+Decline on its card (or accepts one on its own under Handle it for me).
 
 It uses the Executive's own Entra app (the one the Microsoft 365 setup in
 .env.example registers; "Allow public client flows" must be on). Its delegated
 Microsoft Graph permissions must include User.Read, Mail.ReadWrite, Mail.Send
-and offline_access (and Calendars.Read for --calendar). A personal Microsoft account needs an app that accepts
+and offline_access (and Calendars.ReadWrite for --calendar). A personal Microsoft account needs an app that accepts
 personal accounts, with MS365_MCP_TENANT_ID=common or consumers.
 
     export MS365_MCP_CLIENT_ID=...
@@ -25,8 +27,10 @@ The file lands in $DELEGATION_GOOGLE_CREDENTIALS_DIR (default:
 ./delegation-credentials). Copy it onto the API's volume, into the directory
 the API's DELEGATION_GOOGLE_CREDENTIALS_DIR points at (Docker:
 /data/delegation_google/). No restart is needed — it is read on each use.
-Sign in as the address on your People entry: any other account is refused
-when it is used. Do NOT commit the file — it holds your refresh token.
+--email is the address on your People entry. Sign in to any mailbox of
+yours: signing in shows it's yours, and the file saves the mailbox you
+signed in to, which is checked on each use. Do NOT commit the file — it
+holds your refresh token.
 """
 from __future__ import annotations
 
@@ -48,7 +52,7 @@ from typing import Any
 LOGIN_BASE = "https://login.microsoftonline.com"
 GRAPH_ME = "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName"
 GRAPH_SCOPES = ("User.Read", "Mail.ReadWrite", "Mail.Send")
-CALENDAR_SCOPE = "Calendars.Read"
+CALENDAR_SCOPE = "Calendars.ReadWrite"
 
 
 def scope_for(graph_scopes: tuple[str, ...]) -> str:
@@ -68,9 +72,16 @@ def email_key(email: str) -> str:
     return hashlib.sha256(email.strip().lower().encode()).hexdigest()[:16]
 
 
+def mailbox_field(email: str, mailbox: str | None) -> dict[str, str]:
+    """The file's ``mailbox`` entry: the mailbox signed in to, when it isn't
+    ``email`` — must match delegation.gmail.mailbox_field."""
+    address = (mailbox or "").strip().lower()
+    return {"mailbox": address} if address and address != email.strip().lower() else {}
+
+
 def credential_payload(
     email: str, refresh_token: str, client_id: str, tenant: str, *, personal: bool,
-    graph_scopes: tuple[str, ...] = GRAPH_SCOPES,
+    graph_scopes: tuple[str, ...] = GRAPH_SCOPES, mailbox: str | None = None,
 ) -> dict[str, Any]:
     """The file's content — the format delegation.outlook.load_credential reads."""
     microsoft: dict[str, str] = {"refresh_token": refresh_token, "client_id": client_id, "tenant": tenant}
@@ -78,6 +89,7 @@ def credential_payload(
         "version": CREDENTIAL_VERSION,
         "provider": "microsoft",
         "email": email.strip().lower(),
+        **mailbox_field(email, mailbox),
         "account": "personal" if personal else "work",
         "scopes": list(graph_scopes),
         "microsoft": microsoft,
@@ -162,7 +174,7 @@ def _sign_in(tenant: str, client_id: str, scope: str = SCOPE) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--email", required=True, help="Your own Outlook address (as on your People entry)")
-    parser.add_argument("--calendar", action="store_true", help="Also allow reading your calendar (Read my calendar)")
+    parser.add_argument("--calendar", action="store_true", help="Also allow your calendar: read it, and answer invites you accept or decline (Read my calendar)")
     args = parser.parse_args()
     graph_scopes = (*GRAPH_SCOPES, CALENDAR_SCOPE) if args.calendar else GRAPH_SCOPES
     email = args.email.strip().lower()
@@ -176,15 +188,17 @@ def main() -> int:
     if not TENANT_RE.fullmatch(tenant):
         sys.exit("error: MS365_MCP_TENANT_ID must be a tenant id, common, organizations or consumers")
 
-    calendar = ", and read-only access to your calendar" if args.calendar else ""
+    calendar = ", and your calendar (read it, and answer invites)" if args.calendar else ""
     print(f"Sign in as {email} and allow read, draft and send access to your mail{calendar}.")
     token = _sign_in(tenant, client_id, scope_for(graph_scopes))
     refresh_token = str(token.get("refresh_token") or "")
     if not refresh_token:
         sys.exit("error: Microsoft returned no refresh token — check the app allows offline_access.")
     opened = _profile_email(str(token.get("access_token") or ""))
+    if "@" not in opened:
+        sys.exit("error: couldn't read the address of the mailbox you signed in to — run it again.")
     if opened != email:
-        sys.exit(f"error: you signed in as {opened}, not {email}. Run it again as {email}.")
+        print(f"Saving {opened} as the mailbox for {email}.")
     tid = token_tenant(str(token.get("id_token") or ""))
     personal = tid == CONSUMER_TENANT_ID or tenant == "consumers"
     # Refresh where this account lives: its own tenant, or the consumer one.
@@ -195,7 +209,7 @@ def main() -> int:
     )
     path = write_credential(
         directory, email,
-        credential_payload(email, refresh_token, client_id, stored_tenant, personal=personal, graph_scopes=graph_scopes),
+        credential_payload(email, refresh_token, client_id, stored_tenant, personal=personal, graph_scopes=graph_scopes, mailbox=opened),
     )
     print(f"Saved {path}")
     print("Copy it into the API's DELEGATION_GOOGLE_CREDENTIALS_DIR (Docker: /data/delegation_google/),")

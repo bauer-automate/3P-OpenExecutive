@@ -5,6 +5,10 @@ A chat's topic is chosen by the model when the chat is named
 ungroup a topic. What the owner does sticks: a chat they filed
 (``topic_source = 'owner'``) is never retagged, and a topic they touched
 (``kept``) is never merged away by the tidy.
+
+Related topics share an ``area`` (one property, deal or client), which the
+Chats page shows as one heading over them. The model sets it; an area the
+owner renamed or ungrouped (``area_kept``) is left as they made it.
 """
 from __future__ import annotations
 
@@ -21,6 +25,21 @@ MAX_TOPIC_CHARS = 40
 PROMPT_TOPICS = 60
 
 
+# A reply that means "no topic", however the model words it: "none",
+# "(none)", "Write none" (the prompt's own words echoed back), "No topic".
+_NO_TOPIC = re.compile(
+    r"^(?:(?:write|topic|area|answer)\s*:?\s*)?[(\[<]?\s*"
+    r"(?:none|no topic|no area|n/a|-|other)"
+    r"\s*[)\]>]?$",
+    re.IGNORECASE,
+)
+
+
+def is_no_topic(name: str) -> bool:
+    """True when ``name`` is the model saying no topic fits, not a topic."""
+    return bool(_NO_TOPIC.match(name.strip()))
+
+
 def clean_topic_name(raw: str | None) -> str | None:
     """One line, no quotes or end punctuation, capped. None when nothing is
     left, or the model said no topic fits."""
@@ -28,9 +47,36 @@ def clean_topic_name(raw: str | None) -> str | None:
         return None
     name = re.sub(r"\s+", " ", raw).strip().strip("\"'").rstrip(".!?,:;").strip()
     name = "".join(c for c in name if c.isprintable())[:MAX_TOPIC_CHARS].strip()
-    if not name or name.lower() in {"none", "-", "n/a", "other"}:
+    if not name or is_no_topic(name):
         return None
     return name
+
+
+def drop_no_topic_topics(conn: Any) -> int:
+    """Remove topics the model saved from a "no topic" reply (such as
+    "Write none"). Their chats go under no topic, as the model meant, and
+    aren't asked about again; an area saved the same way is cleared. A topic
+    or area the owner named or kept is left alone, whatever its name.
+    Returns how many topics went. Runs at startup."""
+    rows = conn.execute("SELECT id, name FROM chat_topics WHERE kept = 0").fetchall()
+    ids = [int(r[0]) for r in rows if is_no_topic(str(r[1]))]
+    for topic_id in ids:
+        conn.execute(
+            "UPDATE sessions SET topic_id = NULL, topic_source = 'auto' "
+            "WHERE topic_id = ? AND COALESCE(topic_source, '') != 'owner'",
+            (topic_id,),
+        )
+        owned = conn.execute("SELECT 1 FROM sessions WHERE topic_id = ? LIMIT 1", (topic_id,)).fetchone()
+        if owned is None:
+            conn.execute("DELETE FROM chat_topics WHERE id = ?", (topic_id,))
+    areas = conn.execute(
+        "SELECT DISTINCT area FROM chat_topics "
+        "WHERE area IS NOT NULL AND area != '' AND area_kept = 0"
+    ).fetchall()
+    for (area,) in areas:
+        if is_no_topic(str(area)):
+            conn.execute("UPDATE chat_topics SET area = '' WHERE area = ? AND area_kept = 0", (area,))
+    return len(ids)
 
 
 def _now() -> str:
@@ -161,7 +207,7 @@ def list_topics(owner: int, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
         )
         rows = conn.execute(
             """
-            SELECT t.id, t.name, t.kept, t.pinned_at, COUNT(s.session_id) AS chat_count,
+            SELECT t.id, t.name, t.kept, t.pinned_at, t.area, COUNT(s.session_id) AS chat_count,
                    MAX(s.updated_at) AS updated_at
             FROM chat_topics t JOIN sessions s ON s.topic_id = t.id
             WHERE t.owner_person_id = ? AND s.caller_person_id = ?
@@ -180,6 +226,10 @@ def list_topics(owner: int, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
         }
         if r["pinned_at"]:
             item["pinned_at"] = r["pinned_at"]
+        if r["area"]:
+            item["area"] = str(r["area"])
+        if r["updated_at"]:
+            item["updated_at"] = str(r["updated_at"])
         out.append(item)
     return out
 
@@ -255,7 +305,8 @@ def ungroup_topic(owner: int, topic_id: int, db_path: Path = DB_PATH) -> bool:
 def owner_only(session_id: str, owner: int, db_path: Path = DB_PATH) -> bool:
     """Whether only the owner has written in this chat and it is shared with
     no one, so a prompt may carry the owner's topic names and its title may
-    show them: anyone else could steer the call into echoing them."""
+    show them: anyone else could steer the call into echoing them. A line a
+    host origin's page sent is someone else's."""
     with _get_conn(db_path) as conn:
         if conn.execute(
             "SELECT 1 FROM session_shares WHERE session_id = ? LIMIT 1", (session_id,)
@@ -263,8 +314,12 @@ def owner_only(session_id: str, owner: int, db_path: Path = DB_PATH) -> bool:
             return False
         other = conn.execute(
             "SELECT 1 FROM chat_messages WHERE session_id = ? AND role = 'user' "
-            "AND sender_person_id IS NOT NULL AND sender_person_id != ? LIMIT 1",
+            "AND ((sender_person_id IS NOT NULL AND sender_person_id != ?) "
+            "OR sender_surface IS NOT NULL) LIMIT 1",
             (session_id, owner),
+        ).fetchone() or conn.execute(
+            # A host line taken back and sent again is saved as the owner's.
+            "SELECT 1 FROM sessions WHERE session_id = ? AND host_wrote = 1", (session_id,)
         ).fetchone()
     return other is None
 
@@ -298,3 +353,68 @@ def untagged_sessions(owner: int, db_path: Path = DB_PATH) -> list[dict[str, str
             (owner,),
         ).fetchall()
     return [{"session_id": str(r["session_id"]), "title": str(r["title"])} for r in rows]
+
+
+def topics_with_areas(owner: int, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """The owner's topics that hold a chat, with their area ('' = none,
+    None = not looked at) and whether the owner set it, most recently used
+    first, for the area prompts."""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT t.id, t.name, t.area, t.area_kept FROM chat_topics t
+            JOIN sessions s ON s.topic_id = t.id
+            WHERE t.owner_person_id = ?
+            GROUP BY t.id
+            ORDER BY MAX(s.updated_at) DESC
+            LIMIT ?
+            """,
+            (owner, PROMPT_TOPICS),
+        ).fetchall()
+    return [
+        {"id": int(r["id"]), "name": str(r["name"]), "area": r["area"], "area_kept": bool(r["area_kept"])}
+        for r in rows
+    ]
+
+
+def needs_areas(owner: int, db_path: Path = DB_PATH) -> bool:
+    """Whether any topic holding a chat waits for its area to be looked at,
+    once the owner has enough topics (three) for areas to mean anything."""
+    topics = topics_with_areas(owner, db_path)
+    return len(topics) >= 3 and any(t["area"] is None for t in topics)
+
+
+def set_area(owner: int, topic_ids: list[int], area: str | None, db_path: Path = DB_PATH) -> int:
+    """Put the owner's topics under ``area`` ('' when None: looked at, none).
+    Topics whose area the owner set are left alone. Returns how many moved."""
+    if not topic_ids:
+        return 0
+    marks = ",".join("?" for _ in topic_ids)
+    with _get_conn(db_path) as conn:
+        cur = conn.execute(
+            f"UPDATE chat_topics SET area = ? WHERE owner_person_id = ? AND area_kept = 0 AND id IN ({marks})",
+            (area or "", owner, *topic_ids),
+        )
+        return int(cur.rowcount)
+
+
+def rename_area(owner: int, area: str, name: str, db_path: Path = DB_PATH) -> int:
+    """Rename one of the owner's areas (an existing one's name joins the
+    two). Kept so. Returns how many topics it holds."""
+    with _get_conn(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE chat_topics SET area = ?, area_kept = 1 WHERE owner_person_id = ? AND area = ?",
+            (name, owner, area),
+        )
+        return int(cur.rowcount)
+
+
+def ungroup_area(owner: int, area: str, db_path: Path = DB_PATH) -> int:
+    """Drop one of the owner's areas: its topics stand on their own, and the
+    model doesn't put them back under one. Returns how many it held."""
+    with _get_conn(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE chat_topics SET area = '', area_kept = 1 WHERE owner_person_id = ? AND area = ?",
+            (owner, area),
+        )
+        return int(cur.rowcount)

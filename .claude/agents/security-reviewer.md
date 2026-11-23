@@ -7,7 +7,7 @@ description: >
   bypass, hardcoded secrets, race conditions, and information leakage, and
   reports severity and a concrete exploit per finding.
 tools: Read, Grep, Glob, Bash
-model: fable
+model: opus
 effort: xhigh
 maxTurns: 30
 color: red

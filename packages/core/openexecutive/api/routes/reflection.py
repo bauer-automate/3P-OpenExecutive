@@ -56,6 +56,8 @@ class MissOut(BaseModel):
     tools: list[str]
     wanted: str
     kind: str
+    # What would have fixed it (memory.chat_review.CAUSES), or None.
+    cause: str | None = None
     signals: list[str]
     # How its replays went (memory.replay): "open" until one passes,
     # "closed" (it would go right today), "evidence" (can't be judged today).
@@ -90,6 +92,9 @@ class LessonOut(BaseModel):
     shown: int
     fine_after: int
     miss_after: int
+    # How often it was used on each surface (``lessons.SURFACES``: chat,
+    # one_on_one, email, meeting, brief, lead).
+    used_in: dict[str, int] = {}
 
 
 class WeekOut(BaseModel):
@@ -104,6 +109,10 @@ class ReflectionOut(BaseModel):
     weeks: list[WeekOut]
     replay: ReplayOut
     sees_everyone: bool
+    # This week, over the lessons listed: how many were learned and how
+    # often they were used on each surface.
+    learned_this_week: int = 0
+    used_this_week: dict[str, int] = {}
 
 
 def _refuse(status_code: int, code: str, message: str) -> HTTPException:
@@ -122,7 +131,7 @@ def _caller(request: Request) -> Person:
         elif who.defaults_to_principal and local_login():
             person = find_principal_person()
         else:
-            raise _refuse(403, "sign_in_required", "Sign in to see what it got wrong in your chats.")
+            raise _refuse(403, "sign_in_required", "Sign in to see what it learned from your chats.")
     except HTTPException:
         raise
     except Exception as exc:
@@ -203,7 +212,17 @@ def get_reflection(
         misses = chat_review.list_misses(person_id=scope, limit=_PAGE)
         learned = lessons.list_lessons(person_id=scope, limit=_PAGE)
     weeks = chat_review.weekly_rates(person_id=scope)
+    from datetime import UTC, datetime, timedelta
+
+    # Uses are kept by the day, so both numbers cover the same seven days:
+    # today and the six before it.
+    week_ago = (datetime.now(UTC) - timedelta(days=6)).date().isoformat()
+    live = [lesson for lesson in learned if lesson["retired_at"] is None]
     return ReflectionOut(
+        learned_this_week=sum(1 for lesson in live if str(lesson["created_at"])[:10] >= week_ago),
+        # Over the lessons listed, and no others: the count gives away
+        # nothing about a lesson this caller may not see.
+        used_this_week=lessons.used_since(week_ago, lesson_ids=[int(lesson["id"]) for lesson in live]),
         misses=[MissOut(**m) for m in misses],
         lessons=[LessonOut(**lesson, person_name=_name(lesson["person_id"])) for lesson in learned],
         replay=ReplayOut(**replay.summary_for(misses)),

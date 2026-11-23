@@ -49,6 +49,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import openexecutive.workflows.persistence as _wf_persistence
+from openexecutive.workflows import run_control
 from openexecutive.workflows.wait_for_human import (
     CONTINUE_DECISIONS,
     DECISION_VERBS,
@@ -143,6 +144,74 @@ async def apply_resolution(
         _kick_resume(run_id, db_path=db_path)
 
     return True
+
+
+def waiting_runs(key: str, db_path: Path | None = None) -> list[dict]:
+    """The runs paused until ``key`` is ready (``extensions.workflow_wait``)."""
+    key = str(key or "").strip()
+    if not key:
+        return []
+    found = []
+    for run in _wf_persistence.list_awaiting_runs(db_path=db_path):
+        try:
+            state = json.loads(run.get("state_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(state, dict) and state.get("waiting_for") == key:
+            found.append(run)
+    return found
+
+
+async def resume_waiting(key: str, db_path: Path | None = None) -> int:
+    """Pick up every run paused until ``key`` is ready, now that it is: each
+    one's waiting step runs again. Returns how many were picked up. Never
+    raises.
+
+    A run is saved as waiting only after its step writes its report, so a
+    call made in that gap finds nothing. Call it again now and then while
+    ``key`` stays ready (it is one query when nothing waits), not only when
+    it becomes ready."""
+    picked = 0
+    try:
+        for run in waiting_runs(key, db_path=db_path):
+            ready = WaitForHumanResolution(
+                run_id=run["run_id"],
+                reply_text="[ready]",
+                source_channel="system",
+                parsed_decision={"decision": "ready", "note": "what it waited for is ready"},
+                person_id=run.get("awaiting_person_id") or 0,
+            )
+            if await apply_resolution(run["run_id"], ready, db_path=db_path):
+                picked += 1
+    except Exception:
+        logger.exception("resumer: couldn't pick up runs waiting for %s", key)
+    return picked
+
+
+async def stop_waiting(key: str, db_path: Path | None = None) -> int:
+    """Stop every run paused until ``key`` is ready, because the person said
+    not to go on (they pressed Stop on what it waited for): each one stops
+    there and says so, the same as a no on its pause. Returns how many were
+    stopped. Never raises.
+
+    As with ``resume_waiting``, a run is saved as waiting only after its step
+    writes its report, so a call made in that gap finds nothing: when it
+    returns 0 and the Stop still stands, call it again a few seconds later."""
+    stopped = 0
+    try:
+        for run in waiting_runs(key, db_path=db_path):
+            no = WaitForHumanResolution(
+                run_id=run["run_id"],
+                reply_text="[stopped]",
+                source_channel="system",
+                parsed_decision={"decision": "reject", "note": "they stopped it while it waited"},
+                person_id=run.get("awaiting_person_id") or 0,
+            )
+            if await apply_resolution(run["run_id"], no, db_path=db_path):
+                stopped += 1
+    except Exception:
+        logger.exception("resumer: couldn't stop runs waiting for %s", key)
+    return stopped
 
 
 # How a recorded decision reads back to the person. What follows the verb
@@ -269,6 +338,8 @@ def _kick_resume(run_id: str, db_path: Path | None = None) -> None:
                 row = _load_resumable_row(run_id, db_path=db_path)
                 if row is not None:
                     await _execute_resume(row, claim, db_path=db_path)
+            except run_control.RunStopped:
+                logger.info("resumer: run %s was stopped", run_id)
             except Exception:
                 logger.exception("resumer: kicked resume failed for run_id=%s", run_id)
                 _abandon_resume(run_id, "resume failed unexpectedly", db_path=db_path)
@@ -347,6 +418,8 @@ async def _process_resumable(now: datetime, db_path: Path | None = None) -> int:
         try:
             if await _execute_resume(row, claim, db_path=db_path):
                 executed += 1
+        except run_control.RunStopped:
+            logger.info("resumer: run %s was stopped", run_id)
         except Exception:
             logger.exception("resumer: resume failed for run_id=%s", run_id)
             _abandon_resume(run_id, "resume failed unexpectedly", db_path=db_path)
@@ -362,6 +435,7 @@ async def _execute_resume(
     its steps read and draft is theirs (`artifact_records.pinned_viewer`),
     and nobody's for a team run, so no one's documents reach the run's
     history that someone else may read."""
+    from openexecutive.delegation.workflow_reads import private_run
     from openexecutive.orchestrator.artifact_records import (
         NOBODY,
         pinned_viewer,
@@ -370,7 +444,10 @@ async def _execute_resume(
 
     run = _wf_persistence.get_run(row["run_id"], db_path=db_path) or {}
     owner = run.get("owner_person_id")
-    with pinned_viewer(viewer_for_person(owner) if owner is not None else NOBODY):
+    with (
+        pinned_viewer(viewer_for_person(owner) if owner is not None else NOBODY),
+        private_run(str(run.get("workflow_name") or "")),
+    ):
         return await _drive_resume(row, claim, db_path=db_path)
 
 
@@ -453,9 +530,10 @@ async def _drive_resume(
     last_heartbeat = datetime.now(UTC)
     # No handler here: a crash propagates to the caller, which routes it
     # through `_abandon_resume` — the one failure path both entry points share.
-    async for event in workflow.resume(
+    # A Stop raises RunStopped out of here; both callers let it end quietly.
+    async for event in run_control.watch(run_id, workflow.resume(
         inputs=inputs, state=state, resolution=resolution, store=store
-    ):
+    )):
         if isinstance(event, WaitForHumanEvent):
             # A SECOND gate. Re-checkpoint through the same helper the
             # other runners use: that flips running -> awaiting_human,
@@ -553,18 +631,28 @@ async def _drive_resume(
     )
     logger.info("resumer: run %s resumed -> %s", run_id, outcome)
     if artifact and state.deliver_to_person_id is not None:
-        await _deliver_artifact(run_id, state.deliver_to_person_id, artifact)
+        await _deliver_artifact(run_id, name, state.deliver_to_person_id, artifact)
     return True
 
 
-async def _deliver_artifact(run_id: str, person_id: int, artifact: str) -> None:
-    """DM a resumed scheduled run's artifact — the delivery the scheduler
-    would have made had the run not paused. Best effort: the run is already
-    stored as done, and a failed send must not change that."""
+async def _deliver_artifact(run_id: str, name: str, person_id: int, artifact: str) -> None:
+    """DM what a resumed scheduled run came to — the delivery the scheduler
+    would have made had the run not paused (``run_message``: a few plain
+    lines, or nothing). Best effort: the run is already stored as done, and a
+    failed send must not change that."""
     try:
         from openexecutive.orchestrator.schedule_tools import handle_message_person
+        from openexecutive.workflows.dynamic_store import get_definition
+        from openexecutive.workflows.run_message import message_for_run
 
-        await handle_message_person({"person_id": person_id, "text": artifact})
+        defn = get_definition(name)
+        message = await message_for_run(
+            title=(defn.title if defn else "") or name,
+            description=(defn.description if defn else "") or "",
+            artifact=artifact, person_id=person_id,
+        )
+        if message:
+            await handle_message_person({"person_id": person_id, "text": message})
     except Exception:
         logger.exception("resumer: run %s artifact delivery failed (run still done)", run_id)
 

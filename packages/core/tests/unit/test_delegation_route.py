@@ -1,6 +1,7 @@
 """GET / PUT /delegation and /delegation/voice (api/routes/delegation.py)."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from openexecutive.people import store as people_store
 
 OWNER = {"x-caller-email": "olivia@co.example"}
 TEAMMATE = {"x-caller-email": "ben@co.example"}
+# Someone not on the team: Act as me answers only the team.
+NOT_ON_TEAM = {"x-caller-email": "nobody@x.example"}
 
 
 @pytest.fixture(autouse=True)
@@ -72,10 +75,10 @@ def client(audit: list[Any], gmail: dict[str, str]) -> TestClient:
     return TestClient(app)
 
 
-def test_only_the_owner_sees_it(client: TestClient, ids: dict[str, int]) -> None:
-    resp = client.get("/delegation", headers=TEAMMATE)
+def test_only_someone_on_the_team_sees_it(client: TestClient, ids: dict[str, int]) -> None:
+    assert client.get("/delegation", headers=TEAMMATE).status_code == 200
+    resp = client.get("/delegation", headers=NOT_ON_TEAM)
     assert resp.status_code == 403 and resp.json()["detail"]["code"] == "not_available_yet"
-    assert client.get("/delegation", headers={"x-caller-email": "nobody@x.example"}).status_code == 403
     body = client.get("/delegation", headers=OWNER).json()
     assert body["enabled"] is False
     assert body["gmail"]["status"] == "not_configured"
@@ -155,7 +158,7 @@ def test_on_and_off_are_audited_privately(
     assert types == ["delegation_gmail_verified", "delegation_settings_changed", "delegation_settings_changed"]
     assert all(kw["private"] is True for _, kw in audit)
     # A teammate cannot flip it.
-    assert client.put("/delegation", json={"enabled": True}, headers=TEAMMATE).status_code == 403
+    assert client.put("/delegation", json={"enabled": True}, headers=NOT_ON_TEAM).status_code == 403
 
 
 def test_turning_it_off_forgets_the_emails_it_opened(
@@ -251,7 +254,7 @@ def test_learning_needs_their_gmail(
     monkeypatch.setattr(route, "learn_from_sent_mail", locked)
     resp = client.post("/delegation/voice/learn", headers=OWNER)
     assert resp.status_code == 409 and resp.json()["detail"]["code"] == "locked"
-    assert client.post("/delegation/voice/learn", headers=TEAMMATE).status_code == 403
+    assert client.post("/delegation/voice/learn", headers=NOT_ON_TEAM).status_code == 403
 
 
 class _Mailbox:
@@ -376,7 +379,7 @@ def test_only_the_owner_takes_their_signature(
     client: TestClient, ids: dict[str, int], gmail: dict[str, str], mailbox: _Mailbox
 ) -> None:
     gmail["status"] = "connected"
-    assert client.post("/delegation/voice/signature", headers=TEAMMATE).status_code == 403
+    assert client.post("/delegation/voice/signature", headers=NOT_ON_TEAM).status_code == 403
     resp = client.post("/delegation/voice/signature")
     assert resp.status_code == 403 and resp.json()["detail"]["code"] == "sign_in_required"
     assert mailbox.asked == 0
@@ -414,7 +417,7 @@ def test_a_style_is_written_from_their_words_without_saving(
     monkeypatch.setattr(route, "describe_voice", refused)
     resp = client.post("/delegation/voice/describe", json={"description": "Short."}, headers=OWNER)
     assert resp.status_code == 409 and resp.json()["detail"]["code"] == "too_many"
-    assert client.post("/delegation/voice/describe", json={"description": "x"}, headers=TEAMMATE).status_code == 403
+    assert client.post("/delegation/voice/describe", json={"description": "x"}, headers=NOT_ON_TEAM).status_code == 403
     assert client.post("/delegation/voice/describe", json={"nope": 1}, headers=OWNER).status_code == 422
 
 
@@ -471,6 +474,13 @@ def test_read_my_calendar_turns_on_only_once_the_calendar_opens(
     assert body["calendar"]["enabled"] is True and calendar.enabled(ids["principal"]) is True
     assert body["calendar"]["granted"] is True
     assert calendar.enabled(ids["teammate"]) is False
+    # The mailbox gone (disconnected, or its sign-in revoked): the switch reads
+    # Off, since nothing can be read, and On again once it's back.
+    gmail["status"] = "not_configured"
+    assert client.get("/delegation", headers=OWNER).json()["calendar"]["enabled"] is False
+    assert calendar.enabled(ids["principal"]) is True
+    gmail["status"] = "connected"
+    assert client.get("/delegation", headers=OWNER).json()["calendar"]["enabled"] is True
     # Act as me off takes it with it, and it is audited privately each way.
     client.put("/delegation", json={"enabled": False}, headers=OWNER)
     assert calendar.enabled(ids["principal"]) is False
@@ -503,16 +513,22 @@ def test_the_dial_climbs_one_switch_at_a_time(
     pid = ids["principal"]
     gmail["status"] = "connected"
     assert route.reach_of(pid) == "off"
+    assert _reach(client, "when_asked").status_code == 200
+    assert is_enabled(pid) and not inbox.get_watch(pid).enabled and not handle_it.get(pid).enabled
     assert _reach(client, "inbox").status_code == 200
-    assert is_enabled(pid) and inbox.get_watch(pid).enabled and not handle_it.get(pid).enabled
+    assert inbox.get_watch(pid).enabled and handle_it.get(pid).enabled
     assert route.reach_of(pid) == "inbox"
-    _reach(client, "bold")
-    assert handle_it.get(pid).enabled and handle_it.get(pid).mode == "bold"
-    _reach(client, "everything")
-    assert route.reach_of(pid) == "everything"
-    # Across the sending steps: Everything goes, the level stays the one picked.
-    _reach(client, "careful")
-    assert route.reach_of(pid) == "careful" and not handle_it.leading(pid)
+    for gone in ("bold", "everything", "careful"):
+        assert _reach(client, gone).status_code == 422
+
+
+def test_an_older_app_s_handle_it_step_means_inbox(
+    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None
+) -> None:
+    pid = ids["principal"]
+    gmail["status"] = "connected"
+    assert _reach(client, "handle_it").status_code == 200
+    assert route.reach_of(pid) == "inbox"
 
 
 def test_moving_down_turns_everything_above_off(
@@ -522,10 +538,10 @@ def test_moving_down_turns_everything_above_off(
 
     pid = ids["principal"]
     gmail["status"] = "connected"
-    _reach(client, "everything")
+    _reach(client, "inbox")
     assert _reach(client, "when_asked").status_code == 200
     assert is_enabled(pid) and not inbox.get_watch(pid).enabled
-    assert not handle_it.get(pid).enabled and not handle_it.leading(pid)
+    assert not handle_it.get(pid).enabled
     _reach(client, "off")
     assert route.reach_of(pid) == "off" and not is_enabled(pid)
 
@@ -536,48 +552,36 @@ def test_without_a_mailbox_the_dial_stays_off(client: TestClient, ids: dict[str,
     assert route.reach_of(ids["principal"]) == "off"
 
 
-def test_sending_needs_a_signed_sign_in_but_holding_back_doesnt(
+def test_holding_back_needs_no_signed_sign_in(
     client: TestClient, ids: dict[str, int], gmail: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from openexecutive.delegation import handle_it
-
     pid = ids["principal"]
     gmail["status"] = "connected"
     monkeypatch.setenv("OE_LOCAL_LOGIN", "1")
-    _reach(client, "bold")
-    monkeypatch.delenv("OE_LOCAL_LOGIN")
-    # Without signed sign-ins it can't go higher...
-    assert _reach(client, "everything").status_code == 409
-    assert route.reach_of(pid) == "bold"
-    # ...but a lower level, or no sending at all, is always possible.
-    assert _reach(client, "careful").status_code == 200 and handle_it.get(pid).mode == "careful"
-    assert _reach(client, "inbox").status_code == 200 and route.reach_of(pid) == "inbox"
-
-
-def test_everything_is_the_owners_and_not_in_training(
-    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from openexecutive.delegation import training
-
-    gmail["status"] = "connected"
-    _reach(client, "balanced")
-    training.set_(ids["principal"], {training.REPLIES: True}, updated_by="t")
-    resp = _reach(client, "everything")
-    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "in_training"
-    assert route.reach_of(ids["principal"]) == "balanced"
-
-
-def test_training_set_before_sending_holds_once_it_sends(
-    client: TestClient, ids: dict[str, int], gmail: dict[str, str], signed: None
-) -> None:
-    from openexecutive.delegation import handle_it, training
-
-    pid = ids["principal"]
-    gmail["status"] = "connected"
     _reach(client, "inbox")
-    resp = client.put("/delegation/training", json={"replies": True, "follow_ups": True}, headers=OWNER)
-    assert resp.status_code == 200
-    _reach(client, "careful")
-    assert handle_it.get(pid).enabled
-    t = training.get(pid)
-    assert t.replies and t.follow_ups
+    monkeypatch.delenv("OE_LOCAL_LOGIN")
+    assert _reach(client, "when_asked").status_code == 200 and route.reach_of(pid) == "when_asked"
+
+
+def test_one_settings_change_asks_for_the_mailbox_status_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.delegation import gmail as gmail_mod
+
+    asked: list[str] = []
+
+    async def live(address: str, *, gmail: Any = None) -> str:
+        asked.append(address)
+        return "connected"
+
+    monkeypatch.setattr(gmail_mod, "_gmail_status", live)
+
+    async def go() -> list[str]:
+        with gmail_mod.status_memo():
+            with gmail_mod.status_memo():
+                first = await gmail_mod.gmail_status("Owner@Example.com")
+            second = await gmail_mod.gmail_status("owner@example.com")
+        third = await gmail_mod.gmail_status("owner@example.com")
+        return [first, second, third]
+
+    assert asyncio.run(go()) == ["connected"] * 3
+    # Once inside the block, and again outside it.
+    assert asked == ["owner@example.com", "owner@example.com"]

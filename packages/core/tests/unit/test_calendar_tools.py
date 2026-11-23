@@ -77,9 +77,6 @@ def _settings(**kw: Any) -> Any:
         mcp_enabled=True,
         calendar_business_hours_start="09:00",
         calendar_business_hours_end="18:00",
-        calendar_horizon_days=30,
-        calendar_max_events_per_day=10,
-        calendar_max_attendees=8,
         calendar_meet_links_enabled=True,
         calendar_instant_meeting_minutes=30,
         calendar_post_meeting_followup_enabled=True,
@@ -114,14 +111,24 @@ def _call(tool_input: dict[str, Any], settings: Any | None = None, gateway: Any 
     with (
         patch("openexecutive.config.get_settings", return_value=s),
         patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gw),
-        patch("openexecutive.departments.authority.gate_action") as mock_gate,
+        patch("openexecutive.orchestrator.calendar_tools._meeting_gate") as mock_gate,
     ):
+        # Approvals holds it (calendar_tools._meeting_gate): the propose path.
         mock_gate.return_value = SimpleNamespace(
             action="propose",
             assignee_person_id=None,
         )
         raw = asyncio.run(handle_create_calendar_event(tool_input))
     return json.loads(raw)
+
+
+def _call_real(tool_input: dict[str, Any], settings: Any | None = None, gateway: Any = None) -> dict[str, Any]:
+    """Like _call, with Approvals deciding (calendar_tools._meeting_gate)."""
+    with (
+        patch("openexecutive.config.get_settings", return_value=settings or _settings()),
+        patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gateway or _fake_gateway()),
+    ):
+        return json.loads(asyncio.run(handle_create_calendar_event(tool_input)))
 
 
 # ---------------------------------------------------------------------------
@@ -185,49 +192,55 @@ def test_end_before_start_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cap: horizon
+# No caps: how far out, how many people
 # ---------------------------------------------------------------------------
 
-def test_beyond_horizon_rejected() -> None:
+def test_a_meeting_months_out_books() -> None:
     _add_person("Alice", "alice@example.com")
-    far = (datetime.now(UTC) + timedelta(days=60)).replace(hour=10)
-    result = _call({
+    far = _next_weekday_at_10(datetime.now(UTC) + timedelta(days=120))
+    result = _call_real({
         "title": "Sync", "start": _iso(far), "end": _iso(far.replace(hour=11)),
         "attendee_person_ids": [1], "confidence": 0.8,
-    }, settings=_settings(calendar_horizon_days=30))
-    assert "error" in result
-    assert "30 days" in result["error"]
+    })
+    assert result["status"] == "created", result
 
 
 # ---------------------------------------------------------------------------
-# Cap: business hours
+# Business hours: below Hands-off it waits on the asker's card
 # ---------------------------------------------------------------------------
 
-def test_weekend_rejected() -> None:
+def test_a_weekend_meeting_waits_on_a_card() -> None:
     _add_person("Alice", "alice@example.com")
     # Find next Saturday, starting from tomorrow so the time-of-day replace is safe
     d = datetime.now(UTC) + timedelta(days=1)
     while d.weekday() != 5:
         d += timedelta(days=1)
     sat = d.replace(hour=10, minute=0, second=0, microsecond=0)
-    result = _call({
+    result = _call_real({
         "title": "Sync", "start": _iso(sat), "end": _iso(sat.replace(hour=11)),
         "attendee_person_ids": [1], "confidence": 0.8,
     })
-    assert "error" in result
-    assert "weekend" in result["error"].lower() or "business" in result["error"].lower()
+    assert result["status"] == "proposed", result
 
 
-def test_outside_business_hours_rejected() -> None:
+def test_an_evening_meeting_waits_below_hands_off_and_books_on_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.memory.decision_ledger import get_decision_instance
+    from openexecutive.orchestrator import levels
+
     _add_person("Alice", "alice@example.com")
     # 20:00 UTC — outside 09:00–18:00
     late = FUTURE.replace(hour=20)
-    result = _call({
+    tool_input = {
         "title": "Sync", "start": _iso(late), "end": _iso(late.replace(hour=21)),
         "attendee_person_ids": [1], "confidence": 0.8,
-    })
-    assert "error" in result
-    assert "business" in result["error"].lower()
+    }
+    result = _call_real(tool_input)
+    assert result["status"] == "proposed", result
+    held = get_decision_instance(result["decision_instance_id"])
+    assert held is not None
+    assert json.loads(held.proposed_payload_json)["waiting_because"].startswith("It's outside business hours")
+    monkeypatch.setattr(levels, "relaxed", lambda: True)
+    assert _call_real({**tool_input, "title": "Other"})["status"] == "created"
 
 
 # ---------------------------------------------------------------------------
@@ -253,16 +266,15 @@ def test_person_without_email_rejected() -> None:
     assert "email" in result["error"].lower()
 
 
-def test_too_many_attendees_rejected() -> None:
-    for i in range(9):
+def test_any_number_of_attendees_books() -> None:
+    for i in range(12):
         _add_person(f"Person {i}", f"p{i}@example.com")
     all_ids = [p.id for p in people_store.list_people() if p.id]
-    result = _call({
+    result = _call_real({
         "title": "Sync", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
-        "attendee_person_ids": all_ids[:9], "confidence": 0.8,
-    }, settings=_settings(calendar_max_attendees=8))
-    assert "error" in result
-    assert "attendee" in result["error"].lower()
+        "attendee_person_ids": all_ids, "confidence": 0.8,
+    })
+    assert result["status"] == "created", result
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +315,13 @@ def test_happy_path_propose(tmp_path: Path) -> None:
     })
     assert result["status"] == "proposed"
     assert "decision_instance_id" in result
+    # Someone on the team asked, so it waits only for the hour: its card on
+    # Home says that.
+    from openexecutive.memory.decision_ledger import get_decision_instance
+
+    held = get_decision_instance(result["decision_instance_id"])
+    assert held is not None
+    assert json.loads(held.proposed_payload_json)["waiting_because"].startswith("It's outside business hours")
 
 
 def test_propose_does_not_call_mcp() -> None:
@@ -400,7 +419,7 @@ def _call_with_gate(
     with (
         patch("openexecutive.config.get_settings", return_value=s),
         patch("openexecutive.orchestrator.mcp_gateway.get_active_gateway", return_value=gw),
-        patch("openexecutive.departments.authority.gate_action") as mock_gate,
+        patch("openexecutive.orchestrator.calendar_tools._meeting_gate") as mock_gate,
     ):
         mock_gate.return_value = SimpleNamespace(
             action=action, assignee_person_id=assignee_person_id
@@ -728,24 +747,11 @@ def test_instant_meeting_principal_protection() -> None:
     assert "principal" in result["error"].lower()
 
 
-def test_instant_meeting_max_attendees() -> None:
-    ids = [_add_person(f"P{i}", f"p{i}@example.com") for i in range(3)]
-    result, _ = _call_instant(
-        {"attendee_person_ids": ids, "confidence": 0.9},
-        settings=_settings(calendar_max_attendees=2),
-    )
-    assert "error" in result
-    assert "attendees" in result["error"].lower()
-
-
-def test_instant_meeting_daily_cap() -> None:
-    pid = _add_person("Alice", "alice@example.com")
-    result, _ = _call_instant(
-        {"attendee_person_ids": [pid], "confidence": 0.9},
-        settings=_settings(calendar_max_events_per_day=0),
-    )
-    assert "error" in result
-    assert "cap" in result["error"].lower()
+def test_instant_meeting_has_no_attendee_or_daily_cap() -> None:
+    ids = [_add_person(f"P{i}", f"p{i}@example.com") for i in range(12)]
+    for _ in range(12):
+        result, _ = _call_instant({"attendee_person_ids": ids, "confidence": 0.9})
+        assert result["status"] == "created", result
 
 
 # ---------------------------------------------------------------------------
@@ -988,7 +994,10 @@ def test_team_auto_execute_from_an_email_is_proposed_to_an_approver(monkeypatch:
         }))
     assert json.loads(raw)["status"] == "proposed"
     gw.call_tool.assert_not_awaited()
-    assert list_instances("meeting_scheduling")[0].approver_person_id == boss
+    held = list_instances("meeting_scheduling")[0]
+    assert held.approver_person_id == boss
+    # Its card on Home says why it waited: nobody on the team asked.
+    assert json.loads(held.proposed_payload_json)["waiting_because"].startswith("Nobody on your team asked")
 
 
 # The gate itself, unpatched: who counts as someone on the team asking directly.
@@ -1076,3 +1085,156 @@ def test_a_proposal_says_where_its_card_is() -> None:
     assert "right here in the chat" in r["message"]
     assert again["status"] == "already_proposed" and again["approve_here"] is True
     assert again["decision_instance_id"] == r["decision_instance_id"]
+
+
+# ---------------------------------------------------------------------------
+# Business hours on the company's clock, owner-only meetings, raw bookings
+# ---------------------------------------------------------------------------
+
+def _new_york(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zoneinfo import ZoneInfo
+
+
+    monkeypatch.setattr("openexecutive.memory.workspace_settings.get_user_timezone", lambda: ZoneInfo("America/New_York"))
+
+
+def _weekday(days_out: int = 3, tz: Any = UTC) -> datetime:
+    # A weekday on ``tz``'s calendar: just after midnight UTC on a Monday is
+    # still Sunday in New York.
+    day = (datetime.now(UTC) + timedelta(days=days_out)).astimezone(tz)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+def test_business_hours_are_read_on_the_company_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 2 PM in New York is 18:00 or 19:00 UTC: inside 09:00-18:00 there, not in UTC.
+    from zoneinfo import ZoneInfo
+
+    _new_york(monkeypatch)
+    _add_person("Alice", "alice@example.com")
+    day = _weekday(tz=ZoneInfo("America/New_York"))
+    start = day.replace(hour=14, minute=0, second=0, microsecond=0)
+    result = _call({
+        "title": "Sync", "start": _iso(start), "end": _iso(start + timedelta(minutes=30)),
+        "attendee_person_ids": [1], "confidence": 0.9,
+    })
+    assert result.get("status") == "proposed", result
+
+
+def test_a_time_without_a_zone_is_company_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.orchestrator import calendar_tools
+
+    _new_york(monkeypatch)
+    parsed = calendar_tools._parse_iso("2026-11-05T14:00:00")
+    assert parsed == datetime(2026, 11, 5, 19, 0, tzinfo=UTC)
+
+
+def test_early_morning_in_new_york_is_still_outside_hours(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zoneinfo import ZoneInfo
+
+    _new_york(monkeypatch)
+    _add_person("Alice", "alice@example.com")
+    start = _weekday(tz=ZoneInfo("America/New_York")).replace(hour=7, minute=0, second=0, microsecond=0)
+    result = _call_real({
+        "title": "Sync", "start": _iso(start), "end": _iso(start + timedelta(minutes=30)),
+        "attendee_person_ids": [1], "confidence": 0.9,
+    })
+    assert result.get("status") == "proposed", result
+
+
+def test_a_meeting_with_the_principal_alone() -> None:
+    _add_person("John", "john@example.com", is_principal=True)
+    result = _call({
+        "title": "Focus", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+        "attendee_person_ids": [], "include_principal": True, "confidence": 0.9,
+    })
+    assert result.get("status") == "proposed", result
+
+
+def test_no_attendees_without_the_principal_is_still_refused() -> None:
+    _add_person("John", "john@example.com", is_principal=True)
+    result = _call({
+        "title": "Focus", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+        "attendee_person_ids": [], "confidence": 0.9,
+    })
+    assert result.get("error") == "attendee_person_ids must not be empty"
+
+
+def test_a_raw_booking_with_people_goes_through_the_card_tool() -> None:
+    from openexecutive.orchestrator.calendar_tools import RAW_BOOKING_REFUSAL, typed_booking_only
+
+    calls: list[dict[str, Any]] = []
+
+    async def call_tool(tool_input: dict[str, Any]) -> str:
+        calls.append(tool_input)
+        return "ok"
+
+    create = {"name": "google_workspace__manage_event", "arguments": {
+        "action": "create", "summary": "Sync", "attendees": ["alice@example.com"],
+    }}
+    alone = {"name": "google_workspace__manage_event", "arguments": {"action": "create", "summary": "Focus"}}
+    delete = {"name": "google_workspace__manage_event", "arguments": {"action": "delete", "event_id": "e1"}}
+    outlook = {"name": "microsoft_365__create-calendar-event", "arguments": {
+        "body": {"subject": "Sync", "attendees": [{"emailAddress": {"address": "alice@example.com"}}]},
+    }}
+    with patch("openexecutive.config.get_settings", return_value=_settings()):
+        wrapped = typed_booking_only(True, call_tool)
+        refused = asyncio.run(wrapped(create))
+        assert json.loads(refused)["error"] == RAW_BOOKING_REFUSAL
+        assert json.loads(asyncio.run(wrapped(outlook)))["error"] == RAW_BOOKING_REFUSAL
+        assert asyncio.run(wrapped(alone)) == "ok"
+        assert asyncio.run(wrapped(delete)) == "ok"
+        # A turn without create_calendar_event keeps the calendar's own tool.
+        assert asyncio.run(typed_booking_only(False, call_tool)(create)) == "ok"
+    with patch("openexecutive.config.get_settings", return_value=_settings(calendar_booking_enabled=False)):
+        assert asyncio.run(typed_booking_only(True, call_tool)(create)) == "ok"
+    assert calls == [alone, delete, create, create]
+
+
+# ---------------------------------------------------------------------------
+# Approvals decides: no meeting setting of its own
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("workspace", ["solo", "team"])
+def test_the_owner_asking_books_it_with_no_meeting_setting(workspace: str) -> None:
+    from openexecutive.memory import workspace_settings
+
+    workspace_settings.set_workspace_mode(workspace)
+    pid = _add_person("Alice", "alice@example.com")
+    gw = _fake_gateway("evt-owner")
+    with patch(
+        "openexecutive.orchestrator.people_tools.is_principal_on_verified_surface", return_value=True,
+    ):
+        result = _call_real({
+            "title": "Sync", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+            "attendee_person_ids": [pid], "confidence": 0.9,
+        }, gateway=gw)
+    assert result["status"] == "created"
+    gw.call_tool.assert_awaited_once()
+
+
+@pytest.mark.parametrize("workspace", ["solo", "team"])
+def test_hands_off_books_what_someone_else_asked_for(
+    workspace: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.memory import workspace_settings
+    from openexecutive.orchestrator import levels
+
+    workspace_settings.set_workspace_mode(workspace)
+    _from_outside(monkeypatch)
+    pid = _add_person("Alice", "alice@example.com")
+    monkeypatch.setattr(levels, "relaxed", lambda: True)
+    gw = _fake_gateway("evt-hands-off")
+    result = _call_real({
+        "title": "Sync", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+        "attendee_person_ids": [pid], "confidence": 0.9,
+    }, gateway=gw)
+    assert result["status"] == "created"
+    monkeypatch.setattr(levels, "relaxed", lambda: False)
+    result = _call_real({
+        "title": "Other sync", "start": _iso(FUTURE), "end": _iso(FUTURE_END),
+        "attendee_person_ids": [pid], "confidence": 0.9,
+    })
+    assert result["status"] == "proposed"

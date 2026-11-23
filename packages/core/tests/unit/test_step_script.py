@@ -155,8 +155,8 @@ async def test_one_script_makes_every_call_through_the_step(
     # Each call audited on its own, then the script itself.
     assert [r["details"]["tool"] for r in audit] == [LIST, MOVE, MOVE, MOVE, "run_script"]
     report = out[-1][1]
-    assert out[-1][0] == "output" and f"`{MOVE}` — ok (×3)" in report
-    assert "`run_script` — ok" in report
+    assert out[-1][0] == "output" and "Drive: move file — ok (×3)" in report
+    assert "Script — ok" in report
 
 
 @pytest.mark.asyncio
@@ -211,7 +211,7 @@ done
     assert row["details"]["calls"] == 40 and row["details"]["duration_ms"] >= 0
     # The step's report collapses repeats: one line per tool and outcome.
     [output] = [p for kind, p in outputs if kind == "output"]
-    assert f"`{LIST}` — ok (×31)" in output and f"`{LIST}` — refused: budget (×10)" in output
+    assert "Drive: list items — ok (×31)" in output and "Drive: list items — refused: budget (×10)" in output
 
 
 @pytest.mark.asyncio
@@ -402,7 +402,10 @@ async def test_each_call_reports_progress_as_it_happens(
     ])
     kinds = [(k, v) for k, v in out if k == "progress"]
     assert kinds[0] == ("progress", "Running a script…")
-    assert [v for _, v in kinds[1:]] == [f"Using {LIST}…"] + [f"Using {MOVE}…"] * 3
+    assert [v for _, v in kinds[1:]] == [
+        "Listing items · Drive (1 of 200)", "Moving file · Drive (2 of 200)",
+        "Moving file · Drive (3 of 200)", "Moving file · Drive (4 of 200)",
+    ]
 
 
 @pytest.mark.asyncio

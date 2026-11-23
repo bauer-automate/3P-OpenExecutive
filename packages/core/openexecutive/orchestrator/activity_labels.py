@@ -61,6 +61,7 @@ _LABELS: dict[str, str] = {
     "lookup_person": "Looking up people…",
     "ack_alert": "Updating a proposal…",
     "find_alerts": "Looking through the briefing board…",
+    "answer_card": "Answering a card…",
 
     # Calendar. These write, so none of them says "checking" — the label is
     # emitted before the call runs and must not promise a read.
@@ -76,7 +77,9 @@ _LABELS: dict[str, str] = {
     "set_department_head": "Updating the org chart…",
     "ask_about_person": "Checking what I know about someone…",
     "list_open_loops": "Checking what people owe…",
-    "close_open_loop": "Closing an open loop…",
+    "close_open_loop": "Closing a task…",
+    "update_open_loop": "Updating a task…",
+    "reopen_open_loop": "Reopening a task…",
     "assign_open_loop": "Assigning a task…",
     "leave_out_of_brief": "Updating your brief…",
     "list_followups": "Checking follow-ups…",
@@ -90,6 +93,7 @@ _LABELS: dict[str, str] = {
     "create_goal": "Adding a goal…",
     "record_decision_outcome": "Recording how a decision turned out…",
     "remember_fact": "Noting that for good…",
+    "keep_figure": "Keeping that figure…",
     "forget_fact": "Dropping an old fact…",
     "update_company_profile": "Updating the company profile…",
 
@@ -100,6 +104,7 @@ _LABELS: dict[str, str] = {
     # Watchlist
     "add_watchlist_entry": "Adding to the watchlist…",
     "list_watchlist": "Checking the watchlist…",
+    "list_my_activity": "Checking what I did…",
     "remove_watchlist_entry": "Updating the watchlist…",
     "tune_watchlist_entry": "Tuning the watchlist…",
 
@@ -107,6 +112,7 @@ _LABELS: dict[str, str] = {
     "run_executive_research": "Researching…",
     "create_alert": "Flagging something for review…",
     "run_python_job": "Working on the files…",
+    "save_file": "Saving the file…",
     "draft_artifact": "Writing that up…",
     "list_artifacts": "Looking through earlier work…",
     "get_artifact": "Rereading that document…",
@@ -126,18 +132,24 @@ _LABELS: dict[str, str] = {
     # Act as me: a draft in the speaker's own Gmail (never sent)
     "ghostwrite_email": "Drafting an email in your voice…",
     # Act as me: reads of the speaker's own mailbox
-    "search_my_email": "Searching your email…",
-    "read_my_email": "Reading your email…",
-    "read_my_email_attachment": "Reading an attachment…",
+    # (their wording is shared with the Executive's own mailbox's, `mail_labels`)
+    "search_my_email": f"{tool_labels.mail_labels(tool_labels.YOUR_MAIL, 'search')[1]}…",
+    "read_my_email": f"{tool_labels.mail_labels(tool_labels.YOUR_MAIL, 'read')[1]}…",
+    "read_my_email_attachment": f"{tool_labels.mail_labels(tool_labels.YOUR_MAIL, 'attachment')[1]}…",
     "save_my_email_attachment": "Saving a file from your email…",
     "remind_me": "Setting a reminder…",
     "propose_actions": "Leaving you a card to approve…",
+    "find_in_app": "Looking that up in the app…",
+    "do_in_app": "Making that change…",
+    "open_in_app": "Finding the right screen…",
     "my_email_awaiting_reply": "Checking what's waiting on a reply…",
     "my_email_read_before": "Finding the email you mean…",
     "my_calendar": "Checking your calendar…",
 
     # Always in the loop: the speaker's own notes
     "recall_history": "Checking your notes…",
+    # Earlier chats: the speaker's own
+    "search_past_chats": "Checking our earlier chats…",
 
     # MCP gateway. `call_tool` is dynamic and handled in `_label_for`.
     "search_tools": "Looking for the right tool…",
@@ -189,7 +201,10 @@ _PRIORITY: tuple[frozenset[str], ...] = (
         "remember_fact",
         "forget_fact",
         "update_company_profile",
+        "keep_figure",
         "close_open_loop",
+        "reopen_open_loop",
+        "update_open_loop",
         "assign_open_loop",
         "leave_out_of_brief",
         "cancel_followup",
@@ -199,6 +214,7 @@ _PRIORITY: tuple[frozenset[str], ...] = (
     frozenset({
         "create_alert",
         "ack_alert",
+        "answer_card",
         "draft_artifact",
         "add_watchlist_entry",
         "remove_watchlist_entry",
@@ -242,11 +258,22 @@ def _label_for(tool_use: dict[str, Any]) -> tuple[str, str]:
         return FALLBACK_LABEL, ""
     if name == "call_tool":
         return _mcp_label(tool_use.get("input"))
-    return _LABELS.get(name, FALLBACK_LABEL), name
+    return _LABELS.get(name) or _extension_label(name, tool_use.get("input")) or FALLBACK_LABEL, name
+
+
+def _extension_label(name: Any, arguments: Any = None) -> str | None:
+    """The activity line of an installed extension's tool
+    (orchestrator/extensions.py) for this call, if it has one."""
+    if not isinstance(name, str) or name in _LABELS:
+        return None
+    from openexecutive.orchestrator import extensions
+
+    return extensions.activity_label(name, arguments)
 
 
 def _is_nameable(tool_use: dict[str, Any]) -> bool:
-    return tool_use.get("name") in _LABELS or tool_use.get("name") == "call_tool"
+    name = tool_use.get("name")
+    return name in _LABELS or name == "call_tool" or _extension_label(name) is not None
 
 
 def _pick(tool_uses: list[dict[str, Any]]) -> dict[str, Any]:

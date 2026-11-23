@@ -138,6 +138,26 @@ class ReviewSettings:
             return cls()
 
 
+def _off_limits(alert: Alert) -> bool:
+    """Whether the review leaves this card alone, as a candidate, as
+    evidence for another and as a merge target: a source its own code keeps
+    (``TTL_EXEMPT_SOURCES``), or a card that is one person's alone, the
+    principal's (``is_private_alert``) or its own person's
+    (``PERSONAL_SOURCES``, an email watch's sender and subject), or the ask
+    a teammate raised from their own chat (``TEAM_RAISED_SOURCE``, shown
+    only to them and whom it is for). The review routes, nudges and writes
+    audit rows for the team, so it never touches those: their person
+    handles them."""
+    from openexecutive.alerts.models import PERSONAL_SOURCES, TEAM_RAISED_SOURCE, is_private_alert
+
+    return (
+        alert.source in TTL_EXEMPT_SOURCES
+        or alert.source in PERSONAL_SOURCES
+        or alert.source == TEAM_RAISED_SOURCE
+        or is_private_alert(alert)
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 1. Candidates
 # --------------------------------------------------------------------------- #
@@ -152,18 +172,12 @@ def select_candidates(
 ) -> list[Alert]:
     """Live alerts worth a second look: old enough, not recently reviewed,
     not an exempt source. Oldest first, capped at ``max_per_scan``."""
-    from openexecutive.alerts.models import is_private_alert
-
     live = lifecycle.list_live_alerts(limit=500, db_path=db_path, now=now)
     min_age = timedelta(hours=max(0, settings.min_age_hours))
     interval = timedelta(hours=max(0, settings.interval_hours))
     out: list[Alert] = []
     for a in live:
-        if a.source in TTL_EXEMPT_SOURCES:
-            continue
-        # Private to the principal: the review routes, nudges and drafts for
-        # the team, so it never touches one — the principal handles it.
-        if is_private_alert(a):
+        if _off_limits(a):
             continue
         created = parse_aware(a.created_at)
         if created is None or now - created < min_age:
@@ -264,7 +278,9 @@ def _authority_level(slug: str | None) -> str:
         from openexecutive.departments import registry as dept_registry
 
         state = dept_registry.get_state(slug)
-        return str(state.config.authority_level.value) if state else "unknown"
+        from openexecutive.departments.authority import department_level
+
+        return str(department_level(slug).value) if state else "unknown"
     except Exception:
         return "unknown"
 
@@ -367,15 +383,13 @@ def gather_evidence(
         except Exception:
             logger.debug("alert_review: watch evidence failed", exc_info=True)
 
-    from openexecutive.alerts.models import is_private_alert
-
     pool = all_live if all_live is not None else lifecycle.list_live_alerts(limit=200, db_path=db_path, now=now)
     tags = set(alert.topic_tags or [])
     for other in pool:
         if other.id == alert.id:
             continue
-        # A private alert is never evidence for one the team may act on.
-        if is_private_alert(other):
+        # One person's card is never evidence for one the team may act on.
+        if _off_limits(other):
             continue
         other_created = parse_aware(other.created_at)
         if other_created is None or other_created <= created:
@@ -392,7 +406,7 @@ def gather_evidence(
     try:
         from openexecutive.api.routes import today as today_route
 
-        items = today_route._build_activity(30, since=created).items
+        items = today_route._build_activity(30, since=created, everyone=True).items
         # Activity is company-wide; only items that plainly mention this
         # alert's subject are citable evidence for closing it.
         subject_terms = _subject_terms(f"{alert.headline} {alert.suggested_action}")
@@ -534,6 +548,9 @@ _DM_MAX_CHARS = 1200
 # `_dm`'s detail for a DM held by the recipient's notification settings
 # (people.held_messages): it goes later, so it is not yet a delivered nudge.
 _HELD_DETAIL = "held for their quiet hours or brief"
+# `_dm`'s detail when the card is already on their list and they have no
+# chat app: the card is the message.
+ON_THEIR_LIST = "on their list"
 
 
 def _dm_text(headline: str, text: str) -> str:
@@ -545,7 +562,7 @@ def _dm_text(headline: str, text: str) -> str:
 
 
 async def _dm(
-    person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+    person_id: int, text: str, *, headline: str = "", alert_id: int | None = None, theirs: bool = False,
 ) -> tuple[bool, str]:
     """DM a rostered person through the real handler (server-side channel
     resolution + the outbound anti-spam guard). Returns (ok, detail).
@@ -553,30 +570,52 @@ async def _dm(
     Tagged as alert-review outreach about ``alert_id``, so acknowledging or
     dismissing that alert later resolves whether the DM landed. A caller
     about a critical alert wraps it in ``_urgent_if`` so it gets past the
-    person's quiet hours and digest (``people.notifications``)."""
+    person's quiet hours and digest (``people.notifications``).
+
+    ``theirs``: the card is already on their list (Home and the phone show
+    it), so the message only goes to their chat app. Without one there is
+    nothing to send: a second card saying "[Alert review] Re: <the card>"
+    only repeated it, once every pass."""
     import json
 
     from openexecutive.attunement.outcomes import SOURCE_ALERT_REVIEW, tag_proactive
-    from openexecutive.orchestrator.schedule_tools import handle_message_person
+    from openexecutive.orchestrator.schedule_tools import NO_REACHABLE_CHANNEL, message_person
 
     try:
         with tag_proactive(SOURCE_ALERT_REVIEW, f"alert:{alert_id}" if alert_id else ""):
-            raw = await handle_message_person({
-                "person_id": person_id, "text": _dm_text(headline, text),
-            })
+            raw = await message_person(
+                {"person_id": person_id, "text": _dm_text(headline, text)}, alert_fallback=not theirs,
+            )
         parsed = json.loads(raw)
     except Exception as exc:
         return False, f"dm failed: {exc}"
+    if theirs and isinstance(parsed, dict) and NO_REACHABLE_CHANNEL in str(parsed.get("error") or "") and _on_team(person_id):
+        # They have no chat app: the card on their list is the message. A
+        # send that failed stays a failure, and a contact, who never signs
+        # in, has no list.
+        return True, ON_THEIR_LIST
     # Only a real delivery counts. "alerted" means the handler fell back to
     # creating a NEW alert because the person has no channel — for the
     # review that would just mint another candidate to route next pass.
-    if isinstance(parsed, dict) and "error" not in parsed and parsed.get("status") == "sent":
-        return True, "sent"
+    if isinstance(parsed, dict) and "error" not in parsed and parsed.get("status") in ("sent", "delivered"):
+        return True, str(parsed.get("status"))
     # Held by the person's own notification settings: it is saved and goes
     # when they asked to hear, so the move happened.
     if isinstance(parsed, dict) and parsed.get("status") == "held":
         return True, _HELD_DETAIL
     return False, str(parsed.get("error") if isinstance(parsed, dict) else raw)[:200]
+
+
+def _on_team(person_id: int) -> bool:
+    """Whether ``person_id`` is someone on the team, who signs in and has
+    a list of cards. False on a read error."""
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(person_id)
+    except Exception:
+        return False
+    return person is not None and getattr(person, "kind", "team") == "team"
 
 
 def _urgent_if(urgent: bool) -> contextlib.AbstractContextManager[None]:
@@ -774,7 +813,7 @@ def _apply_merge(ctx: _MoveContext) -> bool:
     survivor = alert_store.get_alert(v.superseded_by_alert_id, db_path=ctx.db_path)
     if (
         survivor is None or not lifecycle.is_live(survivor, ctx.now)
-        or survivor.source in TTL_EXEMPT_SOURCES
+        or _off_limits(survivor)
         or not alert_store.mark_superseded(ctx.alert_id, survivor.id or -1, db_path=ctx.db_path)
     ):
         return False
@@ -836,7 +875,7 @@ async def _apply_route(ctx: _MoveContext) -> None:
         with _urgent_if(alert.severity == "urgent"):
             ok, detail = await _dm(
                 target, v.message or f"Can you own this? {alert.headline}", headline=alert.headline,
-                alert_id=ctx.alert_id,
+                alert_id=ctx.alert_id, theirs=True,
             )
     ctx.summary.moves_used += 1
     if ok:
@@ -869,13 +908,20 @@ async def _apply_nudge(ctx: _MoveContext) -> None:
     with _urgent_if(alert.severity == "urgent"):
         ok, detail = await _dm(
             target, v.message or f"Checking in on: {alert.headline}", headline=alert.headline,
-            alert_id=ctx.alert_id,
+            alert_id=ctx.alert_id, theirs=alert.routed_to_person_id == target,
         )
-    ctx.summary.moves_used += 1
+    if detail != ON_THEIR_LIST:  # nothing went, so no move was spent
+        ctx.summary.moves_used += 1
     if ok and detail == _HELD_DETAIL:
         # Not delivered yet: no nudge counted toward the cap.
         _audit(EVENT_REVIEWED, f"Nudge about '{alert.headline[:80]}' held for the recipient",
                {**ctx.base_details, "target_person_id": target, "held": True})
+        return
+    if ok and detail == ON_THEIR_LIST:
+        # Nothing was sent: the card on their list is all they have. Not a
+        # nudge, so it never counts as one.
+        _audit(EVENT_REVIEWED, f"'{alert.headline[:80]}' is already on their list",
+               {**ctx.base_details, "target_person_id": target, "on_their_list": True})
         return
     if ok:
         ctx.summary.nudged += 1
@@ -904,6 +950,7 @@ async def _apply_escalate(ctx: _MoveContext) -> None:
             v.message or f"Needs you today: {alert.headline}\n{v.why_now or ''}".strip(),
             headline=alert.headline,
             alert_id=ctx.alert_id,
+            theirs=alert.routed_to_person_id in (None, ctx.principal_id),
         )
     ctx.summary.moves_used += 1
     if not ok:
@@ -918,8 +965,11 @@ async def _apply_escalate(ctx: _MoveContext) -> None:
     ctx.due_at = ctx.due_at or (ctx.now + timedelta(hours=_DEFAULT_ESCALATION_HOURS)).isoformat()
     ctx.summary.escalated += 1
     ctx.move_taken = "escalate"
-    _audit(EVENT_ESCALATED, f"Escalated '{alert.headline[:80]}' to {new_sev} ({detail})",
-           {**ctx.base_details, "new_severity": new_sev, "due_at": ctx.due_at, "dm_ok": ok})
+    # With no chat app the card on their list is raised; no message went.
+    sent = detail != ON_THEIR_LIST
+    _audit(EVENT_ESCALATED,
+           f"Escalated '{alert.headline[:80]}' to {new_sev} ({detail if sent else 'raised on their list, no message sent'})",
+           {**ctx.base_details, "new_severity": new_sev, "due_at": ctx.due_at, "dm_ok": sent})
 
 
 async def _apply_draft(ctx: _MoveContext) -> None:
@@ -970,8 +1020,11 @@ def _apply_suggest_workflow(ctx: _MoveContext) -> None:
         return
     ctx.summary.suggested += 1
     ctx.move_taken = "suggest_workflow"
-    _audit(EVENT_SUGGESTED, f"Suggested workflow {v.workflow_name} for '{alert.headline[:80]}'",
-           {**ctx.base_details, "workflow_name": v.workflow_name})
+    from openexecutive.workflows import workflow_label
+
+    title = workflow_label(v.workflow_name)
+    _audit(EVENT_SUGGESTED, f"Suggested {title} for '{alert.headline[:80]}'",
+           {**ctx.base_details, "workflow_name": v.workflow_name, "workflow_title": title})
 
 
 async def apply_verdict(
@@ -992,7 +1045,7 @@ async def apply_verdict(
     Each move is a small handler above; this is the dispatcher.
     """
     assert alert.id is not None
-    if alert.source in TTL_EXEMPT_SOURCES:
+    if _off_limits(alert):
         return ""  # never touched (candidates already exclude these; belt and braces)
 
     roster = evidence.get("roster") or []
@@ -1071,24 +1124,13 @@ async def apply_verdict(
 
 
 def _seed_outbound_session() -> Any:
-    """Seed ``current_session`` from the roster so the outbound guard accepts
-    DMs to real people (same invariant as executive_reflection)."""
+    """Bind a fresh ``current_session`` for the pass, so its tool calls read
+    one session of their own."""
     try:
         from openexecutive.orchestrator.schedule_tools import current_session
         from openexecutive.orchestrator.session import Session
-        from openexecutive.people.store import list_people
 
-        seen: set[tuple[str, str]] = set()
-        for person in list_people():
-            if person.slack_user_id:
-                seen.add(("slack_dm", person.slack_user_id))
-            if person.discord_user_id:
-                seen.add(("discord_dm", person.discord_user_id))
-            if person.telegram_chat_id:
-                seen.add(("telegram", person.telegram_chat_id))
-            if person.email:
-                seen.add(("email", person.email))
-        return current_session, current_session.set(Session(seen_channel_refs=seen))
+        return current_session, current_session.set(Session())
     except Exception:
         logger.debug("alert_review: session seed failed", exc_info=True)
         return None

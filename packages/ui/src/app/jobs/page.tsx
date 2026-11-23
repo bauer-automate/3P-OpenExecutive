@@ -12,15 +12,20 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   DynamicWorkflowDef,
+  type RepeatOffer,
   WorkflowMeta,
   WorkflowRunSummary,
   WorkflowSection,
   deleteCustomWorkflow,
   deleteWorkflowRun,
   listCustomWorkflows,
+  listRepeatOffers,
   listWorkflowRuns,
   listWorkflows,
+  stopWorkflowRun,
 } from "@/lib/api";
+import RepeatOfferCard from "@/components/jobs/RepeatOfferCard";
+import ScheduleLink from "@/components/schedule/ScheduleLink";
 import StartHere from "@/components/jobs/StartHere";
 import { buttonClass } from "@/components/ui/Button";
 import OverflowMenu, { type OverflowItem } from "@/components/ui/OverflowMenu";
@@ -28,13 +33,16 @@ import SidePanel from "@/components/ui/SidePanel";
 import { formatRelativeTime } from "@/lib/relativeTime";
 import {
   RunBucket,
+  runIsStoppable,
   runStatusBadgeColor,
   runStatusBucket,
   runStatusLabel,
 } from "@/lib/runStatus";
 import { cadenceLabel, cardAction, lastRunAt } from "@/lib/workflowCards";
 import { starterPicksFor } from "@/lib/workflowStarters";
+import { noteRunOnArrival, opensHere, stepCount } from "@/lib/workflowRun";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
+import { PageSpinner } from "@/components/ui/Spinner";
 
 const SECTION_ORDER: WorkflowSection[] = [
   "Board",
@@ -150,6 +158,15 @@ function JobsPageInner() {
   const [runsQuery, setRunsQuery] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // Offers to do something they keep asking for on a schedule; the newest shows.
+  const [offers, setOffers] = useState<RepeatOffer[]>([]);
+  useEffect(() => {
+    const ctrl = new AbortController();
+    listRepeatOffers(ctrl.signal).then((o) => {
+      if (!ctrl.signal.aborted) setOffers(o);
+    });
+    return () => ctrl.abort();
+  }, []);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -224,6 +241,18 @@ function JobsPageInner() {
     [refresh]
   );
 
+  const handleStop = useCallback(
+    async (runId: string) => {
+      try {
+        await stopWorkflowRun(runId);
+      } catch {
+        // already finished: the refresh shows where it ended up
+      }
+      refresh();
+    },
+    [refresh]
+  );
+
   const handleDeleteCustom = useCallback(
     async (name: string) => {
       if (!confirm(`Delete the custom workflow “${name}”? This cannot be undone.`))
@@ -237,6 +266,11 @@ function JobsPageInner() {
   const readyMade = workflows.filter((w) => !w.is_custom);
   const readyMadeCount = readyMade.filter((w) => !w.background).length;
   const offWorkflows = customDefs.filter((d) => !d.is_active);
+  // Set by the review card's "Turn on workflow", which lands back here.
+  const turnedOnName = searchParams.get("turned_on");
+  const turnedOnTitle = turnedOnName
+    ? customDefs.find((d) => d.name === turnedOnName && d.is_active)?.title
+    : undefined;
   const ownWorkflows = workflows.filter((w) => w.is_custom && !w.background);
   const openRuns = runCounts.active + runCounts.awaiting;
 
@@ -246,6 +280,14 @@ function JobsPageInner() {
         <StartHere
           readyMadeCount={readyMadeCount}
           onBrowseReadyMade={() => setParam({ browse: "1" })}
+          top={
+            offers[0] && (
+              <RepeatOfferCard
+                offer={offers[0]}
+                onDone={(id) => setOffers((os) => os.filter((o) => o.id !== id))}
+              />
+            )
+          }
         />
       )}
 
@@ -253,6 +295,7 @@ function JobsPageInner() {
         <h2 className="text-xl font-bold tracking-tight text-fg">
           {tab === "runs" ? "Runs" : "Your workflows"}
         </h2>
+        {tab === "catalog" && <ScheduleLink kind="workflow" className="mr-auto" />}
         <ViewSwitch
           tab={tab}
           runsLabel={openRuns > 0 ? `Runs (${openRuns} open)` : `Runs (${runs.length})`}
@@ -261,10 +304,19 @@ function JobsPageInner() {
       </div>
 
       {loading && (
-        <div className="text-[15px] text-fg-muted">Loading workflows…</div>
+        <PageSpinner label="Loading workflows" />
       )}
       {error && (
         <div className="mb-4 text-[15px] text-red-400">Error: {error}</div>
+      )}
+
+      {!loading && tab === "catalog" && turnedOnTitle && (
+        <p
+          role="status"
+          className="mb-3 inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 py-1 text-sm font-medium text-emerald-500"
+        >
+          <span aria-hidden="true">✓</span> {turnedOnTitle} is on
+        </p>
       )}
 
       {!loading && tab === "catalog" && (
@@ -294,6 +346,7 @@ function JobsPageInner() {
           expanded={expanded}
           onExpand={(key) => setExpanded((c) => ({ ...c, [key]: true }))}
           onDelete={handleDelete}
+          onStop={handleStop}
         />
       )}
 
@@ -401,6 +454,8 @@ function YourWorkflows({
   onBrowse: () => void;
 }) {
   const cadenceByName = new Map(customDefs.map((d) => [d.name, d.cadence] as const));
+  // Its creator or the principal deletes a workflow; the server says who.
+  const canDelete = new Map(customDefs.map((d) => [d.name, d.can_delete] as const));
 
   if (workflows.length === 0 && offWorkflows.length === 0) {
     return (
@@ -441,7 +496,9 @@ function YourWorkflows({
                 label={`More for ${d.title}`}
                 items={[
                   { label: "Edit", href: `/jobs/new?edit=${encodeURIComponent(d.name)}` },
-                  { label: "Delete", danger: true, onSelect: () => onDeleteCustom(d.name) },
+                  ...(d.can_delete === false
+                    ? []
+                    : [{ label: "Delete", danger: true, onSelect: () => onDeleteCustom(d.name) }]),
                 ]}
               />
             </div>
@@ -454,13 +511,15 @@ function YourWorkflows({
         const last = lastRunAt(w.name, runs);
         const cadence = cadenceLabel(cadenceByName.get(w.name));
         const meta = [
-          cadence || `${w.steps.length} steps`,
+          cadence || stepCount(w.steps),
           last ? `last run ${formatRelativeTime(last)}` : "not run yet",
         ].join(" · ");
         const more: OverflowItem[] = [
           ...(action.kind === "signoff" ? [{ label: "Run again", href }] : []),
           { label: "Edit", href: `/jobs/new?edit=${encodeURIComponent(w.name)}` },
-          { label: "Delete", danger: true, onSelect: () => onDeleteCustom(w.name) },
+          ...(canDelete.get(w.name) === false
+            ? []
+            : [{ label: "Delete", danger: true, onSelect: () => onDeleteCustom(w.name) }]),
         ];
         return (
           <div key={w.name} className={cardCls}>
@@ -488,7 +547,11 @@ function YourWorkflows({
                   Review
                 </Link>
               ) : (
-                <Link href={href} className={buttonClass("primary", "md")}>
+                <Link
+                  href={href}
+                  onClick={(e) => opensHere(e) && noteRunOnArrival(w.name)}
+                  className={buttonClass("primary", "md")}
+                >
                   Run
                 </Link>
               )}
@@ -518,7 +581,7 @@ function CatalogCard({ workflow: w, useFor }: { workflow: WorkflowMeta; useFor?:
             Quick
           </span>
         ) : null}
-        {w.quick ? "One question, one document" : `${w.steps.length} steps`} · ~
+        {w.quick ? "One question, one document" : stepCount(w.steps)} · ~
         {w.estimated_minutes} min
       </span>
     </Link>
@@ -672,6 +735,7 @@ function RunsView({
   expanded,
   onExpand,
   onDelete,
+  onStop,
 }: {
   runs: WorkflowRunSummary[];
   counts: Record<RunStatus, number>;
@@ -685,6 +749,7 @@ function RunsView({
   expanded: Record<string, boolean>;
   onExpand: (key: string) => void;
   onDelete: (runId: string) => void;
+  onStop: (runId: string) => void;
 }) {
   const visible = runs.filter(
     (r) =>
@@ -796,6 +861,9 @@ function RunsView({
                         <OverflowMenu
                           label={`More for ${r.title}`}
                           items={[
+                            ...(runIsStoppable(r.status)
+                              ? [{ label: "Stop run", onSelect: () => onStop(r.run_id) }]
+                              : []),
                             { label: "Delete run", danger: true, onSelect: () => onDelete(r.run_id) },
                           ]}
                         />

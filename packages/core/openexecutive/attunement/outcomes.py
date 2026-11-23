@@ -39,6 +39,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from openexecutive.utils import db
+
 logger = logging.getLogger(__name__)
 
 # Sources, as stored. Kept small and stable: they key the nudge engine's
@@ -52,17 +54,19 @@ SOURCE_REFLECTION = "reflection"
 SOURCE_RESEARCH = "research"
 SOURCE_ALERT_REVIEW = "alert_review"
 SOURCE_TASK_ASSIGNED = "task_assigned"
+SOURCE_RIGHT_NOW = "right_now"
 
 SOURCE_LABELS: dict[str, str] = {
     SOURCE_NUDGE_STALLED: "approval nudges",
     SOURCE_NUDGE_COMMITMENT: "commitment chases",
     SOURCE_NUDGE_INITIATIVE: "initiative check-ins",
-    SOURCE_OPEN_LOOP: "open-loop chases",
+    SOURCE_OPEN_LOOP: "task chases",
     SOURCE_FOLLOWUP: "scheduled follow-ups",
     SOURCE_REFLECTION: "standup DMs",
     SOURCE_RESEARCH: "research DMs",
     SOURCE_ALERT_REVIEW: "alert-review DMs",
     SOURCE_TASK_ASSIGNED: "task notices",
+    SOURCE_RIGHT_NOW: "Right now pings",
 }
 
 OUTCOME_REPLIED = "replied"
@@ -107,10 +111,7 @@ def current_tag() -> tuple[str, str] | None:
     return _proactive.get()
 
 
-def _db(db_path: Path | None) -> Path:
-    from openexecutive.memory.episodic import _resolve_db_path
-
-    return _resolve_db_path(db_path)
+_db = db.company_path
 
 
 def record_send(

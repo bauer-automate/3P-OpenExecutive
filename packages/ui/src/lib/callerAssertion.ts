@@ -12,9 +12,11 @@ import { createPrivateKey, randomBytes, sign, type KeyObject } from "node:crypto
 export const CALLER_ASSERTION_HEADER = "x-caller-assertion";
 export const ASSERTION_VERSION = "v1";
 export const ASSERTION_AUDIENCE = "openexecutive-api";
-// Short, so a captured assertion is soon worthless, and well under the API's
+// Short, so a captured assertion is soon worthless, yet long enough to outlast
+// a restart: a request that arrives while the instance restarts waits for it,
+// and must still be good when it gets there. Well under the API's
 // MAX_LIFETIME_S, so a slow clock on either side still leaves room.
-export const ASSERTION_LIFETIME_S = 30;
+export const ASSERTION_LIFETIME_S = 120;
 
 const KID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const SEED_RE = /^[A-Za-z0-9_-]{43}=?$/;
@@ -31,6 +33,9 @@ export type CallerClaims = {
   method: string;
   // The path and query exactly as the proxy sends them upstream.
   target: string;
+  // "host" for a call a host origin's page made (lib/hostOrigins.ts); left
+  // out of the claims otherwise, so such an assertion is as it always was.
+  surface?: "host";
 };
 
 /**
@@ -70,6 +75,9 @@ export function mintCallerAssertion(
   if (claims.kind === "operator" && claims.email.trim()) {
     throw new Error("the operator names no one");
   }
+  if (claims.surface !== undefined && claims.surface !== "host") {
+    throw new Error("the surface is host or none");
+  }
   const iat = Math.floor(nowMs / 1000);
   // Keys in sorted order and no spaces: byte for byte what
   // scripts/mint-caller-assertion.py signs, so the test vectors match.
@@ -83,6 +91,7 @@ export function mintCallerAssertion(
     m: claims.method.toUpperCase(),
     p: claims.target,
     sub,
+    ...(claims.surface ? { surface: claims.surface } : {}),
   };
   const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
   const signingInput = `${ASSERTION_VERSION}.${body}`;

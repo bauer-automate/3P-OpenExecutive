@@ -132,6 +132,25 @@ def _now_and_reader(now: datetime) -> tuple[str, Reader | None]:
     return label, principal_reader()
 
 
+def _card_reader() -> tuple[int | None, bool]:
+    """Who the cards a brief names are named for, as ``name_cards_for``'s
+    ``(person_id, principal)``: the principal on the scheduler's delivery,
+    else whoever started the run (no one, outside a chat). A teammate's run names no card that only
+    the principal may see (the principal's own drafted documents)."""
+    if PRINCIPAL_DELIVERY.get():
+        return None, True
+    try:
+        from openexecutive.orchestrator.schedule_tools import current_session
+
+        session = current_session.get()
+    except Exception:
+        logger.exception("morning_brief: session lookup failed — cards named for no one")
+        return None, False
+    if session is None:
+        return None, False  # not known to be the principal's: name no card's headline
+    return getattr(session, "caller_person_id", None), False
+
+
 class MorningBriefWorkflow(Workflow):
     name = "morning_brief"
     title = "Morning Brief"
@@ -232,7 +251,7 @@ class MorningBriefWorkflow(Workflow):
             # active projects, each with a free slot when a calendar can be
             # read (one short call). Never raises; without a calendar there
             # are no slots and no calendar block.
-            top_three, calendar = await build_top_three(today_data["due_soon"])
+            top_three, calendar = await build_top_three(today_data["due_soon"], include_own=private_ok)
             if top_three:
                 today_data["top_three"] = top_three
             if calendar is not None:
@@ -256,19 +275,21 @@ class MorningBriefWorkflow(Workflow):
         # The reflection's notes are written from what everyone may see (it
         # reads the board without private rows), so any run may carry them.
         reflection_flags = brief_state.reflection_flags_since(since)
+        # A card number in the notes ("card 220") became one in the brief,
+        # which tells the reader nothing: the brief model reads the card's
+        # headline instead (alerts.card_refs).
+        if reflection_flags:
+            from openexecutive.alerts.card_refs import name_cards_for
+
+            flag_reader, for_principal = _card_reader()
+            reflection_flags = await asyncio.to_thread(
+                name_cards_for, reflection_flags, flag_reader, principal=for_principal, fmt="plain",
+            )
         # Corrections teammates made since the last brief: the principal's
-        # FYI (memory.facts). What waits for their approval is theirs alone
-        # (GET /memories/facts hides it from other teammates), so a brief any
-        # teammate may run lists only what is in force.
+        # FYI (memory.facts). All of them are in force.
         from openexecutive.memory.facts import render_teammate_changes
 
-        teammate_changes = await asyncio.to_thread(
-            render_teammate_changes, since, include_proposed=private_ok,
-        )
-        in_force_changes = (
-            await asyncio.to_thread(render_teammate_changes, since, include_proposed=False)
-            if private_ok else teammate_changes
-        )
+        teammate_changes = await asyncio.to_thread(render_teammate_changes, since)
         # Always in the loop: what the owner's own notes say is due, only on
         # the scheduler's delivery to them alone (never a chat run, whose
         # tool result lands in the turn's shared audit row and peer memory)
@@ -296,7 +317,6 @@ class MorningBriefWorkflow(Workflow):
         private_used = private_ok and (
             bool(owner_notes.text)
             or first_week.private
-            or teammate_changes != in_force_changes
             or live.calendar is not None
             or any(
                 str(t).lower() == PRIVATE_ALERT_TAG
@@ -310,6 +330,8 @@ class MorningBriefWorkflow(Workflow):
         try:
             activity_response = today_route._build_activity(
                 20, since=since, exclude_workflows=today_route.RHYTHM_WORKFLOWS,
+                # The principal's own items only where they alone read it.
+                viewer=today_route.principal_id() if _private_ok() else None,
             )
             activity = [item.model_dump() for item in activity_response.items]
         except Exception:
@@ -387,7 +409,6 @@ class MorningBriefWorkflow(Workflow):
 
         from openexecutive.briefing.grounding import ground_brief
         from openexecutive.briefing.narrative import (
-            QUIET_PRINCIPAL,
             STANDALONE_BRIEF_SOLO_SYSTEM,
             STANDALONE_BRIEF_SYSTEM,
             render_briefing_context,
@@ -419,16 +440,13 @@ class MorningBriefWorkflow(Workflow):
                 live=live, live_window="since the last brief",
                 reflection_flags=reflection_flags, rendered_context=rendered,
                 reader=reader,
+                # Their lessons only in a brief that is theirs alone.
+                owner_lessons=private_ok,
             )
         except Exception as exc:
             logger.exception("morning_brief: synthesis failed")
             yield WorkflowEvent(type="error", message=f"Synthesis failed: {exc}")
             return
-
-        if not artifact_text:
-            # The shared synthesizer's own quiet-day line, so the empty
-            # fallback reads identically to a model-produced quiet brief.
-            artifact_text = QUIET_PRINCIPAL
 
         # Nobody reads this before it ships: hold back any line naming a
         # person or figure the context doesn't hold, and cite the figures.
@@ -438,6 +456,18 @@ class MorningBriefWorkflow(Workflow):
             surface="morning brief",
         )
         held = len(grounding.held) if grounding and grounding.mode == "enforce" else 0
+        # Any card still named by its number is named by its headline, linked
+        # to it on Home (delivery rewrites the link for Slack).
+        from openexecutive.alerts.card_refs import name_cards_for
+
+        card_reader, for_principal = _card_reader()
+        artifact_text = await asyncio.to_thread(
+            name_cards_for, artifact_text, card_reader,
+            principal=for_principal, include_private=private_used,
+        )
+        from openexecutive.alerts.card_refs import keep_app_links
+
+        artifact_text = keep_app_links(artifact_text)
 
         yield WorkflowEvent(
             type="step_done",

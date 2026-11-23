@@ -26,14 +26,20 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 # (the tests compare all three).
 VERSION = "v1"
 AUDIENCE = "openexecutive-api"
-# Short, so a captured assertion is soon worthless, and well under the API's
+# Short, so a captured assertion is soon worthless, yet long enough to outlast
+# a restart: a request that arrives while the instance restarts waits for it,
+# and must still be good when it gets there. Well under the API's
 # MAX_LIFETIME_S, so a slow clock on either side still leaves room.
-LIFETIME_S = 30
+LIFETIME_S = 120
 
 KID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 _SEED_RE = re.compile(r"[A-Za-z0-9_-]{43}=?")
 
 SignerKind = Literal["user", "operator"]
+# Where the request came from, when it isn't the web app's own pages: "host",
+# a host origin's page (OE_HOST_ORIGINS, docs/auth.md). Signed so the API can
+# hold such a request to what a host may do.
+SURFACES = ("host",)
 
 
 def _b64url(data: bytes) -> str:
@@ -79,13 +85,18 @@ def mint_assertion(
     target: str,
     now_ms: int | None = None,
     jti: str | None = None,
+    surface: str = "",
 ) -> str:
     """One ``x-caller-assertion`` value, good for one request: ``method``,
     ``target`` (the path with its query, exactly as the request sends it), for
     ``LIFETIME_S``, once. ``kind`` is ``user`` (named by ``email``) or
-    ``operator`` (the owner at the controls, naming no one)."""
+    ``operator`` (the owner at the controls, naming no one). ``surface`` is
+    ``host`` for a call a host origin's page made, else empty (and left out of
+    the claims, so an assertion without one is byte for byte as before)."""
     if kind not in ("user", "operator"):
         raise ValueError("kind is user or operator")
+    if surface and surface not in SURFACES:
+        raise ValueError("surface is host or empty")
     sub = email.strip().lower() if kind == "user" else ""
     if kind == "user" and "@" not in sub:
         raise ValueError("a user is named by their email")
@@ -104,6 +115,8 @@ def mint_assertion(
         "p": target,
         "sub": sub,
     }
+    if surface:
+        claims["surface"] = surface
     # Sorted keys and no spaces: byte for byte what the web app signs.
     body = json.dumps(claims, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     signing_input = f"{VERSION}.{_b64url(body.encode('utf-8'))}"

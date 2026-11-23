@@ -14,6 +14,7 @@ the hardcoded ``OPENROUTER_MODELS`` snapshot when nothing has been loaded.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import replace
 from typing import Any, Literal, TypedDict
@@ -21,12 +22,21 @@ from typing import Any, Literal, TypedDict
 from fastapi import HTTPException
 
 from openexecutive.config import get_settings
+from openexecutive.observability import wrap_provider
 from openexecutive.providers import openrouter_catalog
 from openexecutive.providers.anthropic_provider import AnthropicProvider
-from openexecutive.providers.feature_gate import FeatureSpec
+from openexecutive.providers.feature_gate import (
+    NON_CLAUDE_MAX_OUTPUT_TOKENS,
+    FeatureSpec,
+    ReadingLimits,
+    context_tokens,
+    reading_limits,
+)
 from openexecutive.providers.openai_compatible import OpenAICompatibleProvider
 from openexecutive.providers.openrouter_provider import OpenRouterProvider
 from openexecutive.providers.provider import LLMProvider
+
+logger = logging.getLogger(__name__)
 
 # Anthropic-direct slugs — used as canonical model names everywhere in
 # the codebase (config defaults, agent class defaults, override DB).
@@ -148,6 +158,7 @@ _DEFAULT_NON_CLAUDE_SPEC = FeatureSpec(
     supports_thinking=False,
     supports_web_search=True,
     supports_tool_use=True,
+    max_output_tokens=NON_CLAUDE_MAX_OUTPUT_TOKENS,
 )
 
 # Non-Claude model whose live catalog entry advertises ``reasoning``
@@ -159,6 +170,7 @@ _NON_CLAUDE_REASONING_SPEC = FeatureSpec(
     supports_thinking=True,
     supports_web_search=True,
     supports_tool_use=True,
+    max_output_tokens=NON_CLAUDE_MAX_OUTPUT_TOKENS,
 )
 
 # Self-hosted OpenAI-compatible backend: tools only. There is no search
@@ -403,6 +415,7 @@ def _local() -> OpenAICompatibleProvider:
         local_spec = replace(
             _LOCAL_FEATURE_SPEC,
             supports_pdf_input=bool(getattr(settings, "local_pdf_input", False)),
+            max_output_tokens=getattr(settings, "local_max_output_tokens", None) or None,
         )
         spec_lookup: dict[str, FeatureSpec] = {
             m: local_spec for m in _local_models(settings)
@@ -415,6 +428,7 @@ def _local() -> OpenAICompatibleProvider:
             include_usage_accounting=getattr(
                 settings, "local_include_usage_accounting", False
             ),
+            stream_usage=bool(getattr(settings, "local_stream_usage", True)),
             reasoning_effort=getattr(settings, "local_reasoning_effort", None),
         )
     return _local_provider
@@ -447,6 +461,21 @@ def _openrouter() -> OpenRouterProvider:
     return _openrouter_provider
 
 
+def sees_images(model: str) -> bool:
+    """Whether ``model`` can be shown a picture (a browser screenshot,
+    ``browser.tools``). Claude and OpenAI's own models can; another model
+    only when the OpenRouter catalog lists image input for it, and a local
+    one never. Unknown is no."""
+    from openexecutive.providers import openrouter_catalog
+
+    if model in _local_models(get_settings()):
+        return False
+    known = openrouter_catalog.accepts_images(model)
+    if known is not None:
+        return known
+    return _is_claude(model) or model.startswith(("anthropic/", "openai/"))
+
+
 def get_provider(model: str) -> LLMProvider:
     """Return the provider that should serve calls for ``model``.
 
@@ -468,11 +497,11 @@ def get_provider(model: str) -> LLMProvider:
     # regex so widening ``_is_claude`` can't silently re-route local traffic
     # to a hosted vendor.
     if model in _local_models(settings):
-        return _local()
+        return wrap_provider(_local(), "local")
     if _is_claude(model):
         if settings.openrouter_enabled:
-            return _openrouter()
-        return _anthropic()
+            return wrap_provider(_openrouter(), "openrouter")
+        return wrap_provider(_anthropic(), "anthropic")
     # Other non-Claude slugs require OpenRouter to be enabled.
     if not settings.openrouter_enabled:
         raise HTTPException(
@@ -484,7 +513,7 @@ def get_provider(model: str) -> LLMProvider:
                 f"from a local OpenAI-compatible backend."
             ),
         )
-    return _openrouter()
+    return wrap_provider(_openrouter(), "openrouter")
 
 
 def pdf_input_supported(model: str) -> bool:
@@ -510,3 +539,41 @@ def _reset_for_tests() -> None:
     _anthropic_provider = None
     _openrouter_provider = None
     _local_provider = None
+
+
+def reading_limits_for(model: str = "") -> ReadingLimits:
+    """How much a turn on ``model`` may read (feature_gate.reading_limits).
+
+    The one source of read sizes: every reader takes them from here rather
+    than from a number of its own. "" is the default model.
+    """
+    settings = get_settings()
+    model = model or settings.default_model
+    local_models = _local_models(settings)
+    if model in local_models:
+        _warn_local_context_unset(settings)
+    return reading_limits(
+        context_tokens(
+            model,
+            local_models=local_models,
+            local_context_tokens=int(getattr(settings, "local_context_tokens", 0) or 0),
+        )
+    )
+
+
+_LOCAL_CONTEXT_WARNED = False
+
+
+def _warn_local_context_unset(settings: Any) -> None:
+    """Say once that a local model is read at the default window: a server
+    started with more holds more than the Executive will give it."""
+    global _LOCAL_CONTEXT_WARNED
+    fields_set = getattr(settings, "model_fields_set", None)
+    if _LOCAL_CONTEXT_WARNED or fields_set is None or "local_context_tokens" in fields_set:
+        return
+    _LOCAL_CONTEXT_WARNED = True
+    logger.warning(
+        "LOCAL_CONTEXT_TOKENS is not set: local models are read as holding %d tokens. "
+        "Set it to the context the local server is started with.",
+        int(getattr(settings, "local_context_tokens", 0) or 0),
+    )

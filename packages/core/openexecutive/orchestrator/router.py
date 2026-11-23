@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.agents.base import BaseAgent
+from openexecutive.observability import trace_span
 
 if TYPE_CHECKING:
     from openexecutive.memory.workspace_settings import PrincipalRole
@@ -50,16 +51,34 @@ SPECIALIST_DESCRIPTIONS = {
     "triage": "Chief of Staff — evaluates inbound events (email/Slack/docs) for significance and decides alerting",
 }
 
+# One line per specialist for the consult_specialist tool. The chat re-sends
+# the tool list on every call, so these are shorter than
+# SPECIALIST_DESCRIPTIONS (shown once, in the Agent Council and workflow
+# designer) but keep each area's routing cues.
+SPECIALIST_SHORT = {
+    "cso": "strategy, competition, M&A, positioning, OKRs",
+    "cfo": "finance, unit economics, fundraising, cash flow",
+    "chro": "hiring, compensation, performance, culture, org design",
+    "gc": "contracts, IP, employment law, compliance",
+    "coo": "processes, vendors, scaling, operating metrics",
+    "cmo": "GTM, brand, messaging, PR, crisis communications",
+    "cpo": "roadmap, prioritization, product strategy",
+    "sales": "pipeline, discovery, pricing and discounting, proposals, forecasting",
+    "board_comms": "board decks, investor relations, governance",
+    "triage": "whether an inbound event is significant",
+}
+
+_SPECIALIST_OPTIONS = "; ".join(f"{k} ({v})" for k, v in SPECIALIST_SHORT.items())
+
 SPECIALIST_TOOLS: list[dict[str, Any]] = [
     {
         "name": "consult_specialist",
         "description": (
-            "Consult a specialist executive agent for domain-specific analysis. "
-            "Use this to get deep expertise from the relevant functional leader "
-            "whenever a question asks for judgment in their area: a decision, a plan, "
-            "an analysis, a negotiation, a hire, a contract term, a pricing or fundraising "
-            "move, a board message. Not for lookups, scheduling, status or routine drafting. "
-            "You may call this multiple times in parallel for cross-domain questions."
+            "Consult a specialist executive for analysis in their area whenever a "
+            "question asks for judgment: a decision, a plan, an analysis, a negotiation, "
+            "a hire, a contract term, a pricing or fundraising move, a board message. "
+            "Not for lookups, scheduling, status or routine drafting. Call several in "
+            "parallel for cross-domain questions."
         ),
         "input_schema": {
             "type": "object",
@@ -67,15 +86,15 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
                 "specialist": {
                     "type": "string",
                     "enum": sorted(SPECIALIST_REGISTRY.keys()),
-                    "description": f"Which specialist to consult. Options: {', '.join(f'{k} ({v})' for k, v in SPECIALIST_DESCRIPTIONS.items())}",
+                    "description": f"Which specialist to consult: {_SPECIALIST_OPTIONS}.",
                 },
                 "query": {
                     "type": "string",
-                    "description": "The specific question or task for the specialist. Be precise — they only see this query and the conversation context.",
+                    "description": "The precise question or task; the specialist sees only this and the conversation context.",
                 },
                 "context": {
                     "type": "string",
-                    "description": "Relevant context from the conversation that the specialist needs to give a good answer.",
+                    "description": "Context from the conversation the specialist needs.",
                 },
             },
             "required": ["specialist", "query"],
@@ -180,6 +199,9 @@ def _lessons_for_call(query: str) -> str:
 
     session = current_session.get()
     person_id = getattr(session, "caller_person_id", None) if session is not None else None
+    if person_id is None and session is not None:
+        # A shared call: the lessons of the person it belongs to.
+        person_id = getattr(session, "lessons_person_id", None)
     return lessons_for_query(person_id, query)
 
 
@@ -213,8 +235,9 @@ async def route_to_specialist(
     only).
 
     ``standing_facts`` is the STANDING FACTS block (``memory.facts``) the
-    same way: "" sends none, ``None`` reads the store — so a workflow step's
-    analysis uses the principal's corrections just as a chat consult does.
+    same way: "" sends none, ``None`` reads the store, the facts that bear
+    on ``query`` first — so a workflow step's analysis uses the principal's
+    corrections just as a chat consult does.
     """
     agent = SPECIALIST_REGISTRY.get(specialist_name)
     if agent is None:
@@ -226,19 +249,20 @@ async def route_to_specialist(
     if standing_facts is None:
         from openexecutive.memory.facts import render_facts_for_prompt
 
-        standing_facts = await asyncio.to_thread(render_facts_for_prompt)
-    return await agent.analyze(
-        query=query,
-        context=context,
-        retrieved_knowledge=retrieved_knowledge,
-        episodic_context=episodic_context,
-        failure_cases=failure_cases,
-        department_memory=department_memory,
-        company_stage=company_stage,
-        principal_role=principal_role,
-        standing_facts=standing_facts,
-        actor=actor,
-    )
+        standing_facts = await asyncio.to_thread(render_facts_for_prompt, query=query)
+    with trace_span("specialist {specialist}", specialist=specialist_name, actor=actor):
+        return await agent.analyze(
+            query=query,
+            context=context,
+            retrieved_knowledge=retrieved_knowledge,
+            episodic_context=episodic_context,
+            failure_cases=failure_cases,
+            department_memory=department_memory,
+            company_stage=company_stage,
+            principal_role=principal_role,
+            standing_facts=standing_facts,
+            actor=actor,
+        )
 
 
 # Tool_result returned for consult_specialist calls past the per-turn fan-out
@@ -373,19 +397,26 @@ async def _prefetch_department_for_call(
     registry and queries the dept peer's Honcho representation. Returns
     "" when the specialist has no owning department (e.g. ``triage``)
     or when Honcho is disabled / fails — the wrapper's own degrade-on-
-    failure semantics already audit the outcome.
+    failure semantics already audit the outcome. When Honcho has nothing
+    (off, or empty), the department's own notes answer instead
+    (``memory.department_notes``).
     """
     from openexecutive.departments.registry import slug_for_specialist
+    from openexecutive.memory import department_notes
     from openexecutive.memory.honcho_client import prefetch_department
 
     slug = slug_for_specialist(call["specialist"])
     if slug is None:
         return ""
-    return await prefetch_department(
+    answer = await prefetch_department(
         query=call["query"],
         department_slug=slug,
         session_id=session_id,
     )
+    if answer:
+        return answer
+    # A sqlite read: off the event loop, like every parallel specialist call.
+    return await asyncio.to_thread(department_notes.for_prompt, slug, call["query"])
 
 
 async def route_parallel(

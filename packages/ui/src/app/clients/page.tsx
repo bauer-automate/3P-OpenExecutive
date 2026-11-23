@@ -24,6 +24,8 @@ import {
   updateClientMeta,
 } from "@/lib/api";
 import { clientCountsSummary, renewalBadge } from "@/lib/practice";
+import { PageSpinner } from "@/components/ui/Spinner";
+import { isImeComposing } from "@/lib/imeComposing";
 
 // Client-company switcher for fractional / multi-client use. One client is
 // live at a time; switching saves the current client back to its slot and
@@ -360,7 +362,7 @@ export default function ClientsPage() {
 
         {/* List */}
         {loading ? (
-          <p className="mt-8 text-[15px] text-fg-muted">Loading clients…</p>
+          <PageSpinner label="Loading clients" />
         ) : status.clients.length === 0 ? (
           <div className="mt-8 rounded-2xl border border-line bg-surface-elevated p-8 text-center">
             <p className="text-[15px] text-fg-muted">
@@ -499,7 +501,7 @@ export default function ClientsPage() {
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && name.trim() && !creating && !fixtureActive) void handleCreate();
+                    if (e.key === "Enter" && !isImeComposing(e) && name.trim() && !creating && !fixtureActive) void handleCreate();
                   }}
                   placeholder="Client company name"
                   className={FIELD_CLS}

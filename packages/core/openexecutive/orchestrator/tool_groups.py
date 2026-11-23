@@ -20,7 +20,7 @@ handlers, chips and audit rows a direct call would.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 OPEN_TOOLS = "open_tools"
@@ -34,15 +34,20 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
         ("cancel_calendar_event", "create_calendar_event", "create_instant_meeting"),
     ),
     "people": (
-        "add, change or archive people on the roster, department heads, roster requests",
-        ("archive_person", "resolve_roster_request", "set_department_head", "upsert_person"),
+        "add, change or archive people on the roster, department heads, roster requests, "
+        "what memory holds about one person",
+        ("archive_person", "ask_about_person", "resolve_roster_request", "set_department_head", "upsert_person"),
+    ),
+    "memory": (
+        "forget a remembered fact, change a company-profile field (industry, headcount, ARR, priorities, ...)",
+        ("forget_fact", "update_company_profile"),
     ),
     "corrections": (
         "leave something out of the brief, list, cancel or move a follow-up or reminder, mark a chat draft sent",
         ("cancel_followup", "leave_out_of_brief", "list_followups", "mark_draft_sent", "move_followup"),
     ),
     "goals": (
-        "department goals, decision outcomes, open loops",
+        "department goals, decision outcomes, tasks",
         (
             "assign_open_loop",
             "close_open_loop",
@@ -50,16 +55,21 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
             "list_department_goals",
             "list_open_loops",
             "record_decision_outcome",
+            "reopen_open_loop",
             "update_department_goal",
+            "update_open_loop",
         ),
     ),
     "watch_and_alerts": (
-        "keep an eye on topics, people or competitors (the watch list), alerts, executive research runs",
+        "keep an eye on topics, people or competitors (the watch list), alerts, executive research runs, "
+        "what you did on your own lately (your activity)",
         (
             "ack_alert",
             "add_watchlist_entry",
+            "answer_card",
             "create_alert",
             "find_alerts",
+            "list_my_activity",
             "list_watchlist",
             "remove_watchlist_entry",
             "run_executive_research",
@@ -67,12 +77,26 @@ GROUPS: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
     "workflows": (
-        "draft, save, list, suggest or run workflows; Python jobs (analysis, charts, documents; with or without files)",
-        ("draft_workflow", "list_workflows", "run_python_job", "run_workflow", "save_workflow", "suggest_workflow"),
+        "draft, save, list, suggest or run workflows; anything the person wants done again "
+        "and again on a schedule (a recap every Friday, a check each morning)",
+        ("draft_workflow", "list_workflows", "run_workflow", "save_workflow", "suggest_workflow"),
+    ),
+    "files": (
+        "work on any file (an email attachment, a Drive file, one sent in chat): split, merge or "
+        "convert PDFs and spreadsheets, analysis, documents (Python jobs); any chart, graph or plot "
+        "the person asks for, drawn as an image to show in the answer (never as text bars); save a "
+        "file into a Drive or OneDrive folder",
+        ("run_python_job", "save_file"),
     ),
     "documents": (
         "write, read back or list documents such as memos, reports and plans (artifacts)",
         ("draft_artifact", "get_artifact", "list_artifacts"),
+    ),
+    "app": (
+        "do what the app's own buttons do: pin, rename, delete or share chats; topics, documents, "
+        "files, cards on Today, workflows, memory, departments, skills, the person's own settings; "
+        "links to screens",
+        ("do_in_app", "find_in_app", "open_in_app"),
     ),
     "messaging": (
         "Slack, Telegram and Discord messages, department messages, company broadcasts",
@@ -133,12 +157,10 @@ def open_tools_tool(offered: Iterable[str]) -> dict[str, Any]:
     return {
         "name": OPEN_TOOLS,
         "description": (
-            "Open a group of further tools. You have more tools than the ones listed "
-            "directly; they sit in the groups below. When a request needs one, open "
-            "its group: the result gives each tool's description and input, and you "
-            "then call it with use_tool. Open a group only when the request needs it. "
-            "Before you tell the person you can't do something, check these groups: "
-            "if one covers it, open it.\n"
+            "Open a group of further tools; the result gives each tool's description "
+            "and input, and you call it with use_tool. Open one only when the request "
+            "needs it, and before telling the person you can't do something, check "
+            "whether a group below covers it.\n"
             + lines
         ),
         "input_schema": {
@@ -225,3 +247,42 @@ def unwrap(tool_use: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]
     if not isinstance(args, dict):
         return None, json.dumps({"error": f"use_tool needs {name}'s input as an object."})
     return {**tool_use, "name": name, "input": args}, None
+
+
+_NO_MATCH = "No matching tools found"
+
+
+def _found_nothing(result: str) -> bool:
+    if _NO_MATCH in result:
+        return True
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("tools") == []
+
+
+def after_search(result: str, deferred: dict[str, dict[str, Any]]) -> str:
+    """``search_tools``' answer, and when it found nothing, where else to
+    look: it searches only the connected tool servers, never the groups
+    open_tools opens, so a model that took "no matching tools" as "no such
+    tool" told the person it couldn't do what a group would have done."""
+    if not deferred or not isinstance(result, str) or not _found_nothing(result):
+        return result
+    names = set(deferred)
+    groups = [group for group, (_, tools) in GROUPS.items() if any(t in names for t in tools)]
+    if not groups:
+        return result
+    return (
+        f"{result}\n\nThat searched only the connected tool servers. More tools are in groups you open "
+        f"with open_tools: {', '.join(groups)}. Open the one that fits before saying you can't do it."
+    )
+
+
+def searching(search: Callable[[dict[str, Any]], Any], deferred: dict[str, dict[str, Any]]) -> Callable[..., Any]:
+    """``search`` (the gateway's search_tools) answering with ``after_search``."""
+
+    async def run(tool_input: dict[str, Any]) -> str:
+        return after_search(await search(tool_input), deferred)
+
+    return run

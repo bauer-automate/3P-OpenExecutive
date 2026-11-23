@@ -26,8 +26,9 @@ alone, never the principal, and only in a conversation nobody else can read
 (``orchestrator.history_tools``), even when it was noted in a shared thread. Each person sees, corrects, pins and
 forgets their own notes in Memories → History (``/memories/history``).
 
-**Switches.** Each person turns it on for themselves (``reply_notes``,
-absent means off; despite the name it covers every channel). Any team member
+**Switches.** Each person has their own (``reply_notes``; despite the name
+it covers every channel). Absent means on, for everyone who may keep notes
+(``_on_by_default``): each person's notes are theirs alone. Any team member
 on the People list may (``can_keep_notes``); notes from email replies still
 need Act as me, which writes them. The owner sets how long notes last for the company
 (``retention_days``: 30, 90, 365, or until forgotten; 90 when unset), and a
@@ -107,6 +108,13 @@ class Note:
     correction: str | None
     corrected_at: str | None
 
+    @property
+    def corrected(self) -> str:
+        """The correction as the Executive reads it, in note form
+        (:func:`note_form`); empty when there is none. Every reader that
+        hands a correction to a model uses this, never ``correction``."""
+        return note_form(self.correction) if self.correction else ""
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -143,6 +151,81 @@ _COLUMNS = (
     "id, person_id, visibility, source, channel, conversation_key, counterpart, subject, kind, "
     "summary, quote, due_date, trust, occurred_at, created_at, expires_at, pinned, correction, corrected_at"
 )
+
+
+# Past-tense verbs a note can start with. A known list, not any word ending
+# in "ed", so a name (Fred, Ahmed) or a noun (Seed) is never read as a verb.
+# Words often used as adjectives ("Expected revenue …", "Used car …") are
+# left out.
+_REGULAR_VERBS = frozenset({
+    "accepted", "added", "agreed", "announced", "answered", "approved", "asked",
+    "assigned", "booked", "called", "cancelled", "canceled", "changed", "checked",
+    "closed", "committed", "completed", "complained", "confirmed", "created",
+    "decided", "declined", "delayed", "delegated", "delivered", "emailed",
+    "explained", "finished", "fixed", "followed",
+    "forwarded", "hired", "introduced", "invited", "launched", "liked",
+    "listed", "mentioned", "moved", "needed", "noted", "offered", "opened",
+    "ordered", "owed", "postponed", "priced",
+    "promised", "published", "purchased", "quoted", "raised",
+    "received", "recommended", "rejected", "reminded",
+    "removed", "replied", "reported", "requested", "reviewed",
+    "shared", "shipped", "signed", "started", "submitted", "suggested",
+    "tested", "wanted", "warned", "worked",
+    "clarified", "stated", "corrected",
+    "rescheduled", "responded", "advised", "arranged",
+    "provided", "acknowledged", "thanked", "informed", "notified", "pushed",
+})
+_IRREGULAR_VERBS = frozenset({
+    "said", "told", "sent", "gave", "took", "made", "wrote", "put", "got",
+    "kept", "met", "paid", "bought", "sold", "chose", "thought", "felt",
+    "found", "brought", "began", "ran", "came", "went", "did", "had",
+    "were", "let", "built", "spent", "lent", "meant", "heard",
+    "held", "quit", "forgot", "became", "knew", "saw", "showed",
+    "understood", "taught", "caught", "dealt", "drove", "flew", "fought", "hid",
+    "lost", "rang", "sought", "spoke", "stood", "swore", "threw",
+    "wore", "withdrew", "undertook", "overtook", "forgave", "forbade", "froze",
+})
+
+
+def shown_summary(summary: str) -> str:
+    """A note's summary as its owner reads it: "You said the price list goes
+    out Friday." A note is always about the person who owns it, and only
+    they see it, so the summary is stored starting with the verb ("Said …")
+    and the screens put "You" in front. Text that doesn't start with a
+    past-tense verb from the known list (which holds no names, so "Fred
+    asked …" is left alone) is shown as it is. A correction is shown as
+    typed."""
+    text = (summary or "").strip()
+    first = text.split(" ", 1)[0]
+    if not first[:1].isupper() or not _past_tense(first):
+        return summary
+    return "You " + first[:1].lower() + text[1:]
+
+
+# Past tenses spelled like the present: as the first word they read as an order.
+_SAME_AS_PRESENT = frozenset({"put", "let", "quit"})
+
+
+def note_form(text: str) -> str:
+    """Text as the Executive reads it: a note, never "You said …". The
+    screens put "You" in front of a note (:func:`shown_summary`), so a
+    correction typed over that text starts with "You told …"; the Executive
+    reads it as "Told …", the way it reads every note. A verb spelled like
+    its present ("You put Dana in charge") keeps "You", or the note would
+    read as an order ("Put Dana in charge")."""
+    words = (text or "").strip().split(" ", 2)
+    if (
+        len(words) > 1 and words[0].lower() == "you" and _past_tense(words[1])
+        and words[1].rstrip(",.;:").lower() not in _SAME_AS_PRESENT
+    ):
+        rest = " ".join(words[1:])
+        return rest[:1].upper() + rest[1:]
+    return text
+
+
+def _past_tense(word: str) -> bool:
+    w = word.rstrip(",.;:").lower()
+    return w in _REGULAR_VERBS or w in _IRREGULAR_VERBS
 
 
 def _now(now: datetime | None) -> datetime:
@@ -263,11 +346,29 @@ def set_company_retention(days: Any, *, by: str, db_path: Path | None = None, no
     return value
 
 
+def _on_by_default(person_id: int | None) -> bool:
+    """Whether "Keep track of what happens" is on for someone who never set
+    it: on for everyone who may keep notes (``can_keep_notes``), since each
+    person's notes are theirs alone. Off for a contact, for no person, and
+    when the People list can't be read."""
+    if person_id is None:
+        return False
+    try:
+        from openexecutive.people.registry import get_person
+
+        return can_keep_notes(get_person(person_id))
+    except Exception:
+        logger.warning("history: couldn't read the roster", exc_info=True)
+        return False
+
+
 def person_settings(person_id: int | None, *, db_path: Path | None = None) -> PersonSettings:
-    """A person's own switches. Off, and the company default, when unset or
-    unreadable."""
-    if person_id is None or not _db_path(db_path).exists():
+    """A person's own switches. When unset: on for everyone who may keep
+    notes, with the company's note length. Off when unreadable."""
+    if person_id is None:
         return PersonSettings()
+    if not _db_path(db_path).exists():
+        return PersonSettings(reply_notes=_on_by_default(person_id))
     try:
         conn = _connect(db_path)
         try:
@@ -281,7 +382,7 @@ def person_settings(person_id: int | None, *, db_path: Path | None = None) -> Pe
         logger.warning("history: couldn't read a person's settings — treating them as off", exc_info=True)
         return PersonSettings()
     if row is None:
-        return PersonSettings()
+        return PersonSettings(reply_notes=_on_by_default(person_id))
     return PersonSettings(reply_notes=bool(row[0]), retention_days=int(row[1]) if row[1] is not None else None)
 
 
@@ -580,7 +681,12 @@ def list_notes(
         f"SELECT {_COLUMNS} FROM {NOTES_TABLE} WHERE person_id = ? AND {_live_clause()}"  # noqa: S608 — constant table name and columns
     )
     params: list[Any] = [person_id, _now(now).isoformat()]
-    words = [w for w in (query or "").lower().split() if len(w) > 1][:6]
+    # The leading "You" is only in the shown text ("You said …",
+    # shown_summary), never stored, so a search typed from the screen drops it.
+    typed = (query or "").lower().split()
+    if len(typed) > 1 and typed[0] == "you":
+        typed = typed[1:]
+    words = [w for w in typed if len(w) > 1][:6]
     for word in words:
         like = f"%{word.replace('%', '').replace('_', '')}%"
         sql += (
@@ -705,12 +811,28 @@ def people_keeping_notes(*, db_path: Path | None = None) -> list[int]:
             rows = conn.execute(
                 f"SELECT person_id FROM {PERSON_TABLE} WHERE reply_notes = 1 ORDER BY person_id",  # noqa: S608 — constant table name
             ).fetchall()
+            ids = {int(r[0]) for r in rows}
+            # Everyone who may keep notes and never turned it off.
+            chose = {int(r[0]) for r in conn.execute(
+                f"SELECT person_id FROM {PERSON_TABLE}",  # noqa: S608 — constant table name
+            ).fetchall()}
+            try:
+                from openexecutive.people.registry import list_people
+
+                roster = list_people()
+            except Exception:
+                logger.warning("history: couldn't read the roster", exc_info=True)
+                roster = []
+            for person in roster:
+                pid = person.id
+                if pid is not None and can_keep_notes(person) and pid not in chose:
+                    ids.add(int(pid))
         finally:
             conn.close()
     except Exception:
         logger.warning("history: couldn't read who keeps notes", exc_info=True)
         return []
-    return [int(r[0]) for r in rows]
+    return sorted(ids)
 
 
 def reminded(person_id: int, day: str, *, db_path: Path | None = None) -> bool:

@@ -510,6 +510,8 @@ Files a rostered sender shares (PDFs, Word, spreadsheets, text, images) are read
 
 A thread follow-up the response gate decides wasn't meant for the bot gets an :eyes: reaction, which needs the **`reactions:write`** scope. Without it the skip is still recorded in the audit log, just with no reaction.
 
+The People and department pages pick Slack people and channels by name (`integrations/chat_directory.py`, `GET /chat-directory/*`). That needs **`users:read`** and **`users:read.email`** (people, and matching a person by work email) and **`channels:read`** / **`groups:read`** (public channels, and the private ones the bot is in). Without them the pickers show only the by-hand ID field. Discord's member list needs the bot's **Server Members** privileged intent (Developer Portal → Bot); without it Discord people are entered by ID. Telegram can't list chats, so the pickers offer the chats the bot has seen a message from (recorded only with `TELEGRAM_WEBHOOK_SECRET` set).
+
 ### Email Poller
 `integrations/email_poller.py`
 
@@ -566,6 +568,7 @@ All settings via environment variables (`.env` file in `packages/core/`).
 | `DEFAULT_MODEL` | No | `claude-sonnet-4-6` | Model for Executive + most specialists |
 | `DEEP_REASONING_MODEL` | No | `claude-sonnet-5-5` | Model for CSO, CFO, GC, Board |
 | `ROUTING_MODEL` | No | `claude-haiku-5-5` | Model for intent routing and memory extraction |
+| `PUSHBACK_MODEL` | No | — (off) | The Executive's model for one answer after pushback on the last one |
 | `VECTOR_STORE_PATH` | No | `./chroma_db` | ChromaDB persistence directory |
 | `COMPANY_PROFILE_PATH` | No | `./company/profile.yaml` | Company profile location |
 | `EPISODIC_DB_PATH` | No | `./episodic_memory.db` | SQLite for episodic memory, alerts, audit, scheduler |

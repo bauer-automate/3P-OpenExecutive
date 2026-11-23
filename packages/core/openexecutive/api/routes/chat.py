@@ -7,12 +7,13 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from openexecutive.api import caller as api_caller
 from openexecutive.api import chat_live
@@ -27,11 +28,12 @@ from openexecutive.api.models import (
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit import principal_turn_rows, rows_for_person
 from openexecutive.integrations.attachments import build_attachment_output
+from openexecutive.orchestrator import outside_content
+from openexecutive.orchestrator.action_chips import drop_replaced
 from openexecutive.orchestrator.answer_sources import TurnSources
 from openexecutive.orchestrator.debug_events import DebugCollector
 from openexecutive.orchestrator.turn_inbox import TurnInbox
 from openexecutive.workflows import turn_files
-from openexecutive.workflows.python_job import available as python_job_available
 from openexecutive.workflows.turn_files import bind as bind_turn_files
 
 # Per-file size cap. Mirrors `_DEFAULT_MAX_BYTES` in
@@ -183,6 +185,75 @@ def _rename_session_in_background(
     task.add_done_callback(_rename_tasks.discard)
 
 
+# Steps approved from a chat that were still running when the turn was
+# stopped or ran out of time: they finish on their own (strong references,
+# as `_rename_tasks`).
+_approving_tasks: set[asyncio.Future[str]] = set()
+class _ApprovedNote(NamedTuple):
+    """What the turn reads about the card it approved."""
+
+    text: str
+
+
+# What the turn shows while an approved step runs.
+APPROVING_LABEL = "Doing what you approved…"
+
+
+async def _approve_card_in_turn(
+    card_id: int,
+    card_input: dict[str, Any] | None,
+    request: Request,
+    session: Any,
+    *,
+    stop_event: asyncio.Event | None,
+    deadline: float,
+    keepalive_s: float,
+) -> AsyncIterator[str | _ApprovedNote]:
+    """Approve a card from inside a chat turn's stream.
+
+    Yields SSE lines (an activity line first, then keepalives while the step
+    runs) and, last, the note the turn reads about it. Yields no note when
+    the turn was stopped, ran out of time or lost its page first: the step
+    carries on to its end on its own, and the turn's loop then ends as
+    stopped or timed out. A turn stopped before it began approves nothing.
+    """
+    from openexecutive.api.routes.decisions import HOST_APPROVE_NOTE, approve_in_chat
+
+    if session.from_host:
+        # A page in another app never approves a card (docs/auth.md): its
+        # turn only reads and advises, so the card stays as it is.
+        yield _ApprovedNote(HOST_APPROVE_NOTE)
+        return
+    if stop_event is not None and stop_event.is_set():
+        return
+    activity = {"type": "activity", "label": APPROVING_LABEL, "tool": "approve_card"}
+    yield f"data: {json.dumps(activity)}\n\n"
+    approving = asyncio.ensure_future(approve_in_chat(card_id, request, card_input))
+    stop_waiter = asyncio.ensure_future(stop_event.wait()) if stop_event is not None else None
+    try:
+        while not approving.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (stop_event is not None and stop_event.is_set()):
+                break
+            if await request.is_disconnected():
+                break
+            wait_s = min(remaining, keepalive_s) if keepalive_s > 0 else remaining
+            waits: set[asyncio.Future[Any]] = {approving}
+            if stop_waiter is not None:
+                waits.add(stop_waiter)
+            await asyncio.wait(waits, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED)
+            if not approving.done() and not (stop_event is not None and stop_event.is_set()):
+                yield _SSE_KEEPALIVE
+    finally:
+        if stop_waiter is not None:
+            stop_waiter.cancel()
+        if not approving.done():
+            _approving_tasks.add(approving)
+            approving.add_done_callback(_approving_tasks.discard)
+    if approving.done():
+        yield _ApprovedNote(approving.result())
+
+
 def _stop_owner_key(request: Request, caller_person_id: int | None) -> str:
     """A stable identity for "who may stop this turn".
 
@@ -197,9 +268,43 @@ def _stop_owner_key(request: Request, caller_person_id: int | None) -> str:
     direct curl against a local API, where there is no identity to separate
     (``api.caller.identity_key``).
     """
-    if caller_person_id is not None:
-        return f"person:{caller_person_id}"
-    return api_caller.identity_key(request)
+    key = f"person:{caller_person_id}" if caller_person_id is not None else api_caller.identity_key(request)
+    # A host origin's page (api.caller.from_host) stops and adds to its own
+    # turns only, and the person's own pages to theirs: a script on the host
+    # can't put words into a turn that may act.
+    return f"{key}|host" if api_caller.from_host(request) else key
+
+
+# Conversations a host origin's page has written in whose stored mark
+# (session_store.host_wrote) hasn't been written yet, or failed to write: a
+# turn running alongside must be held all the same. An id leaves once its mark
+# is stored, so a host page starting many chats doesn't grow it. The API runs
+# as one process.
+_host_sessions: set[str] = set()
+
+
+def _host_wrote(session_id: str) -> bool:
+    from openexecutive.memory.session_store import host_wrote
+
+    return session_id in _host_sessions or host_wrote(session_id)
+
+
+def _host_wrote_quietly(session_id: str) -> bool:
+    """``_host_wrote``, answering yes when it can't be read (fails closed)."""
+    try:
+        return _host_wrote(session_id)
+    except Exception:
+        logger.warning("chat.host_mark_unreadable session_id=%s", session_id, exc_info=True)
+        return True
+
+
+def _exists_without_host(session_id: str) -> bool:
+    """Whether ``session_id`` is a stored conversation that a host origin's
+    page has never written in. (A new one has no row yet: the turn writes it
+    after this check.)"""
+    from openexecutive.memory.session_store import get_session_metadata
+
+    return get_session_metadata(session_id) is not None and not _host_wrote(session_id)
 
 
 def _sweep_stale_stops() -> None:
@@ -303,7 +408,7 @@ class _StreamStep(NamedTuple):
 _SSE_KEEPALIVE = ": keepalive\n\n"
 # The steps of a reply the other pages of a shared chat follow live
 # (``chat_live.turn_event``), besides its text and the thinking pings.
-_LIVE_STEPS = frozenset({"activity", "action_taken", "phase"})
+_LIVE_STEPS = frozenset({"activity", "action_taken", "phase", "rewrite"})
 
 
 async def _cancel_stream_step(anext_task: asyncio.Task[Any], turn_id: str) -> None:
@@ -434,6 +539,18 @@ def _add_to_turn(client_turn_id: str, owner: str, message_id: str, text: str) ->
     if entry is None or entry.owner != owner or entry.inbox is None:
         return None
     if entry.event.is_set() or not entry.inbox.add(message_id, text):
+        return None
+    return entry.turn_id
+
+
+def _hand_over_turn(client_turn_id: str, owner: str) -> str | None:
+    """Ask a running turn to stop and hand over what it has. Returns its
+    server `turn_id`, or None (no such live turn, not yours, already stopped
+    or finished: indistinguishable, as for `_request_stop`)."""
+    entry = _active_stops.get(client_turn_id)
+    if entry is None or entry.owner != owner or entry.inbox is None:
+        return None
+    if entry.event.is_set() or not entry.inbox.request_hand_over():
         return None
     return entry.turn_id
 
@@ -630,6 +747,18 @@ def _session_access(
     return "forbidden"
 
 
+def _turn_access(
+    request: Request, session_id: str, caller_person_id: int | None
+) -> tuple[SessionAccess, bool]:
+    """The one rule for who may write in ``session_id`` this turn: whoever may
+    use it (``_session_access``), or someone its owner shared it with
+    (``_shared_member``, then the second value is True)."""
+    access = _session_access(request, session_id, caller_person_id)
+    if access == "forbidden" and _shared_member(session_id, caller_person_id):
+        return "allowed", True
+    return access, False
+
+
 def _shared_member(session_id: str, caller_person_id: int | None) -> bool:
     """Whether the owner of web chat ``session_id`` shared it with this caller,
     who then reads it and writes in it with them (``session_store.set_shares``).
@@ -728,7 +857,9 @@ def _shared_chat_block(names: list[str], owner: str = "") -> str:
         "This is a shared chat in the web app. Everyone in it reads every "
         f"message and every reply: {', '.join(names)}. Each person's message "
         "starts with [Name] for who wrote it; answer whoever wrote the latest "
-        "one. Anything private to one of them (their own notes, mail or what "
+        "one. Speak to the group: \"you\" is whoever wrote the latest "
+        "message, and anyone else in the chat is named (never ask someone "
+        "to get, tell or loop in themselves). Anything private to one of them (their own notes, mail or what "
         "you remember about them) stays out of this chat unless they bring it "
         "up here themselves."
     )
@@ -886,49 +1017,6 @@ def _build_page_context_block(page_context: PageContext | None) -> str:
     return "\n".join(lines)
 
 
-def _seed_seen_channel_refs(session: Any, person_id: int | None) -> None:
-    """Record the caller's OWN channel addresses as seen on this session.
-
-    `schedule_followup` refuses to queue a send to a `(channel, channel_ref)`
-    the session has not seen — an anti-spam gate, and the reason an injected
-    "email this to attacker@evil" in an alert body cannot become a scheduled
-    send. The chat adapters populate it from the inbound message; nothing
-    populated it for a browser turn.
-
-    The gate was unreachable on web until `set_session` bound the session for
-    the whole stream, so it silently allowed ANY address; reachable, it reads
-    an empty set as "seen nothing" and refuses even the principal's own,
-    breaking "remind me tomorrow at 9am". Seeding the caller's own refs is
-    what makes the gate mean on web what it means everywhere else: you may
-    schedule to yourself, and to whatever this conversation actually used.
-
-    Replaces the set each turn, so it holds this turn's speaker's addresses
-    alone: in a shared chat, a teammate who speaks after the principal can't
-    schedule a message to the principal, and an address removed from the
-    roster stops being one.
-    """
-    session.seen_channel_refs = set()
-    if person_id is None:
-        return
-    try:
-        from openexecutive.people.store import get_person
-
-        person = get_person(person_id)
-    except Exception:
-        logger.warning("chat.seen_refs_seed_failed person_id=%s", person_id, exc_info=True)
-        return
-    if person is None:
-        return
-    for channel, ref in (
-        ("email", getattr(person, "email", None)),
-        ("slack_dm", getattr(person, "slack_user_id", None)),
-        ("discord_dm", getattr(person, "discord_user_id", None)),
-        ("telegram", getattr(person, "telegram_chat_id", None)),
-    ):
-        if ref:
-            session.seen_channel_refs.add((channel, str(ref)))
-
-
 def _resolve_caller_person_id(request: Request) -> int | None:
     """Resolve the calling Person from the `x-caller-email` header.
 
@@ -954,15 +1042,82 @@ def _caller_is_principal_or_unclaimed(request: Request) -> bool:
     names no one, so it can't set up an install it doesn't own. Fails closed:
     if the roster cannot be read, the answer is no.
     """
+    from openexecutive.people import install_owner
     from openexecutive.people import store as people_store
 
     try:
+        who = api_caller.caller(request)
         if people_store.find_principal_person() is None:
-            return api_caller.caller(request).kind != "service"
+            # Unclaimed only on an install nobody has owned yet: once an owner
+            # is kept (``people.install_owner``), only they may set it up again.
+            owner = install_owner.get()
+            if owner is not None:
+                return who.defaults_to_principal or who.email == owner
+            return who.kind != "service"
+        if install_owner.away_from_own_company():
+            # A simulator company or a client is live, with its own principal:
+            # the install's owner still runs it and can switch back.
+            owner = install_owner.get() or install_owner.from_own_company_copy()
+            if owner is not None and who.email == owner:
+                return True
         return people_store.is_principal_or_self(_resolve_caller_person_id(request), None)
     except Exception:
         logger.exception("principal check failed — refusing the principal-only change")
         return False
+
+
+_READS = frozenset({"GET", "HEAD", "OPTIONS"})
+# The writes that replace the whole company: on an install with no principal
+# yet, whoever makes one is kept as its owner (``_install_owner_to_keep``).
+_SETS_UP = ("/reset", "/load", "/activate")
+
+
+def principal_writes(request: Request) -> Iterator[None]:
+    """Router dependency for routes whose writes replace or wipe the whole
+    company (the company simulator, client slots): a reset, a load, a switch
+    and the backup are the principal's, as the workspace settings and the
+    People list are (``_caller_is_principal_or_unclaimed``). Reads stay open.
+    The install's owner is kept once the write has gone through, never on
+    one that failed."""
+    if request.method in _READS:
+        yield
+        return
+    if not _caller_is_principal_or_unclaimed(request):
+        raise HTTPException(status_code=403, detail="Only the principal can change the company's saved data")
+    owner = _install_owner_to_keep(request)
+    yield
+    if owner:
+        from openexecutive.people import install_owner
+
+        try:
+            install_owner.remember(owner)
+        except Exception:
+            logger.warning("couldn't keep the install's owner", exc_info=True)
+
+
+def _install_owner_to_keep(request: Request) -> str | None:
+    """The address to keep as the install's owner once this write goes
+    through: the principal's, signed in as themselves, while their own
+    company is live, or on a roster with no principal yet the address of
+    whoever replaces the company (a reset, a load, a switch), not an
+    incidental write. With it kept, loading a simulator company or a client
+    can't lock them out of switching back (``people.install_owner``).
+    Never raises."""
+    from openexecutive.people import install_owner
+    from openexecutive.people import store as people_store
+
+    try:
+        email = api_caller.caller(request).email
+        principal = people_store.find_principal_person()
+        if principal is None:
+            mine = request.url.path.rstrip("/").endswith(_SETS_UP)
+        else:
+            mine = (principal.email or "").strip().lower() == email
+        if email and mine and not install_owner.away_from_own_company():
+            return email
+    except Exception:
+        logger.warning("couldn't tell the install's owner", exc_info=True)
+    return None
 
 
 async def _run_chat_turn(
@@ -976,6 +1131,9 @@ async def _run_chat_turn(
     client_turn_id: str | None = None,
     memory_text: str | None = None,
     turn_files: dict[str, bytes] | None = None,
+    background: bool = False,
+    approve_card: int | None = None,
+    approve_input: dict[str, Any] | None = None,
 ) -> StreamingResponse:
     """Shared streaming-chat handler for both the JSON and multipart routes.
 
@@ -986,9 +1144,13 @@ async def _run_chat_turn(
     records as the caller's words instead of `message` (see
     `Executive.stream_chat`). `turn_files` are the uploads as sent, which a
     Python job may take by name for this turn (workflows/turn_files.py).
+    `approve_card` is a card under a reply in this chat that the person
+    tapped Approve on (`approve_input`: its changed fields): it is approved
+    as its own button does (`decisions.approve_in_chat`), and this turn reads
+    what happened, so the Executive carries on with the ask.
     """
     from openexecutive.config import get_settings
-    from openexecutive.knowledge.retriever import retrieve
+    from openexecutive.knowledge.retriever import chat_builtin_results, retrieve
     from openexecutive.memory.episodic import format_for_prompt
     from openexecutive.memory.session_store import create_session
     from openexecutive.orchestrator.executive import Executive
@@ -1024,10 +1186,6 @@ async def _run_chat_turn(
     principal_turn = is_principal_on_verified_surface(
         SimpleNamespace(from_web_chat=True, caller_person_id=caller_person_id)
     )
-    # Only a principal's turn can run a Python job, so only there are the
-    # uploads kept for the turn; anyone else's are dropped here.
-    if turn_files and not (principal_turn and python_job_available()):
-        turn_files = None
     # A client-supplied id must be the caller's own chat; any other id the
     # turn can't use is swapped for a fresh chat before the stop switch arms.
     requested_id = _clean_session_id(session_id)
@@ -1035,9 +1193,7 @@ async def _run_chat_turn(
     # Someone the owner shared this chat with, writing in it with them.
     member = False
     if requested_id is not None:
-        access = _session_access(request, requested_id, caller_person_id)
-        if access == "forbidden" and _shared_member(requested_id, caller_person_id):
-            access, member = "allowed", True
+        access, member = _turn_access(request, requested_id, caller_person_id)
         if access in ("forbidden", "orphaned"):
             # Someone else's chat, or an ownerless one nobody here can vouch
             # for (its starter was lost to a restart). Continue in a fresh
@@ -1117,7 +1273,35 @@ async def _run_chat_turn(
             _release_stop(client_turn_id, turn_id)
             raise
     try:
+        if requested_id is not None:
+            # Decided again once this turn holds the chat: the owner may have
+            # taken them out, deleted it, or someone else's first turn claimed
+            # the id while this one waited. Only an id that was unused before
+            # the wait may still be unused; a chat that existed and is gone
+            # now was deleted, and must not be recreated under this caller.
+            again = _turn_access(request, requested_id, caller_person_id)[0]
+            if not (again == "allowed" or (again == "missing" and access == "missing")):
+                raise HTTPException(status_code=404, detail="Session not found")
         session = await _get_or_create_session(requested_id, request)
+        # A host origin's page writes only in a conversation it started or
+        # already wrote in: one line from it holds the conversation read-only
+        # for good, so it must not reach one of the person's own.
+        if (
+            api_caller.from_host(request)
+            and requested_id is not None
+            and await asyncio.to_thread(_exists_without_host, requested_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This conversation was started in Open Executive. Continue it there.",
+            )
+        if turn_files:
+            # Kept for the conversation, so a later message can still attach,
+            # split or save them (orchestrator/file_refs.py, file:<name>).
+            # Inside the guard: a cancelled write must release the turn too.
+            from openexecutive.orchestrator import conversation_files
+
+            await asyncio.to_thread(conversation_files.keep, session.session_id, turn_files)
     except BaseException:
         _release_stop(client_turn_id, turn_id)
         if lock_key is not None:
@@ -1131,6 +1315,20 @@ async def _run_chat_turn(
     # proxy stamps x-caller-email from it). A header-less request resolves to
     # the principal but is no sign-in, so it never gets Act as me.
     session.web_caller_signed_in = api_caller.signed_in(request)
+    # Per turn too: a host origin's page sent it, or wrote earlier in this
+    # conversation (Session.from_host). Then it only reads and advises,
+    # whichever page asks now: the host's lines stay in what the model reads.
+    # A conversation whose lines can't be read is held the same way.
+    host_call = api_caller.from_host(request)
+    if host_call:
+        session.from_host = True
+    else:
+        try:
+            session.from_host = await asyncio.to_thread(_host_wrote, session.session_id)
+        except Exception:
+            logger.exception("chat.host_lines_unreadable session_id=%s", session.session_id)
+            session.from_host = True
+    line_surface = "host" if host_call else None
     is_first_turn = len(session.conversation_history) == 0
 
     # A chat its owner shared (``chat_people``): everyone in it reads every
@@ -1212,12 +1410,6 @@ async def _run_chat_turn(
             full={"message": message, "memory_text": memory_text},
         )
 
-    # Let the caller schedule to their own addresses, and only theirs. Runs per
-    # turn rather than only on session creation: a newly-added address works
-    # without a fresh session, and in a shared chat each speaker gets their
-    # own set.
-    _seed_seen_channel_refs(session, caller_person_id)
-
     # Persist the session row immediately (idempotent INSERT OR IGNORE) so a
     # mid-turn failure never leaves a ghost in-memory session with no DB row.
     # `caller_person_id` is bound here on the first turn; INSERT OR IGNORE means
@@ -1232,6 +1424,18 @@ async def _run_chat_turn(
         )
     except Exception:  # pragma: no cover - DB write should not block the turn
         logger.exception("chat.session_persist_failed turn_id=%s", turn_id)
+    if host_call:
+        # Now, not when the turn is saved: a turn from the person's own page
+        # in this conversation, even one running alongside, is held too
+        # (here first, so a failed write below still holds it).
+        _host_sessions.add(session.session_id)
+        try:
+            from openexecutive.memory.session_store import mark_host_wrote
+
+            if mark_host_wrote(session.session_id):
+                _host_sessions.discard(session.session_id)
+        except Exception:
+            logger.exception("chat.host_mark_failed session_id=%s", session.session_id)
 
     # Fan out the three context-fetching steps in parallel. Each one is a few
     # hundred ms to a few seconds on its own and they are mutually independent,
@@ -1357,6 +1561,7 @@ async def _run_chat_turn(
                     store=request.app.state.store if hasattr(request.app.state, "store") else None,
                     record_source=turn_sources.add,
                     max_chars=get_settings().knowledge_chat_max_chars,
+                    n_builtin=chat_builtin_results(),
                 ),
                 _do_episodic(),
                 _do_prefetch(),
@@ -1431,6 +1636,9 @@ async def _run_chat_turn(
         )
 
         full_response = ""
+        # The reply as it stood before the Executive wrote it again: it
+        # stands when the turn ends before the new one has a word.
+        first_reply = ""
         # Messages folded into this turn (POST /chat/add), filled once the
         # turn's inbox closes and persisted with it.
         added_texts: list[str] = []
@@ -1442,9 +1650,13 @@ async def _run_chat_turn(
         timed_out = False
         client_disconnected = False
         stopped = False
+        # Broadcast to pages that have the chat open: a shared chat's others,
+        # and the owner watching a turn run on the server with no page of its
+        # own (``start_background_turn``: an approved card's Watch).
+        live_turn = session.shared_chat or background
 
         try:
-            if session.shared_chat:
+            if live_turn:
                 chat_live.turn_started(
                     session.session_id,
                     turn_key=live_key,
@@ -1455,6 +1667,28 @@ async def _run_chat_turn(
             # Flush knowledge_retrieved (and any other pre-stream events) first.
             for evt in collector._events:
                 yield f"data: {json.dumps(collector.to_sse_dict(evt))}\n\n"
+
+            turn_page_block = page_context_block
+            if approve_card is not None:
+                # Approve tapped on a card under a reply: do the step inside
+                # the turn, so it shows as working and Stop and the turn's
+                # deadline hold while it runs (the step itself finishes on its
+                # own and its card says how it went).
+                approved: str | None = None
+                async for evt in _approve_card_in_turn(
+                    approve_card, approve_input, request, session,
+                    stop_event=stop_event,
+                    deadline=exec_t0 + timeout_s,
+                    keepalive_s=settings.chat_stream_keepalive_s,
+                ):
+                    if isinstance(evt, _ApprovedNote):
+                        approved = evt.text
+                    else:
+                        yield evt
+                if approved is not None:
+                    turn_page_block = "\n\n".join(
+                        part for part in (page_context_block, f"THE CARD THEY JUST APPROVED:\n{approved}") if part
+                    )
 
             logger.info("chat.executive_start turn_id=%s", turn_id)
 
@@ -1469,7 +1703,7 @@ async def _run_chat_turn(
                     attachment_blocks=attachment_blocks,
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
-                    page_context_block=page_context_block,
+                    page_context_block=turn_page_block,
                     turn_id=turn_id,
                     memory_text=turn_memory_text,
                     channel_context_block=shared_block,
@@ -1487,7 +1721,7 @@ async def _run_chat_turn(
                     attachment_blocks=attachment_blocks,
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
-                    page_context_block=page_context_block,
+                    page_context_block=turn_page_block,
                     turn_id=turn_id,
                     memory_text=turn_memory_text,
                     channel_context_block=shared_block,
@@ -1531,18 +1765,27 @@ async def _run_chat_turn(
                     logger.info(
                         "chat.persist_skipped_deleted session_id=%s", session.session_id
                     )
+                    # The turn may have kept its ask after the delete forgot
+                    # the chat's asks: forget them again if the chat is gone.
+                    from openexecutive.memory.session_store import get_session_metadata
+                    from openexecutive.workflows import repeat_asks
+
+                    if get_session_metadata(session.session_id) is None:
+                        repeat_asks.forget_session(session.session_id)
                     return
                 if not is_first_turn:
                     update_session_timestamp(session.session_id)
                 save_message(
-                    session.session_id, "user", message, sender_person_id=caller_person_id
+                    session.session_id, "user", message, sender_person_id=caller_person_id,
+                    sender_surface=line_surface,
                 )
                 # Messages sent while it worked and folded into this reply,
                 # in the order they arrived, before the reply that answers
                 # them.
                 for added_text in added_texts:
                     save_message(
-                        session.session_id, "user", added_text, sender_person_id=caller_person_id
+                        session.session_id, "user", added_text, sender_person_id=caller_person_id,
+                        sender_surface=line_surface,
                     )
                 persisted["assistant_message_id"] = save_message(
                     session.session_id,
@@ -1677,14 +1920,23 @@ async def _run_chat_turn(
                                     "content": item,
                                     "session_id": session.session_id,
                                 }
-                            if session.shared_chat:
+                            if live_turn:
                                 chat_live.turn_event(session.session_id, live_key, live_evt)
                             yield f"data: {json.dumps(live_evt)}\n\n"
                         else:
                             if isinstance(item, dict) and item.get("type") == "action_taken":
-                                action_chips.append(item)
+                                # A draft written again in this reply replaces
+                                # the earlier one's chip and card.
+                                action_chips[:] = drop_replaced([*action_chips, item])
+                            elif isinstance(item, dict) and item.get("type") == "rewrite":
+                                # The reply is written again whole: what
+                                # streamed so far is dropped here (the saved
+                                # reply) and by every page showing it.
+                                if full_response.strip():
+                                    first_reply = full_response
+                                full_response = ""
                             if (
-                                session.shared_chat
+                                live_turn
                                 and isinstance(item, dict)
                                 and item.get("type") in _LIVE_STEPS
                             ):
@@ -1755,8 +2007,26 @@ async def _run_chat_turn(
                     with contextlib.suppress(Exception):
                         await aclose()
 
+            if first_reply and not full_response.strip():
+                # Stopped, timed out or cut off after a rewrite began but
+                # before it wrote anything: the first reply stands, saved and
+                # back on every page showing it.
+                full_response = first_reply
+                kept_evt = {"type": "chunk", "content": first_reply, "session_id": session.session_id}
+                if live_turn:
+                    chat_live.turn_event(session.session_id, live_key, kept_evt)
+                if not client_disconnected:
+                    yield f"data: {json.dumps(kept_evt)}\n\n"
+
             if not turn_sources.is_empty():
                 answer_sources = turn_sources.payload()
+
+            # Whether the turn wanted the person's browser while it wasn't
+            # connected, taken on every path so a turn whose tab closed can't
+            # leave the card for the next one.
+            from openexecutive.browser import tools as browser_tools
+
+            browser_needed = browser_tools.take_needed(session)
 
             if client_disconnected:
                 # Connection is gone, so we can't yield anything more — but we
@@ -1780,6 +2050,30 @@ async def _run_chat_turn(
             if answer_sources is not None and full_response:
                 sources_evt = {"type": "sources", "session_id": session.session_id, **answer_sources}
                 yield f"data: {json.dumps(sources_evt)}\n\n"
+
+            # What the turn held for an outside read, for Approve / Not now
+            # buttons under the reply (Approve sends the person's go).
+            held_steps = outside_content.pending_held(session) if not (stopped or timed_out) else ()
+            if held_steps:
+                held_evt = {"type": "held_steps", "session_id": session.session_id, "steps": list(held_steps)}
+                yield f"data: {json.dumps(held_evt)}\n\n"
+            # The turn wanted the person's browser and it wasn't connected: a
+            # card under the reply to add the extension.
+            if browser_needed and not (stopped or timed_out):
+                needed_evt = {
+                    "type": "browser_needed",
+                    "session_id": session.session_id,
+                    "store_url": browser_tools.store_url(),
+                }
+                yield f"data: {json.dumps(needed_evt)}\n\n"
+            # What the content check flagged this turn, in plain words
+            # (orchestrator.content_scan): sent only with held steps, as the
+            # reason on their card. A flag that held nothing changed nothing
+            # the person sees, so it stays in the audit log alone.
+            flags = outside_content.pending_flags(session) if held_steps else ()
+            if flags:
+                flags_evt = {"type": "flags", "session_id": session.session_id, "flags": list(flags)}
+                yield f"data: {json.dumps(flags_evt)}\n\n"
 
             if stopped:
                 # Not an `error` event — a stop is a user decision, not a
@@ -1843,7 +2137,7 @@ async def _run_chat_turn(
             _release_stop(client_turn_id, turn_id)
             if lock_key is not None:
                 _release_session_turn(lock_key, turn_lock)
-            if session.shared_chat:
+            if live_turn:
                 # Saved by now (every path persists before it ends): the
                 # other pages read the chat again.
                 chat_live.turn_ended(session.session_id, live_key)
@@ -1869,6 +2163,8 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
         page_context=body.page_context,
         client_turn_id=body.client_turn_id,
         memory_text=body.memory_text,
+        approve_card=body.approve_card,
+        approve_input=body.approve_input,
     )
 
 
@@ -1968,6 +2264,7 @@ async def start_background_turn(
             attachment_blocks=None,
             request=_StaysConnected(request.scope, request.receive),
             memory_text=memory_text,
+            background=True,
         )
     except BaseException:
         _release_background_slot(owner)
@@ -2027,6 +2324,31 @@ async def chat_stop(body: StopChatRequest, request: Request) -> dict[str, str]:
     return {"status": "stopping", "turn_id": stopped_turn_id}
 
 
+@router.post("/chat/hand-over")
+async def chat_hand_over(body: StopChatRequest, request: Request) -> dict[str, str]:
+    """Stop an in-flight /chat turn's work and have it hand over what it has.
+
+    The person will finish the task themselves (I'll finish it). The turn
+    takes the request at its next step, says so with a `handing_over` event,
+    runs no more tools and writes up what it found and did as its reply. A
+    request that lands while the final answer is already being written
+    changes nothing: that answer is the hand-over. 404 as for /chat/stop.
+    """
+    client_turn_id = _clean_client_turn_id(body.client_turn_id)
+    turn_id = (
+        _hand_over_turn(
+            client_turn_id,
+            _stop_owner_key(request, _resolve_caller_person_id(request)),
+        )
+        if client_turn_id
+        else None
+    )
+    if turn_id is None:
+        raise HTTPException(status_code=404, detail="No in-flight turn with that id")
+    logger.info("chat.hand_over_requested turn_id=%s", turn_id)
+    return {"status": "handing_over", "turn_id": turn_id}
+
+
 @router.post("/chat/add")
 async def chat_add(body: AddChatMessageRequest, request: Request) -> dict[str, str]:
     """Add a message to an in-flight /chat turn, addressed by its
@@ -2070,7 +2392,7 @@ async def chat_upload(
 ) -> StreamingResponse:
     """Streaming chat turn with file/photo attachments.
 
-    Documents (PDF/DOCX/TXT/MD/CSV) have their text extracted, inlined into
+    Documents (PDF/DOCX/XLSX/TXT/MD/CSV) have their text extracted, inlined into
     the user message, and indexed into the ChromaDB ``inbound_attachments``
     collection as a background task — exactly the behavior the Discord and
     Telegram bots already use. That collection is never retrieved from, so an
@@ -2110,6 +2432,9 @@ async def chat_upload(
             extra_text, blocks = await build_attachment_output(
                 filename, data, upload.content_type or "", inbound=False,
             )
+            # The upload is bound and kept by this route itself; don't leave
+            # it offered for a chat app's turn (turn_files.offer).
+            turn_files.take_offered()
         except Exception:
             logger.exception("chat_upload: processing failed for %s", filename)
             text_parts.append(f"(Could not process {filename})")
@@ -2139,6 +2464,53 @@ async def chat_upload(
         memory_text=f"{message}\n\n(Attached files: {', '.join(filenames)})",
         turn_files=turn_files.collect(uploads),
     )
+
+
+# ---------------------------------------------------------------------------
+# The chat mic: speech to text into the message box.
+# ---------------------------------------------------------------------------
+
+
+class VoiceStatus(BaseModel):
+    available: bool
+    max_seconds: int
+
+
+class TranscribeResponse(BaseModel):
+    text: str
+
+
+@router.get("/chat/voice", response_model=VoiceStatus)
+async def chat_voice() -> VoiceStatus:
+    """Whether the chat mic can turn speech into words here, and how long a
+    recording it takes. The mic is hidden when ``available`` is false."""
+    from openexecutive.providers import transcription
+
+    return VoiceStatus(available=transcription.available(), max_seconds=transcription.max_seconds())
+
+
+@router.post("/chat/transcribe", response_model=TranscribeResponse)
+async def chat_transcribe(
+    file: UploadFile = File(...),  # noqa: B008 — FastAPI multipart marker
+) -> TranscribeResponse:
+    """The words in a recording from the chat mic. They go into the message
+    box, where the person reads and sends them; nothing is sent or kept
+    here."""
+    from openexecutive.providers import transcription
+
+    if not transcription.available():
+        raise HTTPException(status_code=404, detail="Speech to text isn't set up")
+    filename = file.filename or "recording.webm"
+    if not transcription.is_audio(filename, file.content_type or ""):
+        raise HTTPException(status_code=400, detail="That isn't a recording")
+    data = await file.read(transcription.MAX_BYTES + 1)
+    if len(data) > transcription.MAX_BYTES:
+        raise HTTPException(status_code=413, detail="The recording is too long")
+    try:
+        text = await transcription.transcribe(data, filename, file.content_type or "")
+    except transcription.TranscriptionError as exc:
+        raise HTTPException(status_code=502, detail=f"Couldn't hear it: {exc}") from exc
+    return TranscribeResponse(text=text)
 
 
 # ---------------------------------------------------------------------------
@@ -2310,6 +2682,10 @@ async def _fast_json_call(
         log_model_usage(response, model=model, actor=log_tag)
         text_blocks = [b for b in response.content if getattr(b, "type", "") == "text"]
         raw = text_blocks[0].text.strip() if text_blocks else ""
+    except TimeoutError:
+        # A slow fast model, not a fault: the caller falls back.
+        logger.warning("%s: LLM call timed out", log_tag)
+        return None
     except Exception:
         logger.exception("%s: LLM call failed", log_tag)
         return None
@@ -2399,15 +2775,46 @@ _FOLLOWUP_MAX_CHARS_PER_MESSAGE = 1500
 _FOLLOWUP_MAX_WORDS = 24
 
 
-def _build_followup_transcript(messages: list[dict[str, Any]]) -> str:
+def _build_followup_transcript(
+    messages: list[dict[str, Any]],
+    names: dict[int, str] | None = None,
+    reader: int | None = None,
+    owner: int | None = None,
+) -> str:
+    """The tail of the chat for the follow-up model. In a shared chat
+    (``names``, everyone in it by person id) each person's line carries their
+    name, and the transcript says it is a group chat and whose next message
+    to write: ``reader``'s, who is asking. A line saved without a sender is
+    ``owner``'s, as in ``_named_history``."""
+    group = bool(names) and len(names or {}) > 1
     lines: list[str] = []
     for m in messages[-_FOLLOWUP_MAX_MESSAGES:]:
-        speaker = "EXECUTIVE" if m.get("role") == "assistant" else "USER"
+        if m.get("role") == "assistant":
+            speaker = "EXECUTIVE"
+        elif group:
+            sender = m.get("sender_person_id")
+            sender = owner if sender is None else sender
+            speaker = (names or {}).get(sender, "") if isinstance(sender, int) else ""
+            speaker = speaker or "SOMEONE IN THE CHAT"
+        else:
+            speaker = "USER"
         text = str(m.get("content") or "").strip()
         if len(text) > _FOLLOWUP_MAX_CHARS_PER_MESSAGE:
             text = text[:_FOLLOWUP_MAX_CHARS_PER_MESSAGE] + " […]"
         lines.append(f"{speaker}: {text}")
-    return "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    if not group:
+        return body
+    everyone = ", ".join((names or {}).values())
+    who = (names or {}).get(reader, "") if reader is not None else ""
+    header = f"This is a group chat with the executive. People in it: {everyone}."
+    if who:
+        header += (
+            f" The USER is {who}: write {who}'s next message, in {who}'s own voice."
+            f" Never suggest {who} message, loop in or ask {who}; another person"
+            " in the chat is named, never called 'me'."
+        )
+    return f"{header}\n\n{body}"
 
 
 async def _generate_followup_via_llm(transcript: str) -> str | None:
@@ -2548,7 +2955,12 @@ async def get_suggested_prompts(request: Request) -> dict[str, Any]:
         logger.exception("suggested_prompts: session list failed")
         sessions = []
 
-    recent_titles = [s["title"] for s in sessions[:5] if s.get("title")]
+    # Not a chat a host origin's page wrote in: its title is that page's
+    # words, and a starter prompt is sent as the person's own.
+    recent_titles = [
+        s["title"] for s in sessions[:5]
+        if s.get("title") and not _host_wrote_quietly(str(s.get("session_id") or ""))
+    ]
     latest_session_id = sessions[0]["session_id"] if sessions else None
 
     key = _cache_key(profile, latest_session_id, caller_person_id)

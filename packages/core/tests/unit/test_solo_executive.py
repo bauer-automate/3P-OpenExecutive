@@ -46,8 +46,16 @@ from ._agent_loop_fakes import FinalMsg, ScriptedProvider, TextBlock, ToolUseBlo
 # deliberately: the inbound-email reply step names the `--- REPLY ---` block
 # instead of the Gmail send tool, so it holds for Outlook too. And once more:
 # the Skills paragraph saves repeatable work as a workflow, not a playbook.
-# And again: Domain Expertise says when to consult a specialist.
-TEAM_PERSONA_SHA256 = "3f46b161c65c1c16d731f48728a8f8eef3dadd2da30f425dd935a6188b2acf62"
+# And again: Domain Expertise says when to consult a specialist. And again:
+# the wording was tightened (same rules, ~27% shorter) to cut the cached prefix.
+# And again: People is checked first when asked how to reach someone.
+# And again: a name that fits more than one person is never picked silently.
+# And again: Approvals is the one gate (no department authority, no "propose,
+# do not wait").
+# And again: a greeting gets a greeting back, not a status report.
+# And again: Big jobs (do the whole job; a one-line heads-up for a long one).
+# And again: an email reply may quote a draft signed by the sender for them to send.
+TEAM_PERSONA_SHA256 = "e28f90204c43d7c622ac20f8ad8783d0f8ba43ed8cb7419eb6f2a18c2023fab6"
 
 SOLO_HEADINGS = (
     "## You Work for One Person",
@@ -60,6 +68,14 @@ TEAM_ONLY_HEADINGS = (
     "## Choosing Who to Tell",
     "## Departments & Org Coordination",
 )
+
+
+@pytest.fixture(autouse=True)
+def _careful_holds_no_asked_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suite pins Approvals to Careful (tests/conftest.py), which holds
+    every acting step a turn asks for (take_the_lead._asked_hit); these
+    tests are about other checks, so that hold stays out."""
+    monkeypatch.setattr("openexecutive.orchestrator.take_the_lead._careful_turn", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -143,7 +159,7 @@ def test_solo_persona_speaks_to_one_principal_of_any_role() -> None:
     assert "not that they work without people" in solo
     for person in ("their manager", "direct reports", "board"):
         assert person in solo
-    assert "Treat them as contacts." in solo
+    assert "Treat them as contacts" in solo
     # The goal-update discipline carries over word for word where it matters.
     assert "Update goals **one at a time, each backed by a specific thing that happened.**" in solo
     assert "Do not sweep." in solo

@@ -1,34 +1,47 @@
 "use client";
 
-import Link from "next/link";
-import { type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 import { useAskOEFormContext } from "@/components/askoe/AskOEContext";
-import { TeamModeOffer } from "@/components/people/TeamModeOffer";
+import { ChatAppPickers } from "@/components/people/ChatAppPickers";
+import { ContactKeeperSwitch } from "@/components/people/ContactChanges";
+import { NeedsALook, PersonRow, SectionHead } from "@/components/people/PeopleNeeds";
+import { TeamModeSwitch } from "@/components/people/TeamModeSwitch";
 import Button from "@/components/ui/Button";
-import SectionTabs, { sectionPanelProps } from "@/components/ui/SectionTabs";
+import { useChatDirectory, useSlackEmailMatch } from "@/components/ui/ChatPicker";
 import SidePanel from "@/components/ui/SidePanel";
 import { useWorkspace } from "@/components/workspace/WorkspaceContext";
 import {
   createPerson,
+  getContactChanges,
+  getLastContacts,
   getPeopleViewer,
   listPeople,
+  type ContactChanges,
   type PageFormField,
   type Person,
   type PersonKind,
 } from "@/lib/api";
 import {
-  defaultKindForTab,
-  defaultPeopleTab,
+  canClaimPrincipal,
   effectiveKind,
   hiddenTeamCount,
   isContact,
   peopleForTab,
-  personCardStatus,
-  shouldOfferTeamMode,
-  tabsFor,
-  type PeopleTab,
+  shouldSwitchToTeam,
 } from "@/lib/peopleKinds";
+import {
+  addFormKind,
+  CONTACTS_PREVIEW,
+  contactLine,
+  contactsByRecent,
+  roleBadge,
+  sameEmailPairs,
+  teamInOrder,
+  teamLine,
+} from "@/lib/peopleBoard";
+import { lastContactLabel, matchesSearch, type LastContact } from "@/lib/peopleList";
+import { PageSpinner } from "@/components/ui/Spinner";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,57 +57,11 @@ const ALL_SCOPES = [
   { value: "legal_sign", label: "Legal", hint: "Receives proposals with legal implications." },
   { value: "board_comms", label: "Board", hint: "Receives proposals before board communications." },
   { value: "meeting_scheduling", label: "Meetings", hint: "Receives meetings the Executive wants to book." },
-  { value: "wildcard", label: "All (wildcard)", hint: "Receives anything no one else is scoped for — usually the principal." },
+  { value: "wildcard", label: "All (wildcard)", hint: "Receives anything no one else is scoped for, usually the owner." },
 ];
 
 const CHANNELS = ["any", "slack", "discord", "telegram", "email"];
 const KINDS: PersonKind[] = ["team", "contact"];
-
-// ---------------------------------------------------------------------------
-// PersonCard — name, role, channel and one status. Approval scopes are on
-// the person's own page.
-// ---------------------------------------------------------------------------
-
-const TONE_DOT = { ok: "bg-emerald-500", warn: "bg-amber-500", muted: "bg-fg-subtle" } as const;
-
-function channelLabel(channel: string): string {
-  return channel === "any" ? "Any channel" : channel.charAt(0).toUpperCase() + channel.slice(1);
-}
-
-function PersonCard({ person, today }: { person: Person; today: string }) {
-  const contact = isContact(person);
-  const status = personCardStatus(person, today);
-  return (
-    <Link
-      href={`/people/${person.id}`}
-      className="flex items-start gap-4 rounded-2xl border border-line bg-surface-elevated hover:bg-surface-hover hover:border-line-strong transition-colors p-5 group focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
-    >
-      <div className="w-11 h-11 rounded-full bg-accent/10 text-accent flex items-center justify-center flex-shrink-0 text-base font-semibold">
-        {person.full_name.charAt(0).toUpperCase()}
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span className="text-base font-semibold text-fg group-hover:text-accent transition-colors truncate">
-            {person.full_name}
-          </span>
-          {person.is_principal && (
-            <span className="inline-block px-2 py-0.5 rounded-full text-xs font-medium bg-accent/10 text-accent">
-              Principal
-            </span>
-          )}
-        </div>
-        <div className="text-[15px] text-fg-muted mt-0.5 truncate">{person.role || "—"}</div>
-        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-fg-muted">
-          {!contact && <span>{channelLabel(person.preferred_channel)}</span>}
-          <span className="inline-flex items-center gap-1.5">
-            <span aria-hidden="true" className={`h-2 w-2 rounded-full ${TONE_DOT[status.tone]}`} />
-            {status.label}
-          </span>
-        </div>
-      </div>
-    </Link>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Add Person modal
@@ -104,6 +71,8 @@ interface AddPersonModalProps {
   initialKind: PersonKind;
   /** Contacts are the principal's alone: nobody else is offered the choice. */
   canAddContacts: boolean;
+  /** Only while nobody is the principal yet (canClaimPrincipal). */
+  canBePrincipal: boolean;
   onCreated: (p: Person) => void;
   onClose: () => void;
 }
@@ -183,7 +152,7 @@ function ScopePicker({ selected, onToggle }: { selected: string[]; onToggle: (va
 
 const SCOPE_VALUES = ALL_SCOPES.map((s) => s.value);
 
-function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: AddPersonModalProps) {
+function AddPersonModal({ initialKind, canAddContacts, canBePrincipal, onCreated, onClose }: AddPersonModalProps) {
   const [form, setForm] = useState({ ...BLANK_FORM, kind: canAddContacts ? initialKind : "team" });
   const kind = effectiveKind(form.kind, form.is_principal);
   const contact = kind === "contact";
@@ -192,6 +161,18 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
   const [showContact, setShowContact] = useState(false);
   const [showAuthority, setShowAuthority] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
+
+  // Slack, Discord and Telegram by name. Slack suggests whoever has the
+  // email typed above, and opens the fold to show it until it is toggled.
+  const chatDirectory = useChatDirectory("people");
+  const slackMatch = useSlackEmailMatch(form.email, !!chatDirectory?.slack.configured);
+  const [contactToggled, setContactToggled] = useState(false);
+  const contactOpen = showContact || (!contactToggled && !!slackMatch);
+  const setChatId = useCallback(
+    (field: "slack_user_id" | "discord_user_id" | "telegram_chat_id", id: string) =>
+      setForm((f) => (f[field] === id ? f : { ...f, [field]: id })),
+    [],
+  );
 
   useEffect(() => {
     // After the panel has taken focus on open, so it remembers the button
@@ -220,13 +201,15 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
           }]
         : []),
       { name: "role", label: contact ? "Role and company" : "Role", type: "text", value: form.role },
-      {
-        name: "is_principal",
-        label: "This is me — Primary",
-        type: "boolean",
-        value: form.is_principal,
-        description: "Marks the person as the primary decision-maker. Only for the user themselves.",
-      },
+      ...(canBePrincipal
+        ? [{
+            name: "is_principal",
+            label: "This is me — Primary",
+            type: "boolean" as const,
+            value: form.is_principal,
+            description: "Marks the person as the primary decision-maker. Only for the user themselves.",
+          }]
+        : []),
       { name: "preferred_channel", label: "Preferred channel", type: "select", options: CHANNELS, value: form.preferred_channel },
       { name: "response_sla_hours", label: "Expected reply within (hours)", type: "number", value: Number(form.response_sla_hours) || 24 },
       { name: "email", label: "Email", type: "text", value: form.email },
@@ -258,7 +241,7 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
             else { next[key] = raw; applied.push(key); }
             break;
           case "is_principal":
-            if (typeof raw !== "boolean") skipped.push(key);
+            if (!canBePrincipal || typeof raw !== "boolean") skipped.push(key);
             else { next.is_principal = raw; applied.push(key); }
             break;
           case "kind":
@@ -428,7 +411,7 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
             />
           </label>
 
-          {!contact && (
+          {!contact && canBePrincipal && (
           <label className="flex items-start gap-3 cursor-pointer select-none rounded-xl border border-line px-4 py-3">
             <input
               type="checkbox"
@@ -449,9 +432,12 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
 
           {/* Contact & routing */}
           <DisclosureSection
-            label={contact ? "Chat IDs" : "Contact & routing"}
-            open={showContact}
-            onToggle={() => setShowContact((v) => !v)}
+            label={contact ? "Chat apps" : "Contact & routing"}
+            open={contactOpen}
+            onToggle={() => {
+              setContactToggled(true);
+              setShowContact(!contactOpen);
+            }}
           >
             {!contact && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -469,7 +455,7 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
                   </select>
                 </label>
                 <p className={HINT_CLS}>
-                  Proposals routed to this person are sent via {form.preferred_channel === "any" ? "any available channel" : form.preferred_channel}.
+                  Proposals routed to this person are sent via {form.preferred_channel === "any" ? "the app they last talked in, then any other" : form.preferred_channel}.
                 </p>
               </div>
               <div>
@@ -493,38 +479,12 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
             </div>
             )}
 
-            <label className={LABEL_CLS}>
-              Slack user ID
-              <input
-                value={form.slack_user_id}
-                onChange={(e) => setForm((f) => ({ ...f, slack_user_id: e.target.value }))}
-                className={INPUT_CLS}
-                placeholder="U01ABC123"
-              />
-            </label>
-
-            <label className={LABEL_CLS}>
-              Discord user ID
-              <input
-                value={form.discord_user_id}
-                onChange={(e) => setForm((f) => ({ ...f, discord_user_id: e.target.value }))}
-                className={INPUT_CLS}
-                placeholder="123456789012345678"
-              />
-              <span className={HINT_CLS}>
-                Right-click your Discord username and &quot;Copy User ID&quot; (developer mode required).
-              </span>
-            </label>
-
-            <label className={LABEL_CLS}>
-              Telegram chat ID
-              <input
-                value={form.telegram_chat_id}
-                onChange={(e) => setForm((f) => ({ ...f, telegram_chat_id: e.target.value }))}
-                className={INPUT_CLS}
-                placeholder="123456789"
-              />
-            </label>
+            <ChatAppPickers
+              ids={form}
+              onChange={setChatId}
+              directory={chatDirectory}
+              slackMatch={slackMatch}
+            />
           </DisclosureSection>
 
           {/* Approval authority — a contact approves nothing */}
@@ -547,42 +507,27 @@ function AddPersonModal({ initialKind, canAddContacts, onCreated, onClose }: Add
 }
 
 // ---------------------------------------------------------------------------
-// Page
+// Page — one page (lib/peopleBoard.ts): search and Add, Needs a look when
+// something is there, the team, the contacts (the three you were last in
+// touch with, then All), and the "Keep my contacts up to date" switch.
 // ---------------------------------------------------------------------------
 
-const TAB_COPY: Record<PeopleTab, { label: string; blurb: string; empty: string; add: string }> = {
-  team: {
-    label: "Team",
-    blurb: "People who work with you. They can sign in, message the Executive and approve what their authority covers.",
-    empty: "No team members yet.",
-    add: "Add person",
-  },
-  contacts: {
-    label: "Contacts",
-    blurb: "Clients, contractors and advisors outside the team — private to you. The Executive emails or invites them only when you ask it to; they can't sign in or message it, and nobody else on the team sees them.",
-    empty: "No contacts yet.",
-    add: "Add contact",
-  },
-};
-
 export default function PeoplePage() {
-  const { mode, loading: workspaceLoading } = useWorkspace();
+  const { mode } = useWorkspace();
+  const [notice, setNotice] = useState<string | null>(null);
   const [people, setPeople] = useState<Person[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
-  const [tab, setTab] = useState<PeopleTab | null>(null);
-  const [offerFor, setOfferFor] = useState<string | null>(null);
+  const [switchedFor, setSwitchedFor] = useState<string | null>(null);
   // Contacts are private to the principal. Until the viewer is known (or if
   // the check fails) nobody is offered them; the API enforces it regardless.
   const [viewerIsPrincipal, setViewerIsPrincipal] = useState(false);
-  const [viewerLoading, setViewerLoading] = useState(true);
-
-  const tabs = tabsFor(viewerIsPrincipal);
-  // Open on the mode's default tab once the mode is known; a tab the user
-  // picked is kept from then on (and never one this viewer is not offered).
-  const activeTab: PeopleTab =
-    tab !== null && tabs.includes(tab) ? tab : defaultPeopleTab(mode, viewerIsPrincipal);
+  const [query, setQuery] = useState("");
+  const [allContacts, setAllContacts] = useState(false);
+  const [lastContacts, setLastContacts] = useState<Map<number, LastContact>>(new Map());
+  // What the Executive changed in the contacts: the principal's alone.
+  const [contactChanges, setContactChanges] = useState<ContactChanges | null>(null);
 
   function refresh() {
     setLoading(true);
@@ -592,96 +537,176 @@ export default function PeoplePage() {
       .finally(() => setLoading(false));
   }
 
+  const loadContactChanges = useCallback((next?: ContactChanges) => {
+    if (next) {
+      setContactChanges(next);
+      return;
+    }
+    getContactChanges().then(setContactChanges, () => setContactChanges(null));
+    listPeople({ includeContacts: true }).then(setPeople, () => {});
+  }, []);
+
+  useEffect(() => {
+    if (!viewerIsPrincipal) return;
+    getContactChanges().then(setContactChanges, () => setContactChanges(null));
+    getLastContacts().then(
+      (rows) => setLastContacts(new Map(rows.map((r) => [r.person_id, r]))),
+      () => setLastContacts(new Map()),
+    );
+  }, [viewerIsPrincipal]);
+
   useEffect(() => {
     refresh();
     getPeopleViewer()
       .then((v) => setViewerIsPrincipal(v.is_principal))
-      .catch(() => setViewerIsPrincipal(false))
-      .finally(() => setViewerLoading(false));
+      .catch(() => setViewerIsPrincipal(false));
   }, []);
 
-  const shown = peopleForTab(people, activeTab, mode);
-  const hidden = activeTab === "team" ? hiddenTeamCount(people, mode) : 0;
-  const copy = TAB_COPY[activeTab];
-  const tabsId = useId();
+  const team = teamInOrder(peopleForTab(people, "team", mode));
+  const contacts = viewerIsPrincipal ? contactsByRecent(peopleForTab(people, "contacts", mode), lastContacts) : [];
+  const pairs = sameEmailPairs([...team, ...contacts]);
+  const hidden = hiddenTeamCount(people, mode);
+  const searching = query.trim().length > 0;
+  const found = searching ? [...team, ...contacts].filter((p) => matchesSearch(p, query)) : [];
+  const shownContacts = allContacts ? contacts : contacts.slice(0, CONTACTS_PREVIEW);
   // Local date (YYYY-MM-DD) for "on leave until", sampled once per mount.
   const [today] = useState(() => new Date().toLocaleDateString("en-CA"));
+
+  const row = (person: Person) =>
+    isContact(person) ? (
+      <PersonRow
+        key={person.id}
+        contact
+        name={person.full_name}
+        href={`/people/${person.id}`}
+        line={contactLine(person, lastContactLabel(lastContacts.get(person.id)))}
+      />
+    ) : (
+      <PersonRow
+        key={person.id}
+        name={person.full_name}
+        href={`/people/${person.id}`}
+        badge={roleBadge(person)}
+        line={teamLine(person, today)}
+      />
+    );
 
   return (
     <div className="flex flex-col h-full bg-surface">
       {showAdd && (
         <AddPersonModal
-          initialKind={defaultKindForTab(activeTab)}
+          initialKind={addFormKind({ mode, seesContacts: viewerIsPrincipal })}
           canAddContacts={viewerIsPrincipal}
+          canBePrincipal={canClaimPrincipal(people, loading || error !== null)}
           onCreated={(p) => {
             setPeople((prev) => [...prev, p]);
             setShowAdd(false);
-            // Show the new row where it lives.
-            setTab(isContact(p) ? "contacts" : "team");
-            if (shouldOfferTeamMode(mode, p.kind ?? "team", p.is_principal)) setOfferFor(p.full_name);
+            setNotice(`${p.full_name} added.`);
+            if (shouldSwitchToTeam(mode, p.kind ?? "team", p.is_principal)) setSwitchedFor(p.full_name);
           }}
           onClose={() => setShowAdd(false)}
         />
       )}
-      {offerFor && <TeamModeOffer name={offerFor} onDone={() => setOfferFor(null)} />}
+      {switchedFor && <TeamModeSwitch name={switchedFor} onDone={() => setSwitchedFor(null)} />}
       <main className="flex-1 overflow-y-auto">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between mb-6">
-            <div className="min-w-0">
-              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-fg">People</h1>
-              <p className="text-[15px] text-fg-muted mt-2 max-w-2xl">{copy.blurb}</p>
-            </div>
-            <Button variant="primary" onClick={() => setShowAdd(true)} className="flex-shrink-0 self-start">
-              {copy.add}
+        <div className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
+          <div className="flex items-center justify-between gap-4 mb-5">
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-fg">People</h1>
+            <Button variant="primary" onClick={() => setShowAdd(true)} className="flex-shrink-0">
+              Add
             </Button>
           </div>
 
-          {tabs.length > 1 && (
-            <div className="mb-6">
-              <SectionTabs
-                idBase={tabsId}
-                label="Team or contacts"
-                active={activeTab}
-                onChange={setTab}
-                disabled={(workspaceLoading || viewerLoading) && tab === null}
-                tabs={tabs.map((t) => ({
-                  id: t,
-                  label: TAB_COPY[t].label,
-                  count: loading ? undefined : peopleForTab(people, t, mode).length,
-                }))}
-              />
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search people"
+            aria-label="Search people"
+            className="w-full h-11 mb-5 px-4 rounded-xl bg-surface-input/60 border border-line text-[15px] text-fg placeholder-fg-subtle focus:outline-none focus:border-accent"
+          />
+
+          {notice && (
+            <div
+              role="status"
+              className="p-4 rounded-xl border text-[15px] mb-5 bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-300"
+            >
+              {notice}
             </div>
           )}
-
-          <div {...(tabs.length > 1 ? sectionPanelProps(tabsId, activeTab) : {})}>
-          {loading && <p className="text-fg-muted text-[15px]">Loading…</p>}
+          {loading && <PageSpinner />}
           {error && (
             <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-500 text-[15px] mb-4">
               {error}
             </div>
           )}
-          {!loading && !error && shown.length === 0 && (
-            <div className="rounded-2xl border border-line bg-surface-elevated p-10 text-center">
-              <p className="text-fg-muted text-[15px] mb-5">{copy.empty}</p>
-              <Button variant="primary" onClick={() => setShowAdd(true)}>
-                {activeTab === "contacts" ? "Add your first contact" : "Add your first person"}
-              </Button>
-            </div>
+
+          {!loading && !error && searching && (
+            found.length === 0 ? (
+              <p className="rounded-2xl border border-line bg-surface-elevated p-6 text-center text-[15px] text-fg-muted">
+                No one matches.
+              </p>
+            ) : (
+              <ul className="rounded-2xl border border-line bg-surface-elevated overflow-hidden">{found.map(row)}</ul>
+            )
           )}
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {shown.map((person) => (
-              <PersonCard key={person.id} person={person} today={today} />
-            ))}
-          </div>
+          {!loading && !error && !searching && (
+            <>
+              <NeedsALook
+                changes={viewerIsPrincipal ? contactChanges : null}
+                pairs={pairs}
+                onChanged={loadContactChanges}
+              />
 
-          {hidden > 0 && (
-            <p className="text-sm text-fg-muted mt-5">
-              {hidden === 1 ? "1 other team member is" : `${hidden} other team members are`} hidden while you
-              use Open Executive just for yourself. Switch to team mode in Settings to see them.
-            </p>
+              <section className="mb-6" aria-label="Team">
+                <SectionHead title={`Team · ${team.length}`} />
+                {team.length > 0 ? (
+                  <ul className="rounded-2xl border border-line bg-surface-elevated overflow-hidden">{team.map(row)}</ul>
+                ) : (
+                  <p className="rounded-2xl border border-line bg-surface-elevated p-6 text-center text-[15px] text-fg-muted">
+                    No team members yet.
+                  </p>
+                )}
+                {hidden > 0 && (
+                  <p className="text-sm text-fg-muted mt-3 px-1">
+                    {hidden === 1 ? "1 other team member is" : `${hidden} other team members are`} hidden while you
+                    use Open Executive just for yourself. Switch to team mode in Settings to see them.
+                  </p>
+                )}
+              </section>
+
+              {viewerIsPrincipal && (
+                <section className="mb-6" aria-label="Contacts">
+                  <SectionHead
+                    title={`Contacts · ${contacts.length}`}
+                    right={
+                      contacts.length > CONTACTS_PREVIEW ? (
+                        <button
+                          type="button"
+                          onClick={() => setAllContacts((v) => !v)}
+                          className="text-sm font-semibold text-accent hover:underline"
+                        >
+                          {allContacts ? "Fewer" : `All ${contacts.length} ›`}
+                        </button>
+                      ) : undefined
+                    }
+                  />
+                  {contacts.length > 0 ? (
+                    <ul className="rounded-2xl border border-line bg-surface-elevated overflow-hidden">{shownContacts.map(row)}</ul>
+                  ) : (
+                    <p className="rounded-2xl border border-line bg-surface-elevated p-6 text-center text-[15px] text-fg-muted">
+                      No contacts yet. Clients, contractors and advisors go here, private to you.
+                    </p>
+                  )}
+                </section>
+              )}
+
+              {viewerIsPrincipal && contactChanges && (
+                <ContactKeeperSwitch data={contactChanges} onChanged={loadContactChanges} />
+              )}
+            </>
           )}
-          </div>
         </div>
       </main>
     </div>

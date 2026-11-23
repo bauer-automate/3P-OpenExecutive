@@ -159,7 +159,7 @@ def test_grading_marks_a_thumbs_up_fine_turn_kept(roster: SimpleNamespace) -> No
         turns = conn.execute(f"SELECT * FROM {cr.TURNS_TABLE} WHERE id = ?", (rid,)).fetchall()  # noqa: S608
     finally:
         conn.close()
-    cr._store_grades({rid: ("fine", "", "")}, turns, {rid: [cr.THUMBS_UP]}, {}, db_path=None)
+    cr._store_grades({rid: ("fine", "", "", "")}, turns, {rid: [cr.THUMBS_UP]}, {}, db_path=None)
     assert int(_row(rid)["kept"]) == 1
 
 
@@ -298,6 +298,25 @@ def test_a_miss_that_now_passes_is_closed_with_the_date(roster: SimpleNamespace)
     assert replay.summary_for(cr.list_misses(person_id=None), NOW)["would_pass"] == 1
 
 
+def test_a_replay_of_a_chat_that_read_mail_writes_only_its_persons_rows(
+    db: Path, roster: SimpleNamespace
+) -> None:
+    """The judge's notes quote the chat: on a chat that read mail, every
+    audit row the replay writes is its person's alone."""
+    from openexecutive.memory.session_store import create_session, mark_mail_private
+
+    create_session("s-mail", "Offer", NOW.isoformat(), roster.teammate.id, db_path=db)
+    mark_mail_private("s-mail", roster.teammate.id, db_path=db)
+    miss = _turn(roster.teammate.id, session_id="s-mail")
+    plain = _turn(roster.teammate.id, session_id="s-1")
+    _run(miss, replay.WHY_WEEKLY, passed=True, new_lessons=[])
+    _run(plain, replay.WHY_WEEKLY, passed=True, new_lessons=[])
+    rows = audit_logger.get_audit_logger().query(event_type="chat_review", all_owners=True)
+    mail_rows = [r for r in rows if r.session_id == "s-mail"]
+    assert mail_rows and all(r.private and r.private_to_person == roster.teammate.id for r in mail_rows)
+    assert all(r.private_to_person is None for r in rows if r.session_id == "s-1")
+
+
 def test_a_lesson_whose_miss_still_fails_twice_retires(roster: SimpleNamespace) -> None:
     miss = _turn(roster.principal.id)
     lesson_id = _lesson(roster.principal.id, miss)
@@ -339,7 +358,11 @@ def test_a_new_lesson_present_at_two_broken_liked_turns_retires_and_a_closed_mis
     assert lessons.get_lesson(newer)["retired_reason"] == lessons.REASON_REPLAY
 
 
-def test_a_teammates_turn_never_retires_the_principals_shared_lesson(roster: SimpleNamespace) -> None:
+def test_a_principals_lesson_from_an_older_shared_chat_never_reaches_a_teammates_turn(
+    roster: SimpleNamespace,
+) -> None:
+    """Lessons stay with their own person, so an older row marked shared
+    neither reaches a teammate's replay nor gets retired by it."""
     conn = lessons._connect(None)
     conn.execute(f"INSERT INTO {lessons.TABLE} (person_id, text, quote, session_id, shared, created_at) "  # noqa: S608
                  "VALUES (?, 'The board deck means the Q4 board deck', 'the board deck', 'slack:channel:C1:ts', 1, ?)",
@@ -350,7 +373,7 @@ def test_a_teammates_turn_never_retires_the_principals_shared_lesson(roster: Sim
     theirs = _turn(roster.teammate.id, verdict="fine", kept=1)
     for _ in range(3):
         result = _run(theirs, replay.WHY_PROTECT, passed=False, new_lessons=lessons.lessons_since(None))
-        assert result is not None and shared in result["lesson_ids"] and result["retired"] == []
+        assert result is None or (shared not in result["lesson_ids"] and result["retired"] == [])
     assert lessons.get_lesson(shared)["retired_at"] is None
 
 

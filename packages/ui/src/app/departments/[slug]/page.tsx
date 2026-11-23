@@ -1,10 +1,11 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { AddGoalForm, GoalRow } from "@/components/goals/GoalEditor";
 import Button from "@/components/ui/Button";
+import ChatPicker, { useChatDirectory } from "@/components/ui/ChatPicker";
 import OverflowMenu from "@/components/ui/OverflowMenu";
 import SectionTabs, { sectionPanelProps } from "@/components/ui/SectionTabs";
 import SidePanel from "@/components/ui/SidePanel";
@@ -19,6 +20,7 @@ import {
   type Goal,
   type Person,
 } from "@/lib/api";
+import { type ChatProvider, closestOption, findOption } from "@/lib/chatDirectory";
 import {
   WEEKDAYS,
   checkInSpec,
@@ -29,6 +31,7 @@ import {
   type CheckInChoice,
   type Weekday,
 } from "@/lib/checkInCadence";
+import { PageSpinner } from "@/components/ui/Spinner";
 
 // Auto-refresh cadence for the detail page. The `dept_cadence` scheduler
 // fires at most once per department per cadence (default weekly), so any
@@ -40,27 +43,21 @@ const POLL_INTERVAL_MS = 30_000;
 // Helpers
 // ---------------------------------------------------------------------------
 
-const AUTHORITY_OPTS: DepartmentConfig["authority_level"][] = [
-  "auto_execute",
-  "propose_only",
-  "escalate",
-];
-
 const AUTHORITY_META: Record<
   DepartmentConfig["authority_level"],
   { label: string; hint: string }
 > = {
   auto_execute: {
-    label: "Acts on its own",
-    hint: "The specialist runs actions in its scope without asking. You'll see them in the audit log.",
+    label: "Hands-off",
+    hint: "Its work goes ahead without asking. Approvals is set in Settings → Your Executive.",
   },
   propose_only: {
-    label: "Proposes, you approve",
-    hint: "The specialist drafts actions and routes them to a person for approval before anything happens.",
+    label: "Balanced",
+    hint: "Its work comes to its approver as an Approve card first. Approvals is set in Settings → Your Executive.",
   },
   escalate: {
-    label: "Escalates to a person",
-    hint: "The specialist will not act — it forwards everything to a human.",
+    label: "Careful",
+    hint: "Everything it would do comes to a person first, marked urgent. Approvals is set in Settings → Your Executive.",
   },
 };
 
@@ -72,7 +69,7 @@ function cls(...parts: (string | false | undefined)[]) {
 type SettingsTab = "charter" | "acts" | "numbers" | "channels" | "watched";
 const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
   { id: "charter", label: "Charter" },
-  { id: "acts", label: "How it acts" },
+  { id: "acts", label: "Head and check-in" },
   { id: "numbers", label: "Numbers" },
   { id: "channels", label: "Channels" },
   { id: "watched", label: "Watched" },
@@ -147,7 +144,7 @@ function CheckInPicker({
             </label>
           )}
           <label className={cls(LABEL_CLS, "flex-1 min-w-[10rem]")}>
-            Time (UTC)
+            Time (company time zone)
             <input
               type="time"
               step={60}
@@ -178,7 +175,7 @@ export default function DepartmentDetailPage() {
   const params = useParams();
   const slug = params?.slug as string;
   const router = useRouter();
-  const { mode, effectiveTimezone } = useWorkspace();
+  const { mode, effectiveTimezone, refresh: refreshWorkspace } = useWorkspace();
 
   const [dept, setDept] = useState<DepartmentDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -190,7 +187,6 @@ export default function DepartmentDetailPage() {
   // Settings edit state
   const [editingSettings, setEditingSettings] = useState(false);
   const [settingsForm, setSettingsForm] = useState({
-    authority_level: "propose_only" as DepartmentConfig["authority_level"],
     mission: "",
     checkIn: { kind: "off" } as CheckInChoice,
     headcount: "",
@@ -199,10 +195,40 @@ export default function DepartmentDetailPage() {
     slack_channel_id: "",
     discord_channel_id: "",
     telegram_chat_id: "",
+    google_chat_space: "",
     // One entity per line in the textarea; split + trimmed on save.
     watched_entities: "",
   });
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("charter");
+
+  // Slack, Discord and Telegram rooms by name (the principal's alone; for
+  // anyone else there is no list and the id fields stay).
+  const channelDirectory = useChatDirectory("channels");
+  const channelList = (p: ChatProvider) =>
+    channelDirectory === undefined ? undefined : (channelDirectory?.[p] ?? null);
+  // The room named most like the department, pre-selected while none is set.
+  const channelSuggestion = (p: "slack" | "discord") => {
+    const best = dept ? closestOption(dept.config.title, channelDirectory?.[p].options ?? []) : null;
+    return best ? { option: best, reason: "Closest match" } : null;
+  };
+  const channelName = (p: ChatProvider, id: string) =>
+    findOption(channelDirectory?.[p].options ?? [], id)?.name ?? id;
+  const setSlackChannel = useCallback(
+    (id: string) => setSettingsForm((f) => (f.slack_channel_id === id ? f : { ...f, slack_channel_id: id })),
+    [],
+  );
+  const setDiscordChannel = useCallback(
+    (id: string) => setSettingsForm((f) => (f.discord_channel_id === id ? f : { ...f, discord_channel_id: id })),
+    [],
+  );
+  const setTelegramGroup = useCallback(
+    (id: string) => setSettingsForm((f) => (f.telegram_chat_id === id ? f : { ...f, telegram_chat_id: id })),
+    [],
+  );
+  const setGoogleChatSpace = useCallback(
+    (id: string) => setSettingsForm((f) => (f.google_chat_space === id ? f : { ...f, google_chat_space: id })),
+    [],
+  );
   const settingsTabsId = useId();
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsErr, setSettingsErr] = useState<string | null>(null);
@@ -252,7 +278,6 @@ export default function DepartmentDetailPage() {
       // Same guard for the big settings form.
       if (isInitial || !editingSettingsRef.current) {
         setSettingsForm({
-          authority_level: d.config.authority_level,
           mission: d.config.charter.mission,
           checkIn: parseCheckIn(d.config.cadences.check_in),
           headcount: d.headcount != null ? String(d.headcount) : "",
@@ -261,6 +286,7 @@ export default function DepartmentDetailPage() {
           slack_channel_id: d.config.slack_channel_id ?? "",
           discord_channel_id: d.config.discord_channel_id ?? "",
           telegram_chat_id: d.config.telegram_chat_id ?? "",
+          google_chat_space: d.config.google_chat_space ?? "",
           watched_entities: (d.config.watched_entities ?? []).join("\n"),
         });
       }
@@ -318,7 +344,6 @@ export default function DepartmentDetailPage() {
   function cancelSettings() {
     if (!dept || savingSettings) return;
     setSettingsForm({
-      authority_level: dept.config.authority_level,
       mission: dept.config.charter.mission,
       checkIn: parseCheckIn(dept.config.cadences.check_in),
       headcount: dept.headcount != null ? String(dept.headcount) : "",
@@ -327,6 +352,7 @@ export default function DepartmentDetailPage() {
       slack_channel_id: dept.config.slack_channel_id ?? "",
       discord_channel_id: dept.config.discord_channel_id ?? "",
       telegram_chat_id: dept.config.telegram_chat_id ?? "",
+      google_chat_space: dept.config.google_chat_space ?? "",
       watched_entities: (dept.config.watched_entities ?? []).join("\n"),
     });
     setSettingsErr(null);
@@ -336,12 +362,15 @@ export default function DepartmentDetailPage() {
   async function removeDepartment() {
     if (!dept) return;
     if (!window.confirm(
-      `Delete "${dept.config.title}"? This will also remove all its Goals and cannot be undone.`
+      `Delete "${dept.config.title}"? Its goals stay on the Goals page with no department, ` +
+        "each on its owner (or on the department's lead). This cannot be undone."
     )) return;
     setDeleting(true);
     setDeleteErr(null);
     try {
       await deleteDepartment(slug);
+      // The Departments tab hides once the last department is gone.
+      void refreshWorkspace();
       router.push("/departments");
     } catch (e) {
       setDeleteErr(e instanceof Error ? e.message : "Delete failed");
@@ -357,7 +386,6 @@ export default function DepartmentDetailPage() {
       const headcountNum = settingsForm.headcount.trim() !== "" ? Number(settingsForm.headcount) : undefined;
       const budgetNum = settingsForm.budget_usd.trim() !== "" ? Number(settingsForm.budget_usd) : undefined;
       const updated = await updateDepartment(slug, {
-        authority_level: settingsForm.authority_level,
         charter: {
           mission: settingsForm.mission,
           scope: dept.config.charter.scope,
@@ -372,6 +400,7 @@ export default function DepartmentDetailPage() {
         slack_channel_id: settingsForm.slack_channel_id.trim() || null,
         discord_channel_id: settingsForm.discord_channel_id.trim() || null,
         telegram_chat_id: settingsForm.telegram_chat_id.trim() || null,
+        google_chat_space: settingsForm.google_chat_space.trim() || null,
         // Always sent: an emptied textarea clears the list.
         watched_entities: settingsForm.watched_entities
           .split("\n")
@@ -391,7 +420,7 @@ export default function DepartmentDetailPage() {
     <div className="flex flex-col h-full bg-surface">
       <main className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
-          {loading && <p className="text-fg-muted text-[15px]">Loading…</p>}
+          {loading && <PageSpinner />}
           {error && (
             <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-500 text-[15px]">
               {error}
@@ -399,8 +428,9 @@ export default function DepartmentDetailPage() {
           )}
           {dept && (
             <>
-              {/* Header */}
-              <div className="flex items-start justify-between mb-6 gap-4">
+              {/* Header. On a phone the buttons go under the mission, so the
+                  name and mission keep the full width. */}
+              <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
                 <div className="min-w-0">
                   <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-fg">{dept.config.title}</h1>
                   <div className="text-[15px] text-fg-muted mt-1.5">
@@ -436,7 +466,7 @@ export default function DepartmentDetailPage() {
               <section className="rounded-2xl border border-line bg-surface-elevated px-5 py-2 mb-8">
                 <dl className="divide-y divide-line">
                   <div className="flex flex-col sm:flex-row sm:items-baseline gap-0.5 sm:gap-4 py-3">
-                    <dt className="sm:w-40 flex-shrink-0 text-sm text-fg-muted">How it acts</dt>
+                    <dt className="sm:w-40 flex-shrink-0 text-sm text-fg-muted">Approvals</dt>
                     <dd className="min-w-0">
                       <div className="text-[15px] text-fg">
                         {AUTHORITY_META[dept.config.authority_level].label}
@@ -453,9 +483,10 @@ export default function DepartmentDetailPage() {
                       : []),
                     ...(dept.headcount != null ? [["Headcount", String(dept.headcount)]] : []),
                     ...(dept.budget_usd != null ? [["Budget", `$${dept.budget_usd.toLocaleString()}`]] : []),
-                    ...(dept.config.slack_channel_id ? [["Slack channel", dept.config.slack_channel_id]] : []),
-                    ...(dept.config.discord_channel_id ? [["Discord channel", dept.config.discord_channel_id]] : []),
-                    ...(dept.config.telegram_chat_id ? [["Telegram chat", dept.config.telegram_chat_id]] : []),
+                    ...(dept.config.slack_channel_id ? [["Slack channel", channelName("slack", dept.config.slack_channel_id)]] : []),
+                    ...(dept.config.discord_channel_id ? [["Discord channel", channelName("discord", dept.config.discord_channel_id)]] : []),
+                    ...(dept.config.telegram_chat_id ? [["Telegram group", channelName("telegram", dept.config.telegram_chat_id)]] : []),
+                    ...(dept.config.google_chat_space ? [["Google Chat space", channelName("google_chat", dept.config.google_chat_space)]] : []),
                     ...((dept.config.watched_entities ?? []).length > 0
                       ? [["Watched entities", (dept.config.watched_entities ?? []).join(", ")]]
                       : []),
@@ -629,45 +660,6 @@ export default function DepartmentDetailPage() {
                           The Executive surfaces this person as the department owner in routing decisions.
                         </span>
                       </label>
-                      <fieldset className="space-y-2">
-                        <legend className="text-sm text-fg-muted mb-1.5">How it acts</legend>
-                        {AUTHORITY_OPTS.map((a) => {
-                          const meta = AUTHORITY_META[a];
-                          const checked = settingsForm.authority_level === a;
-                          return (
-                            <label
-                              key={a}
-                              className={cls(
-                                "flex items-start gap-3 p-3.5 rounded-xl border cursor-pointer transition-colors",
-                                checked
-                                  ? "border-accent/60 bg-accent/10"
-                                  : "border-line hover:border-line-strong bg-surface-elevated"
-                              )}
-                            >
-                              <input
-                                type="radio"
-                                name="authority_level"
-                                value={a}
-                                checked={checked}
-                                onChange={() =>
-                                  setSettingsForm((f) => ({ ...f, authority_level: a }))
-                                }
-                                className="mt-1 w-4 h-4 accent-indigo-500 flex-shrink-0"
-                              />
-                              <div className="min-w-0">
-                                <div className="text-[15px] font-medium text-fg">{meta.label}</div>
-                                <div className="text-sm text-fg-muted mt-0.5">{meta.hint}</div>
-                              </div>
-                            </label>
-                          );
-                        })}
-                        <p className={HINT_CLS}>
-                          This covers the department&apos;s check-ins, scheduled messages and alerts, and what its team
-                          members ask for in chat; Operations also covers meetings people ask for. It doesn&apos;t cover
-                          what the Executive does on its own under Take the lead: Always asks first holds that.
-                        </p>
-                      </fieldset>
-
                       <CheckInPicker
                         value={settingsForm.checkIn}
                         onChange={(checkIn) => setSettingsForm((f) => ({ ...f, checkIn }))}
@@ -708,47 +700,51 @@ export default function DepartmentDetailPage() {
                   {settingsTab === "channels" && (
                     <>
                       <p className={SECTION_INTRO_CLS}>
-                        When set, the Executive can post department-scoped updates to these rooms via{" "}
-                        <code className="font-mono text-sm">send_department_message</code>. Leave blank to have OE
-                        fall back to DMing the department head.
+                        The Executive posts this department&apos;s updates in these rooms. Leave one empty and it
+                        messages the department head instead. A suggested room is only saved when you press Save.
                       </p>
-                      <div className="space-y-4">
-                        <label className={LABEL_CLS}>
-                          Slack channel ID
-                          <input
-                            type="text"
-                            value={settingsForm.slack_channel_id}
-                            onChange={(e) =>
-                              setSettingsForm((f) => ({ ...f, slack_channel_id: e.target.value }))
-                            }
-                            placeholder="C01234ABCDE"
-                            className={`${FIELD_CLS} font-mono`}
+                      <div className="space-y-5">
+                        <ChatPicker
+                          label="Slack channel"
+                          value={settingsForm.slack_channel_id}
+                          onChange={setSlackChannel}
+                          list={channelList("slack")}
+                          suggestion={channelSuggestion("slack")}
+                          rawLabel="Slack channel ID"
+                          rawPlaceholder="C01234ABCDE"
+                        />
+                        <ChatPicker
+                          label="Discord channel"
+                          value={settingsForm.discord_channel_id}
+                          onChange={setDiscordChannel}
+                          list={channelList("discord")}
+                          suggestion={channelSuggestion("discord")}
+                          unavailableText="No text channels in the bot's servers."
+                          rawLabel="Discord channel ID"
+                          rawPlaceholder="123456789012345678"
+                        />
+                        <ChatPicker
+                          label="Telegram group"
+                          value={settingsForm.telegram_chat_id}
+                          onChange={setTelegramGroup}
+                          list={channelList("telegram")}
+                          unavailableText="The bot hasn't seen any groups yet."
+                          notListedHint="Not listed? Add the bot to the group and send any message there."
+                          rawLabel="Telegram chat ID"
+                          rawPlaceholder="-1001234567890"
+                        />
+                        {(channelDirectory?.google_chat?.configured || settingsForm.google_chat_space) && (
+                          <ChatPicker
+                            label="Google Chat space"
+                            value={settingsForm.google_chat_space}
+                            onChange={setGoogleChatSpace}
+                            list={channelList("google_chat")}
+                            unavailableText="The Chat app isn't in any space yet."
+                            notListedHint="Not listed? Add the Chat app to the space."
+                            rawLabel="Google Chat space"
+                            rawPlaceholder="spaces/AAAA…"
                           />
-                        </label>
-                        <label className={LABEL_CLS}>
-                          Discord channel ID
-                          <input
-                            type="text"
-                            value={settingsForm.discord_channel_id}
-                            onChange={(e) =>
-                              setSettingsForm((f) => ({ ...f, discord_channel_id: e.target.value }))
-                            }
-                            placeholder="123456789012345678"
-                            className={`${FIELD_CLS} font-mono`}
-                          />
-                        </label>
-                        <label className={LABEL_CLS}>
-                          Telegram chat ID
-                          <input
-                            type="text"
-                            value={settingsForm.telegram_chat_id}
-                            onChange={(e) =>
-                              setSettingsForm((f) => ({ ...f, telegram_chat_id: e.target.value }))
-                            }
-                            placeholder="-1001234567890"
-                            className={`${FIELD_CLS} font-mono`}
-                          />
-                        </label>
+                        )}
                       </div>
                     </>
                   )}

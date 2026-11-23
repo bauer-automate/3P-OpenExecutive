@@ -20,12 +20,15 @@ from openexecutive.api import caller as api_caller
 from openexecutive.api.routes import (
     agents,
     alerts,
+    approvals,
     architecture,
     artifacts,
     audit,
     chat,
+    chat_directory,
     clients,
     company_profile,
+    contacts,
     decisions,
     delegation,
     departments,
@@ -38,7 +41,9 @@ from openexecutive.api.routes import (
     health,
     history,
     knowledge,
+    knowledge_questions,
     may_do,
+    memory_changes,
     notifications,
     onboarding,
     people,
@@ -47,6 +52,7 @@ from openexecutive.api.routes import (
     reflection,
     review,
     saved_tools,
+    schedule,
     scheduled,
     sessions,
     setup_status,
@@ -55,7 +61,9 @@ from openexecutive.api.routes import (
     today,
     version,
     watchlist,
+    worked_out,
     workflow_designer,
+    workflow_offers,
     workflows,
     workspace,
 )
@@ -65,6 +73,7 @@ from openexecutive.api.routes import (
 from openexecutive.integrations.google_chat import router as google_chat_router
 from openexecutive.integrations.slack_events import router as slack_events_router
 from openexecutive.integrations.telegram_bot import router as telegram_router
+from openexecutive.observability import configure_tracing
 from openexecutive.utils.deployment import is_local_login, is_public_deployment
 
 if TYPE_CHECKING:
@@ -394,6 +403,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # departments code references person IDs (FK ordering).
     from openexecutive.people.store import initialize_db as initialize_people_db
     initialize_people_db()
+    # Telegram chats the bot has seen, for the People and department pickers.
+    from openexecutive.integrations.telegram_chats import (
+        initialize_db as initialize_telegram_chats_db,
+    )
+    initialize_telegram_chats_db()
     # Replays of held roster-request messages run on this loop, whichever
     # thread resolves the request (integrations.roster_intake).
     from openexecutive.integrations.roster_intake import bind_loop
@@ -442,56 +456,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for _w in _org_warnings:
             logging.getLogger("openexecutive").warning("org-completeness: %s", _w)
 
-    from openexecutive.departments.cadence import (
-        bootstrap_cadences,
-        cancel_orphaned_cadences,
-    )
-    # Sweep first: cancel cadence actions left behind by deleted departments
-    # so they stop firing check-in alerts, then enqueue for live departments.
-    cancel_orphaned_cadences()
-    bootstrap_cadences()
-
-    if settings.nudge_scan_enabled:
-        from openexecutive.scheduler.nudge_engine import bootstrap_nudge_scan
-        bootstrap_nudge_scan()
-
-    # External-condition monitor — init the watchlist / external_signals
-    # tables, then seed the heartbeat row so the scheduler picks it up
-    # on its next tick. Same shape as nudge_scan above.
+    from openexecutive.departments.cadence import cancel_orphaned_cadences
     from openexecutive.monitoring.store import (
         initialize_db as initialize_monitoring_db,
     )
+    from openexecutive.scheduler.runner import seed_recurring_jobs
+
+    # Sweep first: cancel cadence actions left behind by deleted departments
+    # so they stop firing check-in alerts. The monitoring tables must exist
+    # before its heartbeat is seeded.
+    cancel_orphaned_cadences()
     initialize_monitoring_db()
-    if settings.external_monitor_enabled:
-        from openexecutive.monitoring.pipeline import (
-            bootstrap_external_monitor_scan,
-        )
-        bootstrap_external_monitor_scan()
-
-    # Watchlist research cron — periodic re-run gated by a state-hash
-    # check so quiet days cost nothing. Mirrors the external_monitor
-    # heartbeat above.
-    if settings.watchlist_research_enabled:
-        from openexecutive.monitoring.research.scheduler import (
-            bootstrap_watchlist_research_scan,
-        )
-        bootstrap_watchlist_research_scan()
-
-    if settings.notion_sync_enabled:
-        from openexecutive.knowledge.notion_sync import bootstrap_notion_sync_scan
-        bootstrap_notion_sync_scan()
-    if settings.drive_sync_enabled:
-        from openexecutive.knowledge.drive_sync import bootstrap_drive_sync_scan
-
-        bootstrap_drive_sync_scan()
-    if settings.onedrive_sync_enabled:
-        from openexecutive.knowledge.onedrive_sync import bootstrap_onedrive_sync_scan
-
-        bootstrap_onedrive_sync_scan()
-    if settings.confluence_sync_enabled:
-        from openexecutive.knowledge.confluence_sync import bootstrap_confluence_sync_scan
-
-        bootstrap_confluence_sync_scan()
+    # Every recurring job, from the one list a reset and the scheduler's
+    # start also use, so a job added there comes back after each of them.
+    seed_recurring_jobs()
 
     audit_logger = AuditLogger()
     app.state.audit = audit_logger
@@ -601,6 +579,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # constraint — do not run in more than one process against the same DB).
     from openexecutive.workflows.resumer import run_resumer
     resumer_task = asyncio.create_task(run_resumer())
+
+    # Browser hand-overs live in the process: a "Waiting on you" card the last
+    # one left open can't be answered any more, so it closes now.
+    from openexecutive.browser import handover as browser_handover
+
+    await asyncio.to_thread(browser_handover.close_leftover_cards)
 
     # Discord gateway bot. Embedded in the lifespan (rather than a sibling
     # service) because the bot needs direct access to the same SQLite + ChromaDB
@@ -877,7 +861,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
         description="AI-powered virtual executive team",
-        version="0.6.0",  # x-release-please-version
+        version="0.7.7",  # x-release-please-version
         lifespan=lifespan,
     )
 
@@ -978,6 +962,7 @@ def create_app() -> FastAPI:
     app.include_router(workflow_designer.router, tags=["workflows"])
     app.include_router(workflows.router, tags=["workflows"])
     app.include_router(saved_tools.router, tags=["workflows"])
+    app.include_router(workflow_offers.router, tags=["workflows"])
     app.include_router(python_jobs.router, tags=["workflows"])
     app.include_router(evals.router, tags=["evals"])
     app.include_router(episodic.router, tags=["memories"])
@@ -987,18 +972,30 @@ def create_app() -> FastAPI:
     app.include_router(decisions.router, tags=["decisions"])
     app.include_router(delegation.router, tags=["delegation"])
     app.include_router(take_the_lead.router, tags=["take-the-lead"])
+    app.include_router(approvals.router, tags=["delegation"])
     app.include_router(may_do.router, tags=["delegation"])
     app.include_router(history.router, tags=["memories"])
     app.include_router(reflection.router, tags=["memories"])
+    app.include_router(knowledge_questions.router, tags=["knowledge"])
+    app.include_router(worked_out.router, tags=["memories"])
+    app.include_router(memory_changes.router, tags=["memories"])
     app.include_router(audit.router, tags=["audit"])
     app.include_router(departments.router, tags=["departments"])
     app.include_router(people.router, tags=["people"])
+    app.include_router(contacts.router, tags=["people"])
+    app.include_router(chat_directory.router, tags=["people"])
     app.include_router(today.router, tags=["today"])
     app.include_router(scheduled.router, tags=["scheduled"])
+    app.include_router(schedule.router, tags=["schedule"])
     app.include_router(executive.router, tags=["executive"])
     app.include_router(workspace.router, tags=["workspace"])
     app.include_router(notifications.router, tags=["notifications"])
     app.include_router(watchlist.router, tags=["watchlist"])
+    # The browser extension's relay: steps the Executive takes in the
+    # person's own browser (browser.relay).
+    from openexecutive.api.routes import browser as browser_route
+
+    app.include_router(browser_route.router, tags=["browser"])
     app.include_router(google_chat_router, tags=["google-chat"])
     app.include_router(telegram_router, tags=["telegram"])
     app.include_router(slack_events_router, tags=["slack"])
@@ -1013,6 +1010,8 @@ def create_app() -> FastAPI:
     # x-api-key. Mounting also lazily creates mcp.session_manager, which the
     # lifespan runs (see above).
     mcp_server.mount(app)
+
+    configure_tracing(app)
 
     return app
 

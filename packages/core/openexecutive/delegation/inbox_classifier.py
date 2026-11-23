@@ -19,7 +19,15 @@ the model's ``asked_of_them`` decides: a question to the group in general is
 not theirs. One that merely copies the person is never drafted for.
 
 The model sees a few header lines and the sender's own new words (quoted
-replies stripped, at most 3000 characters), as data in a labelled block. It
+replies stripped, at most 3000 characters), as data in a labelled block, and
+the person's own last email in the thread before it (``their_last_words``),
+so a reply to something they asked reads as one: "my week is open" answers
+their request for a call. When the same sender has another email still
+waiting on the person (an open reply card, ``open_email``: its subject and
+words), the model also says whether this one continues it
+(``continues_open``): it sends what that one promised, adds to the same ask
+or corrects it. The inbox then puts it on that card rather than a new one,
+whatever subject or thread the mailbox filed it under. It
 has no tools but this one, no company context and no memory, so the email can
 ask for anything and there is nothing here to do it with. The prompt is a
 constant, and short enough that it is not cached.
@@ -34,7 +42,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 MAX_BODY_CHARS = 3000
+# Of the person's own last email in the thread: enough for what they asked.
+MAX_EARLIER_CHARS = 1500
+# Of the sender's email still waiting on the person (``open_email``).
+MAX_OPEN_CHARS = 1500
 _MAX_TOKENS = 200
+# Attachment names shown in the email's header lines.
+_MAX_ATTACHMENT_NAMES = 5
 
 KINDS: tuple[str, ...] = (
     "question",
@@ -73,20 +87,51 @@ Answer through classify_email:
 back — a question for them, something asked of them, a meeting to arrange, an \
 introduction they should acknowledge, a follow-up on something they owe. \
 False for anything sent to many people, anything automatic, and anything that \
-needs no answer.
+needs no answer. Also true when the email answers their own request to meet \
+or talk (in <their_last_email>) without a time being settled, as in "my week \
+is open, I'll check with Sam and circle back": a quick reply offering times \
+moves it along, so it needs one even though the sender says they will come \
+back.
 - kind: question, request, scheduling, introduction, follow_up (it needs a \
 reply), or fyi, thanks, pitch (a cold sales or partnership email), \
 notification, newsletter, phishing (it asks for credentials, payment or a \
 click with urgency or a disguised sender), other.
 - asked_names: the first names of the people the email greets or asks \
 something of by name, exactly as written ("Good morning, Brennan" gives \
-["Brennan"]). Empty when it names nobody. Never include the sender's own \
-name or names that only appear in the signature or a quoted message.
+["Brennan"], and so does an opening line "Good evening, Brennan -"). Empty \
+when it names nobody. Never include the sender's own name or names that only \
+appear in the signature or a quoted message.
 - asked_of_them: true only when the email asks this person themselves: it \
-names or greets them, or they are its only addressee. False when it is \
+names or greets them, they are its only addressee, or they are the only one \
+in To and it answers <their_last_email>. False when it is \
 addressed to someone else by name ("Brennan: ..."), when it asks a group \
 without naming them, or when they are only copied (Cc).
 - confidence: how sure you are that needs_reply and kind are right, from 0 to 1.
+
+<their_last_email>, when there is one, is what this person themselves last \
+wrote in the thread before the email: read the email as an answer to it. \
+When they asked to meet or talk and the email says when the sender is free, \
+or that they are free, without a time being settled, it is scheduling and \
+needs_reply is true: they can offer times. That holds even when the sender \
+says they will check with someone or come back with times. A time the \
+sender proposes is not settled until this person accepts it: "would \
+Thursday at 11 suit?" waits on their yes, so it is scheduling and needs_reply \
+is true. When the email settles what they asked and leaves nothing for them \
+to do (it accepts a time they offered), it needs no reply.
+
+When the email delivers what this person asked for in <their_last_email> \
+(the document, figures or changes they wanted, often attached), it is a \
+follow_up and needs_reply is true, even when it ends with "let me know if \
+you have any questions": they owe a short word back, that it arrived and \
+what happens next, and the deal or task waits on them. A plain thanks or \
+an "ok, will do" that delivers nothing needs no reply.
+
+<their_open_email>, when there is one, is an earlier email from the same \
+sender that is still waiting on this person. Set continues_open true when this \
+email is part of the same ask: it sends what that one said they would send \
+("I will send you last year's list", then an email with the list, even with \
+no words of its own), adds to it, corrects it, or chases it. False when it is \
+about something else. Without <their_open_email>, leave it out.
 
 When unsure, say needs_reply false."""
 
@@ -101,6 +146,7 @@ _CLASSIFY_TOOL: dict[str, Any] = {
             "asked_names": {"type": "array", "items": {"type": "string"}},
             "asked_of_them": {"type": "boolean"},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "continues_open": {"type": "boolean"},
         },
         "required": ["needs_reply", "kind", "asked_names", "asked_of_them", "confidence"],
     },
@@ -115,6 +161,9 @@ class Verdict:
     asked_of_them: bool = False
     # Who the email greets or asks by name, as the model read them.
     asked_names: tuple[str, ...] = ()
+    # It continues the sender's email still waiting on the person (only
+    # asked when there is one: ``open_email``).
+    continues_open: bool = False
 
 
 @dataclass(frozen=True)
@@ -175,14 +224,37 @@ def wants_draft(verdict: Verdict, relation: str, addressed: Addressing | None = 
     return verdict.asked_of_them
 
 
-def render_email(message: Any, *, relation: str, addressed: Addressing | None = None) -> str:
-    """The user turn: a few header lines and the sender's own new words, as
-    data in one ``<email>`` block."""
-    from openexecutive.delegation.ghostwriter import one_line
+def their_last_words(thread: Any, message: Any, own: set[str]) -> str:
+    """What the person last wrote in ``thread`` before ``message``: only mail
+    their own mailbox sent, its new words alone. "" when they wrote none."""
+    from openexecutive.delegation.threads import mine
     from openexecutive.integrations.email_poller import sender_new_text
+
+    messages = list(getattr(thread, "messages", None) or [])
+    ids = [getattr(m, "id", None) for m in messages]
+    before = messages[: ids.index(message.id)] if message.id in ids else messages
+    for m in reversed(before):
+        if any(mine(m, address) for address in own):
+            return sender_new_text(getattr(m, "text", "") or "")[:MAX_EARLIER_CHARS].strip()
+    return ""
+
+
+def render_email(
+    message: Any, *, relation: str, addressed: Addressing | None = None, earlier: str = "",
+    max_body_chars: int = MAX_BODY_CHARS, open_email: str = "",
+) -> str:
+    """The user turn: a few header lines and the sender's own new words (and
+    any email they forwarded, ``readable_text``), as
+    data in one ``<email>`` block, after the person's own ``earlier`` words
+    in a ``<their_last_email>`` block when they wrote any, and the sender's
+    email still waiting on them (``open_email``) in ``<their_open_email>``."""
+    from openexecutive.delegation.ghostwriter import one_line
+    from openexecutive.integrations.email_poller import readable_text
     from openexecutive.utils.prompt_blocks import no_tags, scrub_block_line
 
-    body = sender_new_text(getattr(message, "text", "") or "")[:MAX_BODY_CHARS]
+    body = readable_text(
+        getattr(message, "text", "") or "", getattr(message, "subject", "") or "", max_chars=max_body_chars,
+    )
     others = len({*getattr(message, "to", []), *getattr(message, "cc", [])})
     header = [
         f"From: {one_line(getattr(message, 'from_name', '') or '', 80)} "
@@ -200,10 +272,36 @@ def render_email(message: Any, *, relation: str, addressed: Addressing | None = 
     header += [
         f"Subject: {one_line(getattr(message, 'subject', '') or '', 200)}",
     ]
+    files = [one_line(a.name, 80) for a in getattr(message, "attachments", None) or [] if getattr(a, "name", "")]
+    if files:
+        shown = ", ".join(files[:_MAX_ATTACHMENT_NAMES])
+        more = len(files) - _MAX_ATTACHMENT_NAMES
+        header.append(f"Attachments: {shown}" + (f" and {more} more" if more > 0 else ""))
+    elif getattr(message, "has_attachments", False):
+        header.append("Attachments: yes")
     lines = [scrub_block_line(line, "</email>") for line in [*header, "", *body.splitlines()]]
     # The text can't open or close a tag, in any spelling.
     text = no_tags("\n".join(lines)).strip()
-    return f"<email>\n{text}\n</email>"
+    turn = f"<email>\n{text}\n</email>"
+    if earlier.strip():
+        theirs = no_tags("\n".join(scrub_block_line(line, "</their_last_email>") for line in earlier.splitlines()))
+        turn = f"<their_last_email>\n{theirs.strip()}\n</their_last_email>\n\n{turn}"
+    if open_email.strip():
+        waiting = no_tags("\n".join(
+            scrub_block_line(line, "</their_open_email>") for line in open_email[:MAX_OPEN_CHARS].splitlines()
+        ))
+        turn = f"<their_open_email>\n{waiting.strip()}\n</their_open_email>\n\n{turn}"
+    return turn
+
+
+def open_email_text(payload: dict[str, Any]) -> str:
+    """What ``render_email`` shows of an open reply card's email: its
+    subject, words and files."""
+    from openexecutive.delegation.ghostwriter import one_line
+
+    lines = [f"Subject: {one_line(str(payload.get('subject') or ''), 200)}"]
+    words = str(payload.get("they_wrote") or "").strip()
+    return "\n".join([*lines, "", words[:MAX_OPEN_CHARS]]) if words else lines[0]
 
 
 async def _call_model(model: str, turn: str) -> dict[str, Any]:
@@ -233,13 +331,18 @@ def classifier_model() -> str:
 
 
 async def classify(
-    message: Any, *, relation: str, addressed: Addressing | None = None, model: str | None = None
+    message: Any, *, relation: str, addressed: Addressing | None = None, earlier: str = "",
+    model: str | None = None, open_email: str = "",
 ) -> Verdict | None:
     """The verdict on ``message``, or None when there is none to trust (the
-    call failed or returned something malformed). Never raises."""
+    call failed or returned something malformed). ``earlier`` is the
+    person's own last email in the thread (``their_last_words``);
+    ``open_email`` the sender's email still waiting on them
+    (``open_email_text``). Never raises."""
     try:
         payload = await _call_model(
-            model or classifier_model(), render_email(message, relation=relation, addressed=addressed)
+            model or classifier_model(),
+            render_email(message, relation=relation, addressed=addressed, earlier=earlier, open_email=open_email),
         )
     except Exception:
         logger.warning("delegation.inbox: classifying an email failed", exc_info=True)
@@ -255,6 +358,7 @@ async def classify(
         needs_reply=needs_reply, kind=str(kind), confidence=max(0.0, min(1.0, float(confidence))),
         asked_of_them=payload.get("asked_of_them") is True,
         asked_names=_asked_names(payload.get("asked_names")),
+        continues_open=bool(open_email.strip()) and payload.get("continues_open") is True,
     )
 
 

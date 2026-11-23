@@ -15,10 +15,13 @@ stays stable. No new outbound capability is granted: approval-gate and cadence
 recipients must be rostered people (enforced by ``validate_definition``), and
 cadence delivery reuses the scheduler's existing guarded send.
 
-A workflow with action (tool-using) steps is saved **inactive**. The chat
-confirmation is a token this model holds itself, so it cannot stand in for a
-person seeing the tools; the workflow runs (or schedules) only after someone
-turns it on from its review card at ``/jobs/{name}``.
+Approvals decides the rest (``workflow_change.hands_off``). On Hands-off a
+workflow is saved switched on, straight after drafting. Below it, the
+person confirms the summary first, and a workflow with action (tool-using)
+steps is saved **inactive**: the chat confirmation is a token this model
+holds itself, so it cannot stand in for a person seeing the tools; the
+workflow runs (or schedules) only after someone turns it on from its review
+card at ``/jobs/{name}``.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from openexecutive.orchestrator import workflow_change
 from openexecutive.orchestrator.schedule_tools import current_session
 
 logger = logging.getLogger(__name__)
@@ -69,7 +73,26 @@ DEFINITION_SCHEMA: dict[str, Any] = {
                 "advisor; playbook = name of an existing playbook the step follows), "
                 "'action' {id,title,goal,tools,max_tool_calls?} (gets something done with "
                 "tools — 'tools' is the exact list of tool names the step may call, e.g. "
-                "'google_workspace__append_table_rows' or 'oe__read_file'; max_tool_calls "
+                "'google_workspace__append_table_rows' or 'oe__read_document'. The tools you "
+                "use in chat are available to steps as 'oe__<name>', e.g. "
+                "'oe__send_slack_dm', 'oe__web_search' or 'oe__run_workflow'. To email as "
+                "the user (only when they turned on As you and connected their "
+                "mailbox): 'oe__draft_email_as_me' saves a draft for them to send, "
+                "'oe__send_email_as_me' sends it as them; ask which they want, or the "
+                "Executive's own email, when it isn't clear. To read their own mail or "
+                "calendar (the same condition): 'oe__search_my_email', "
+                "'oe__read_my_email', 'oe__my_email_awaiting_reply', 'oe__my_calendar', and "
+                "'oe__answer_email_as_me' answers a thread from those the way its inbox "
+                "replies as them would. The gateway's mail and calendar tools "
+                "(google_workspace__*, microsoft_365__*) act as YOUR account, not theirs: "
+                "a calendar step with no calendar named reads your own calendar. To read "
+                "the user's, use 'oe__my_calendar', or write their email address into the "
+                "step's goal as the calendar to read; "
+                "a workflow that reads them runs only for them, reports only to them, "
+                "and can't also use web search, scripts, gateway tools or other "
+                "workflows. Write the addresses they name into the step's goal: an "
+                "email as them to those, or to them, goes without asking, and the "
+                "first to any other address waits for their approval; max_tool_calls "
                 "is optional — omit it for the default budget), "
                 "'approval_gate' {id,title,person_id,question,timeout_hours?,on_timeout?}, "
                 "or 'synthesis' {id,title,instructions?,specialist?}. "
@@ -82,7 +105,8 @@ DEFINITION_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "Optional recurrence: 'daily@HH:MM' / 'weekly@DOW@HH:MM' / "
-                "'quarterly@DD-HH:MM' (UTC). Requires cadence_person_id and no "
+                "'quarterly@DD-HH:MM', in the company's time zone as the person said "
+                "it ('9am Mondays' is 'weekly@mon@09:00', never UTC). Requires cadence_person_id and no "
                 "required input fields."
             ),
         },
@@ -102,14 +126,17 @@ DRAFT_WORKFLOW_TOOL: dict[str, Any] = {
         "Draft a new reusable executive workflow (a structured, multi-step job "
         "the user can re-run from /jobs) WITHOUT saving it. Use when the user "
         "asks you to create, build, or set up a custom workflow. Returns a "
-        "confirm_token and a summary of the plan. You MUST show the summary to "
-        "the user and get explicit confirmation, then call save_workflow with "
-        "the SAME definition and the confirm_token. Do NOT invent specialists, "
+        "confirm_token, a summary of the plan and a note. Follow the note: "
+        "usually show the summary to the user and get their confirmation, then "
+        "call save_workflow with the SAME definition and the confirm_token. Do NOT invent specialists, "
         "people, or metrics — only use the specialist roles and people the "
         "user has identified. If validation fails, the response lists exactly "
         "what to fix; re-draft and try again. A workflow with action (tool) "
-        "steps is saved switched OFF: after saving, give the user the link so "
-        "they can review its tools and turn it on."
+        "steps saves switched on when the person asked for it in their own "
+        "words in this chat; otherwise it is saved switched OFF: after saving, "
+        "give the user the link so they can review its tools and turn it on. To fix or change a saved "
+        "workflow, read it first (list_workflows with its name) and draft the "
+        "whole corrected definition under the same name."
     ),
     "input_schema": {
         "type": "object",
@@ -129,7 +156,13 @@ SAVE_WORKFLOW_TOOL: dict[str, Any] = {
         "mismatch) — re-draft if you need to change anything. On success the "
         "workflow appears in /jobs and is immediately runnable — except one "
         "with action (tool) steps, which stays off until the user reviews its "
-        "tools and turns it on at the returned deep_link."
+        "tools and turns it on at the returned deep_link. The person's own "
+        "ask is their yes for a change too. A change nobody on the team asked "
+        "for this turn to a switched-on workflow that uses tools, or one to a "
+        "workflow that reads or sends email as its creator or uses their "
+        "browser that its creator didn't ask for, changes nothing yet: it "
+        "leaves a card spelling out the change for them to approve, and it is "
+        "saved, staying on, when they tap Approve."
     ),
     "input_schema": {
         "type": "object",
@@ -163,25 +196,6 @@ def _canonical_token(definition: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 
-def _approved_tool_workflow_error(name: str, existing: Any) -> str | None:
-    """Refuse chat overwrites of a switched-on tool workflow (``existing``).
-
-    A person approved its tools. Chat (including a turn steered by an inbound
-    email) replacing it would switch it off and stage different tools under
-    the same familiar name, so edits to it happen on the Workflows page instead.
-    """
-    from openexecutive.config import get_settings
-
-    if existing is None or not existing.is_active or not _needs_review(existing):
-        return None
-    base = get_settings().ui_base_url.rstrip("/")
-    return (
-        f"{name!r} is a switched-on workflow whose tools the user approved; it "
-        "can't be replaced from chat. Pick a different name for a new "
-        f"workflow, or tell the user to edit it at {base}/jobs/new?edit={name}"
-    )
-
-
 def _session_caller_id() -> int | None:
     """The person chatting — recorded as a new workflow's owner."""
     from openexecutive.workflows.gate_delivery import session_caller_id
@@ -190,16 +204,55 @@ def _session_caller_id() -> int | None:
     return session_caller_id(session) if session is not None else None
 
 
-def _needs_review(defn: Any) -> bool:
-    """True when the workflow has tool-using steps, which a person must approve.
+def _reads_refusal(defn: Any) -> str | None:
+    """Why ``defn``, saved now by the person chatting, may not read their mail
+    as it stands (``workflow_reads.definition_refusal``), or None."""
+    from openexecutive.delegation.workflow_reads import definition_refusal
 
-    Their approval is turning the workflow on from its review card on the Workflows
-    page — a chat confirmation (a token this model holds itself) is not a
-    human seeing the tools.
-    """
+    return definition_refusal(defn, _session_caller_id())
+
+
+def _person_asked() -> bool:
+    """Whether a person on the team asked for this save in their own words
+    this turn, on a surface that verified it is them, with nothing read from
+    outside this turn (checked or not: an unflagged page can still be the
+    one asking): their ask is the yes, as it is for anything else they ask
+    for in chat (``history_chat.verified_speaker``). Fails closed. Never
+    raises."""
+    try:
+        from openexecutive.memory.history_chat import verified_speaker
+        from openexecutive.orchestrator import outside_content
+        from openexecutive.people.store import get_person
+
+        session = current_session.get()
+        caller = _session_caller_id()
+        if session is None or caller is None:
+            return False
+        person = get_person(caller)
+        if person is None or getattr(person, "kind", "team") != "team":
+            return False
+        state = outside_content.current()
+        if state is not None and (state.flags or state.sources or state.pending):
+            return False
+        return verified_speaker(session, person)
+    except Exception:
+        logger.warning("save_workflow: couldn't tell who asked — saving it off", exc_info=True)
+        return False
+
+
+def _needs_review(defn: Any) -> bool:
+    """True when the workflow has tool-using steps that nobody on the team
+    asked for this turn, below Hands-off: then a person turns it on from its
+    review card on the Workflows page. A person's own ask in chat is their
+    yes (``_person_asked``); a step that writes somewhere new (an address
+    outside the team) still asks first (``action_step.TargetPolicy``)."""
     from openexecutive.workflows.dynamic_models import ActionStepSpec
 
-    return any(isinstance(step, ActionStepSpec) for step in defn.steps)
+    if workflow_change.hands_off():
+        return False
+    if not any(isinstance(step, ActionStepSpec) for step in defn.steps):
+        return False
+    return not _person_asked()
 
 
 async def _build_def(definition: Any) -> tuple[Any, str | None]:
@@ -242,20 +295,42 @@ def _summarize(defn: Any) -> str:
     return "\n".join(lines)
 
 
+def _asked_by_its_owner(existing: Any, name: str) -> bool:
+    """Whether the person asked for this change themselves and may change
+    this workflow from chat (the account owner or its creator, in a chat
+    only they read). Someone else's workflow keeps its change card."""
+    if not _person_asked():
+        return False
+    return existing is None or workflow_change.may_read(name) is None
+
+
 async def handle_draft_workflow(tool_input: dict[str, Any]) -> str:
     from openexecutive.workflows.dynamic_store import get_definition
 
     defn, error = await _build_def(tool_input.get("definition"))
+    existing = get_definition(defn.name) if error is None else None
+    on_card = error is None and workflow_change.needs_card(existing, defn, asked=_asked_by_its_owner(existing, defn.name))
+    if on_card:
+        error = workflow_change.may_read(defn.name)
     if error is None:
-        error = _approved_tool_workflow_error(defn.name, get_definition(defn.name))
+        error = _reads_refusal(defn)
     if error is not None:
         return json.dumps({"error": error})
     token = _canonical_token(tool_input["definition"])
     note = (
-        "Show this summary to the user. After they confirm, call "
+        "Approvals is on Hands-off: save it now with save_workflow, the same "
+        "definition and this confirm_token, then tell the user what you saved."
+        if not on_card and workflow_change.hands_off()
+        else "Show this summary to the user. After they confirm, call "
         "save_workflow with the same definition and this confirm_token."
     )
-    if _needs_review(defn):
+    if on_card:
+        note += (
+            " It changes a saved workflow, so saving (overwrite=true) doesn't change it "
+            "right away: it leaves a card showing the change for them, and it is saved "
+            "when they tap Approve."
+        )
+    elif _needs_review(defn):
         note += (
             " It uses tools, so it will be saved switched OFF: tell the user "
             "that after saving they review its tools and turn it on from the "
@@ -308,9 +383,8 @@ async def handle_save_workflow(tool_input: dict[str, Any]) -> str:
         })
 
     existing = get_definition(defn.name)
-    approved_error = _approved_tool_workflow_error(defn.name, existing)
-    if approved_error is not None:
-        return json.dumps({"error": approved_error})
+    if (refused := _reads_refusal(defn)) is not None:
+        return json.dumps({"error": refused})
 
     overwrite = bool(tool_input.get("overwrite", False))
     if existing is not None and not overwrite:
@@ -320,6 +394,25 @@ async def handle_save_workflow(tool_input: dict[str, Any]) -> str:
                 "overwrite=true to replace it."
             )
         })
+    if workflow_change.needs_card(existing, defn, asked=_asked_by_its_owner(existing, defn.name)):
+        # A person approved its tools, or it sends or reads email as its
+        # creator, whom chat can't verify: the change waits on a card that
+        # spells it out, saved on their own tap (workflow_change).
+        try:
+            staged = workflow_change.stage(defn, existing)
+        except Exception:
+            logger.exception("save_workflow: couldn't leave the change card")
+            return json.dumps({"error": "Couldn't leave the card just now. Try again in a moment."})
+        if "decision_id" in staged:
+            session = current_session.get()
+            audit_log(
+                "app_action_proposed",
+                f"Left a card: change the workflow {defn.name!r}",
+                session_id=getattr(session, "session_id", None) if session is not None else None,
+                actor="executive",
+                details={"action": workflow_change.ACTION, "id": defn.name, "decision_id": staged["decision_id"]},
+            )
+        return json.dumps(staged)
 
     # A tool-using workflow waits for a person to turn it on from its review
     # card. Applied after the token check so the token still covers exactly
@@ -331,7 +424,15 @@ async def handle_save_workflow(tool_input: dict[str, Any]) -> str:
         # Conditional on the row read above, so an activation (from any
         # process) landing after the approved-workflow check can't be
         # overwritten by this save.
-        saved = save_if_unchanged(defn, existing, owner_person_id=_session_caller_id())
+        from openexecutive.workflows.approved_targets import kept_on_edit_by
+
+        # Steps changed from chat by someone other than the approver go back
+        # to the approver on the next run (a new workflow has none to keep).
+        caller_id = _session_caller_id()
+        saved = save_if_unchanged(
+            defn, existing, owner_person_id=caller_id,
+            keep_approvals=existing is None or kept_on_edit_by(defn.name, caller_id),
+        )
     except Exception as exc:
         logger.exception("save_workflow: persist failed")
         return json.dumps({"error": f"failed to save: {exc}"})
@@ -346,6 +447,7 @@ async def handle_save_workflow(tool_input: dict[str, Any]) -> str:
     stored = saved
 
     # Reconcile any cadence into the scheduler.
+    queued: int | None = None
     try:
         from openexecutive.workflows.dynamic_cadence import (
             cancel_cadence_rows,
@@ -354,7 +456,7 @@ async def handle_save_workflow(tool_input: dict[str, Any]) -> str:
 
         cancel_cadence_rows(stored.name)
         if stored.is_active and stored.cadence:
-            schedule_dynamic_workflow_cadence(stored)
+            queued = schedule_dynamic_workflow_cadence(stored)
     except Exception:
         logger.exception("save_workflow: cadence scheduling failed (non-fatal)")
 
@@ -375,10 +477,16 @@ async def handle_save_workflow(tool_input: dict[str, Any]) -> str:
 
     base = get_settings().ui_base_url.rstrip("/")
     deep_link = f"{base}/jobs/{stored.name}"
+    # First in the result, so a reply's "every Friday" is checked against
+    # what was saved (orchestrator.claim_check reads the result's start).
+    schedule = stored.cadence or "none: it runs only when started"
+    if stored.is_active and stored.cadence and queued is None:
+        schedule = f"{stored.cadence} (not queued: its first run couldn't be scheduled)"
     if not stored.is_active:
         # Tool workflows always; any other workflow only if drafted off.
         return json.dumps({
             "status": "saved_pending_review",
+            "schedule": schedule,
             "name": stored.name,
             "deep_link": deep_link,
             "note": (
@@ -387,7 +495,7 @@ async def handle_save_workflow(tool_input: dict[str, Any]) -> str:
                 "the link."
             ),
         })
-    return json.dumps({"status": "saved", "name": stored.name, "deep_link": deep_link})
+    return json.dumps({"status": "saved", "schedule": schedule, "name": stored.name, "deep_link": deep_link})
 
 
 WORKFLOW_AUTHORING_TOOLS: list[dict[str, Any]] = [

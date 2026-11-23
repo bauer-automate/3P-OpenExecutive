@@ -151,7 +151,8 @@ def test_org_block_shows_authority_level() -> None:
     dept_registry.invalidate()
     blocks = build_system_blocks()
     org_text = blocks[1]["text"]
-    assert "propose_only" in org_text or "propose only" in org_text
+    # The Approvals level each department runs at (the suite runs at Careful).
+    assert "escalate" in org_text
 
 
 def test_org_block_respects_4000_char_cap() -> None:
@@ -318,7 +319,7 @@ def test_persona_contains_departments_addendum() -> None:
     blocks = build_system_blocks()
     persona = blocks[0]["text"]
     assert "Departments & Org Coordination" in persona
-    assert "authority_level" in persona
+    assert "Approvals" in persona
 
 
 def test_org_block_includes_person_contact_channels() -> None:

@@ -99,6 +99,7 @@ def test_the_principal_sees_everyone_and_a_teammate_their_own(client: TestClient
     miss = next(m for m in everyone["misses"] if m["person_name"] == "Olivia Owner")
     assert miss["session_id"] == "s-1" and miss["tools"] == ["list_people"]
     assert miss["wanted"] == "The thing done." and miss["kind"] == "company" and miss["signals"] == ["thumbs down"]
+    assert miss["cause"] is None
     one = client.get("/memories/reflection", headers=OWNER, params={"person_id": ids["teammate"]}).json()
     assert [m["person_name"] for m in one["misses"]] == ["Ben Teammate"]
     assert one["weeks"] == [{"week": "2026-W42", "graded": 3, "misses": 1}]
@@ -153,6 +154,35 @@ def _lesson(person_id: int, session_id: str, text: str) -> int:
                                         session_id=session_id, turn_row_id=None)
     assert lesson is not None, reason
     return int(lesson["id"])
+
+
+def test_this_weeks_counts_cover_the_same_seven_days(client: TestClient, ids: dict[str, int]) -> None:
+    """Uses are kept by the day, so "learned this week" is too: today and the
+    six days before it, whatever the hour."""
+    from datetime import timedelta
+
+    today = datetime.now(UTC).date()
+    early = _lesson(ids["principal"], "s-1", "The board deck means the Q4 board workflow.")
+    old = _lesson(ids["principal"], "s-2", "The price list means the partner price list.")
+    conn = lessons._connect(None)
+    try:
+        for lesson_id, days in ((early, 6), (old, 7)):
+            day = (today - timedelta(days=days)).isoformat()
+            conn.execute(
+                f"UPDATE {lessons.TABLE} SET created_at = ? WHERE id = ?",  # noqa: S608
+                (f"{day}T00:30:00+00:00", lesson_id),
+            )
+            conn.execute(
+                f"INSERT INTO {lessons.SURFACES_TABLE} (lesson_id, surface, day, shown, graded) "  # noqa: S608
+                "VALUES (?, 'email', ?, 1, 0)",
+                (lesson_id, day),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    page: dict[str, Any] = client.get("/memories/reflection", headers=OWNER).json()
+    assert page["learned_this_week"] == 1
+    assert page["used_this_week"]["email"] == 1
 
 
 def test_lessons_are_listed_and_forgotten_like_misses(client: TestClient, ids: dict[str, int]) -> None:

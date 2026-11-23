@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from openexecutive.alerts import sse_bus
 from openexecutive.alerts.models import Alert, AlertChannel
@@ -39,53 +41,97 @@ async def dispatch_persisted(alert: Alert) -> bool:
     return True
 
 
+# The lowest severity sent to a chat app on its own; the rest wait on Home.
+_CHAT_DM_MIN_SEVERITY = "high"
+
+
 async def dispatch_slack_dm(alert: Alert) -> bool:
-    # Phase 2 — deferred. Currently a no-op; future implementation will reuse
-    # the Bolt client from integrations.slack_bot.
-    logger.info("dispatch_slack_dm: phase-2 stub, alert=%s", alert.id)
-    return False
+    """A high or urgent alert to its person's own chat app: the one it was
+    routed to, else the principal (always the principal for a private one;
+    never for a personal card, ``PERSONAL_SOURCES``, which is its person's or
+    no one's),
+    on the first of their Slack, Discord or Telegram DMs that sends
+    (``people.reach``; ``scheduler.runner.deliver_to_person``, chat apps
+    only). Not during their quiet hours, unless it is urgent and they let
+    urgent things through; it still waits on Home. The channel keeps its old
+    name, ``slack_dm``, in stored preferences."""
+    from openexecutive.alerts.models import SEVERITY_RANK
+    from openexecutive.scheduler.runner import deliver_to_person
+
+    if SEVERITY_RANK.get(str(alert.severity), 0) < SEVERITY_RANK[_CHAT_DM_MIN_SEVERITY]:
+        return False
+    try:
+        person = _alert_person(alert)
+        if person is None:
+            return False
+        if not _awake_for(person, alert):
+            logger.info("dispatch_slack_dm: alert=%s waits on Home (quiet hours)", alert.id)
+            return False
+        delivery = await deliver_to_person(person, _format_broadcast_body(alert), label="Alert", chat_only=True)
+    except Exception:
+        logger.exception("dispatch_slack_dm failed for alert=%s", alert.id)
+        return False
+    if not delivery.ok:
+        logger.info("dispatch_slack_dm: alert=%s not sent: %s", alert.id, delivery.detail)
+    return delivery.ok
+
+
+def _alert_person(alert: Alert) -> Any:
+    """Who an alert reaches outside Home: the person it was routed to, else
+    the principal (always the principal for a private one); a personal card
+    (``PERSONAL_SOURCES``) is its person's or no one's. None when no one."""
+    from openexecutive.alerts.models import PERSONAL_SOURCES, is_private_alert
+    from openexecutive.people.store import find_principal_person, get_person
+
+    person = get_person(alert.routed_to_person_id) if alert.routed_to_person_id is not None else None
+    if alert.source in PERSONAL_SOURCES and (person is None or person.archived):
+        # One person's own card goes to them or nowhere, never on to the
+        # principal (an email watch's sender and subject).
+        return None
+    if person is None or person.archived or is_private_alert(alert):
+        person = find_principal_person()
+    return person
+
+
+def _awake_for(person: Any, alert: Alert) -> bool:
+    """Whether ``person`` may be reached about ``alert`` now: not in their
+    quiet hours, unless it is urgent and they let urgent things through.
+    Otherwise it waits on Home."""
+    from openexecutive.people.channel import is_within_availability
+
+    urgent = str(alert.severity) == "urgent"
+    return bool(is_within_availability(person, now=datetime.now(UTC), quiet_hours=True, urgent=urgent))
 
 
 async def dispatch_email(alert: Alert) -> bool:
-    from openexecutive.config import get_settings
-    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+    """The alert to its person's own address (``_alert_person``), outside
+    their quiet hours like the chat DM (``_awake_for``), the way a brief
+    reaches them (``scheduler.runner.deliver_to_person``, email only),
+    with the headline as the subject and a link to the card on Home."""
+    from openexecutive.alerts.card_refs import card_url, keep_app_links
+    from openexecutive.scheduler.runner import deliver_to_person
 
-    gateway = get_active_gateway()
-    if gateway is None:
-        logger.warning("dispatch_email: MCP gateway not available — skipping")
-        return False
-
-    from openexecutive.integrations.workspace.registry import get_mail_provider
-    from openexecutive.orchestrator.mcp_gateway import _is_error_payload
-
-    settings = get_settings()
-    provider = get_mail_provider(settings)
     try:
-        subject = f"[{alert.severity.upper()}] {alert.headline}"
-        body = f"{alert.body}\n\nSuggested action: {alert.suggested_action or 'None'}"
-        # A self-send to the Executive's own mailbox, through whichever backend
-        # EMAIL_PROVIDER names; the provider spells the tool's argument shape.
-        result = await gateway.call_tool({
-            "name": provider.send_tool_name,
-            "arguments": provider.build_send_arguments(
-                mailbox=settings.exec_email_address,
-                to=settings.exec_email_address,
-                subject=subject,
-                body=body,
-            ),
-        })
-        # The send tool reports a soft failure in-band (`{"error": ...}`), so
-        # a delivery row must not claim success for mail that never left.
-        if isinstance(result, str) and _is_error_payload(result):
-            logger.warning(
-                "dispatch_email: %s reported an error for alert=%s: %s",
-                provider.send_tool_name, alert.id, result[:300],
-            )
+        person = _alert_person(alert)
+        if person is None or not person.email:
             return False
-        return True
+        if not _awake_for(person, alert):
+            logger.info("dispatch_email: alert=%s waits on Home (quiet hours)", alert.id)
+            return False
+        # The headline and body quote outside mail and pages: like a brief,
+        # only links into the app stay clickable.
+        text = keep_app_links(_format_broadcast_body(alert))
+        link = card_url(alert.id) if alert.id is not None else ""
+        if link:
+            text += f"\n\n[Open it on Home]({link})"
+        subject = f"Urgent: {alert.headline}" if str(alert.severity) == "urgent" else alert.headline
+        delivery = await deliver_to_person(person, text, label=subject, email_only=True)
     except Exception:
         logger.exception("dispatch_email failed for alert=%s", alert.id)
         return False
+    if not delivery.ok:
+        logger.info("dispatch_email: alert=%s not sent: %s", alert.id, delivery.detail)
+    return delivery.ok
 
 
 # Tags that MUST NOT broadcast — even if the triage prompt would have
@@ -243,7 +289,7 @@ async def dispatch_company_broadcast(
 
 
 # Per-channel single-arg dispatchers — used for channels that need no
-# extra routing context (web, persisted, email, the slack_dm stub).
+# extra routing context (web, persisted, email, a chat DM).
 # The two broadcast channels are dispatched separately in dispatch_all
 # because they need the department_slug / broadcast_integration kwargs.
 _SIMPLE_DISPATCHERS = {
@@ -273,6 +319,9 @@ async def dispatch_all(
     """
     attempted: list[str] = []
     delivered: list[str] = []
+    if alert.superseded_by_alert_id is not None:
+        # It joined another card (alerts.one_card): that card is what's told.
+        return attempted, delivered
     for ch in channels:
         attempted.append(ch.value)
         ok = False

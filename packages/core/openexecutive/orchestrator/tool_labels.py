@@ -25,23 +25,49 @@ from typing import Any
 
 from openexecutive.memory.drive_reads import parse_content_result
 
+# Whose mailbox a mail read is in, said one way everywhere: "my email" is the
+# Executive's own mailbox (the connected Gmail or Outlook tools below), "your
+# email" is the person's own (Act as me's reads, `activity_labels`). Every
+# search, read and attachment label for either takes its words from here, so
+# the two can never trade places.
+MY_MAIL = "my"
+YOUR_MAIL = "your"
+_MAIL_ACTIONS: dict[str, tuple[str, str]] = {
+    "search": ("Searched {} email", "Searching {} email"),
+    "read": ("Read {} email", "Reading {} email"),
+    "attachment": ("Opened an attachment in {} email", "Opening an attachment in {} email"),
+    "attachments": ("Checked attachments in {} email", "Checking attachments in {} email"),
+}
+
+
+def mail_labels(whose: str, action: str) -> tuple[str, str]:
+    """(done, doing) for a mail search, read or attachment in `whose` mailbox
+    (`MY_MAIL` or `YOUR_MAIL`)."""
+    done, doing = _MAIL_ACTIONS[action]
+    return done.format(whose), doing.format(whose)
+
+
+_MY_SEARCH = mail_labels(MY_MAIL, "search")
+_MY_READ = mail_labels(MY_MAIL, "read")
+_MY_ATTACHMENT = mail_labels(MY_MAIL, "attachment")
+
 # Underlying tool name (without its `server__` prefix, hyphens folded to
 # underscores) -> (done, doing). `doing` carries no ellipsis; the progress line
 # adds it. Google Workspace and Microsoft 365 names share the table: the two
 # servers do not reuse a name for different things.
 _LABELS: dict[str, tuple[str, str]] = {
-    # Mail
-    "search_gmail_messages": ("Searched your mail", "Searching your mail"),
-    "list_mail_messages": ("Searched your mail", "Searching your mail"),
-    "list_mail_folder_messages": ("Searched your mail", "Searching your mail"),
-    "get_gmail_message_content": ("Read an email", "Reading an email"),
-    "get_gmail_messages_content_batch": ("Read an email", "Reading an email"),
-    "get_gmail_thread_content": ("Read an email", "Reading an email"),
-    "get_gmail_threads_content_batch": ("Read an email", "Reading an email"),
-    "get_mail_message": ("Read an email", "Reading an email"),
-    "get_gmail_attachment_content": ("Opened an attachment", "Opening an attachment"),
-    "get_mail_attachment": ("Opened an attachment", "Opening an attachment"),
-    "list_mail_attachments": ("Checked attachments", "Checking attachments"),
+    # Mail. These connected tools are the Executive's own mailbox: "my email".
+    "search_gmail_messages": _MY_SEARCH,
+    "list_mail_messages": _MY_SEARCH,
+    "list_mail_folder_messages": _MY_SEARCH,
+    "get_gmail_message_content": _MY_READ,
+    "get_gmail_messages_content_batch": _MY_READ,
+    "get_gmail_thread_content": _MY_READ,
+    "get_gmail_threads_content_batch": _MY_READ,
+    "get_mail_message": _MY_READ,
+    "get_gmail_attachment_content": _MY_ATTACHMENT,
+    "get_mail_attachment": _MY_ATTACHMENT,
+    "list_mail_attachments": mail_labels(MY_MAIL, "attachments"),
     "draft_gmail_message": ("Drafted an email", "Drafting an email"),
     "create_draft_email": ("Drafted an email", "Drafting an email"),
     "create_reply_draft": ("Drafted a reply", "Drafting a reply"),
@@ -57,7 +83,7 @@ _LABELS: dict[str, tuple[str, str]] = {
     "update_mail_message": ("Updated an email", "Updating an email"),
     "delete_mail_message": ("Deleted an email", "Deleting an email"),
     "modify_gmail_message_labels": ("Labeled an email", "Labeling an email"),
-    "list_gmail_labels": ("Checked your mail labels", "Checking your mail labels"),
+    "list_gmail_labels": ("Checked my email folders", "Checking my email folders"),
     # Files
     "search_drive_files": ("Searched Drive", "Searching Drive"),
     "list_drive_items": ("Searched Drive", "Searching Drive"),
@@ -73,27 +99,27 @@ _LABELS: dict[str, tuple[str, str]] = {
     "move_rename_onedrive_item": ("Moved a file", "Moving a file"),
     "share_drive_item": ("Shared a file", "Sharing a file"),
     # Docs and sheets
-    "search_docs": ("Searched your docs", "Searching your docs"),
+    "search_docs": ("Searched my docs", "Searching my docs"),
     "get_doc_content": ("Read a doc", "Reading a doc"),
     "create_doc": ("Created a doc", "Creating a doc"),
     "modify_doc_text": ("Edited a doc", "Editing a doc"),
     "read_sheet_values": ("Read a spreadsheet", "Reading a spreadsheet"),
     "get_spreadsheet_info": ("Read a spreadsheet", "Reading a spreadsheet"),
-    "list_spreadsheets": ("Searched your spreadsheets", "Searching your spreadsheets"),
+    "list_spreadsheets": ("Searched my spreadsheets", "Searching my spreadsheets"),
     "modify_sheet_values": ("Updated a spreadsheet", "Updating a spreadsheet"),
     "create_spreadsheet": ("Created a spreadsheet", "Creating a spreadsheet"),
     # Calendar
-    "list_calendars": ("Checked your calendar", "Checking your calendar"),
-    "get_events": ("Checked your calendar", "Checking your calendar"),
-    "list_calendar_events": ("Checked your calendar", "Checking your calendar"),
-    "get_calendar_event": ("Checked your calendar", "Checking your calendar"),
-    "get_calendar_view": ("Checked your calendar", "Checking your calendar"),
+    "list_calendars": ("Checked my calendar", "Checking my calendar"),
+    "get_events": ("Checked my calendar", "Checking my calendar"),
+    "list_calendar_events": ("Checked my calendar", "Checking my calendar"),
+    "get_calendar_event": ("Checked my calendar", "Checking my calendar"),
+    "get_calendar_view": ("Checked my calendar", "Checking my calendar"),
     "query_freebusy": ("Checked availability", "Checking availability"),
     "find_meeting_times": ("Checked availability", "Checking availability"),
-    "manage_event": ("Updated your calendar", "Updating your calendar"),
-    "create_calendar_event": ("Updated your calendar", "Updating your calendar"),
-    "update_calendar_event": ("Updated your calendar", "Updating your calendar"),
-    "update_specific_calendar_event": ("Updated your calendar", "Updating your calendar"),
+    "manage_event": ("Updated my calendar", "Updating my calendar"),
+    "create_calendar_event": ("Updated my calendar", "Updating my calendar"),
+    "update_calendar_event": ("Updated my calendar", "Updating my calendar"),
+    "update_specific_calendar_event": ("Updated my calendar", "Updating my calendar"),
     "delete_calendar_event": ("Removed a calendar event", "Removing a calendar event"),
     "accept_calendar_event": ("Answered an invite", "Answering an invite"),
     "decline_calendar_event": ("Answered an invite", "Answering an invite"),
@@ -136,6 +162,22 @@ _VERBS: dict[str, tuple[str, str]] = {
     "copy": ("Copied", "Copying"),
 }
 
+# A mail search that looks only at sent mail says so: "my email" would hide
+# that it is checking what was sent.
+_MAIL_SEARCHES = frozenset({
+    "search_gmail_messages", "list_mail_messages", "list_mail_folder_messages",
+})
+_SENT_LABELS = ("Checked email I sent", "Checking email I sent")
+# Gmail's sent operators, and Microsoft 365's Sent Items folder by name.
+_SENT_RE = re.compile(r"(?<![\w-])(?:in:sent|label:sent|from:me)(?=[\s)]|$)|^sent ?items$", re.IGNORECASE)
+# A query that also reaches other mail ("in:sent OR in:inbox", "{…}", a
+# "NOT", another folder or label, or excluding sent) stays
+# "my email": a wrong "email I sent" is worse than the plain line.
+_ANY_OF_RE = re.compile(
+    r"\sOR\s|\bNOT\b|[{}]|(?<![\w-])(?:in|label):(?!sent(?=[\s)]|$))|(?<![\w])-(?:in|label):sent",
+    re.IGNORECASE,
+)
+
 GENERIC_DONE = "Used a connected tool"
 GENERIC_DOING = "Using a connected tool"
 
@@ -174,12 +216,30 @@ def _clean(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _searches_sent(arguments: Any) -> bool:
+    """Whether a mail search's arguments limit it to sent mail."""
+    if not isinstance(arguments, dict):
+        return False
+    texts = [value for value in arguments.values() if isinstance(value, str)]
+    if any(_ANY_OF_RE.search(text) for text in texts):
+        return False
+    # A folder argument that names another folder ("Inbox") reaches other mail.
+    for key, value in arguments.items():
+        if (
+            isinstance(value, str) and "folder" in key.lower() and value.strip()
+            and not _SENT_RE.search(value.strip())
+        ):
+            return False
+    return any(_SENT_RE.search(text.strip()) for text in texts)
+
+
 def labels_for(raw_name: Any, arguments: Any = None) -> tuple[str, str]:
     """(done, doing) phrases for an MCP tool name. Never returns the raw name.
 
     `arguments` matters only for a tool whose action depends on them, such
     as Google's `manage_event`, which also deletes: a deletion must not read
-    as "Updated your calendar".
+    as "Updated my calendar". A mail search limited to sent mail reads as
+    "Checking email I sent".
     """
     if not isinstance(raw_name, str) or not raw_name.strip():
         return GENERIC_DONE, GENERIC_DOING
@@ -190,6 +250,8 @@ def labels_for(raw_name: Any, arguments: Any = None) -> tuple[str, str]:
         and str(arguments.get("action", "")).lower() == "delete"
     ):
         return _LABELS["delete_calendar_event"]
+    if tool in _MAIL_SEARCHES and _searches_sent(arguments):
+        return _SENT_LABELS
     if tool in _LABELS:
         return _LABELS[tool]
     words = [w for w in tool.split("_") if w]

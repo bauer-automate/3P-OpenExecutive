@@ -1,9 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
-import OverflowMenu from "@/components/ui/OverflowMenu";
+import Icon from "@/components/Icon";
+import Button from "@/components/ui/Button";
+import SectionTabs, { sectionPanelProps } from "@/components/ui/SectionTabs";
 import {
   forgetReflectionLesson,
   forgetReflectionMiss,
@@ -12,47 +14,70 @@ import {
   type ReflectionMiss,
   type ReflectionReplay,
   type ReflectionState,
-  type ReflectionWeek,
 } from "@/lib/api";
-import { EmptyState, formatDate } from "./shared";
+import { DeferredForget, learningStats, nowRight, toggleAll, unhelpfulLessonIds } from "@/lib/learning";
 
-// Reflection — what it got wrong. After a chat goes quiet, the conversation
+import { EmptyState, STAT_VALUE_TONE, formatDate, formatRunAt, type StatTone } from "./shared";
+import { PageSpinner } from "@/components/ui/Spinner";
+
+// Learning (the Reflection screen). After a chat goes quiet, the conversation
 // review grades each turn from the person's own words, the reply and the
 // signals the product recorded (a 👎, a stopped reply, a turn taken back, a
-// claim no tool backed, a failed tool). The misses land here with what the
-// person wanted instead, so the owner can see where the Executive falls
-// short in this workspace. Each person sees their own; the owner also the ones
-// from channels and group chats (never a teammate's own chat).
-// Below the misses, what it learned from them: one-line lessons in the
-// person's own words that reach later turns, with how those turns went.
-// A lesson that doesn't help retires on its own; Forget retires it by hand.
-// At night the Executive replays the misses with today's lessons, in a dry
-// run nobody receives, and a judge says whether each would now go right:
-// that is the number at the top, and the pill on each miss.
+// claim no tool backed, a failed tool). From what fell short it keeps
+// one-line lessons in the person's own words that reach later turns, and at
+// night it replays the misses with today's lessons, in a dry run nobody
+// receives, where a judge says whether each would now go right.
+// This screen shows only what came of that: the lessons in use, with how many
+// chats they reached, and the misses the nightly recheck now gets right. What
+// fell short is never listed or counted here; it feeds the lessons and the
+// recheck. Each person sees their own; the owner also the ones from channels
+// and group chats (never a teammate's own chat).
+// A lesson that doesn't help retires on its own; Stop saying retires it by
+// hand. Several rows can be cleared at once, and clearing waits a few
+// seconds for Undo before it is sent, since a forgotten row is deleted.
 // Nothing here notifies anyone: it is a record, opened on purpose.
 
-const EMPTY =
-  "Nothing yet. After a chat goes quiet, the Executive grades its own answers; the ones that fell short show up here.";
+type View = "lessons" | "misses";
 
-const KIND_LABEL: Record<ReflectionMiss["kind"], string> = {
-  company: "Something to learn",
-  product: "Couldn't do it",
+const EMPTY_LESSONS = "No lessons yet. After a chat goes quiet, I look back at it and keep what I learn here.";
+const EMPTY_FIXED = "Nothing here yet. When a nightly recheck shows I now get something right, it shows here.";
+
+const RETIRED_LABEL: Record<NonNullable<ReflectionLesson["retired_reason"]>, string> = {
+  unhelpful: "stopped: the chats it reached went worse",
+  forgotten: "stopped: forgotten",
+  room: "stopped: made room for newer ones",
+  replay: "stopped: replaying showed it didn't help",
 };
 
-const KIND_PILL: Record<ReflectionMiss["kind"], string> = {
-  company: "bg-amber-500/15 text-amber-500 border-amber-500/30",
-  product: "bg-sky-500/15 text-sky-500 border-sky-500/30",
-};
+/** How long a forget waits for Undo before it is sent. */
+const UNDO_MS = 6000;
 
-/** "W42" from "2026-W42". */
-function weekLabel(week: string): string {
-  const i = week.indexOf("-W");
-  return i >= 0 ? `W${week.slice(i + 2)}` : week;
+/** One forgotten row, waiting for Undo. */
+interface Forget {
+  view: View;
+  id: number;
+}
+
+const keyOf = (f: Forget) => `${f.view === "misses" ? "m" : "l"}:${f.id}`;
+
+function sendForget(f: Forget, keepalive: boolean): Promise<void> {
+  return f.view === "misses" ? forgetReflectionMiss(f.id, { keepalive }) : forgetReflectionLesson(f.id, { keepalive });
 }
 
 export default function ReflectionTab() {
   const [state, setState] = useState<ReflectionState | null | undefined>(undefined);
   const [failed, setFailed] = useState(false);
+  const [view, setView] = useState<View>("lessons");
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [open, setOpen] = useState<Set<number>>(new Set());
+  const [showRetired, setShowRetired] = useState(false);
+  // Forgotten here but not yet sent ("m:<id>" / "l:<id>"), and the toast.
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+  const [toast, setToast] = useState<string | null>(null);
+  const [queue] = useState(() => new DeferredForget<Forget>(sendForget, UNDO_MS));
+  // A forget sent after leaving the screen (unmount, page close) reports nothing.
+  const mounted = useRef(true);
+  const tabsId = useId();
 
   const refresh = useCallback(async () => {
     try {
@@ -67,319 +92,498 @@ export default function ReflectionTab() {
     void refresh();
   }, [refresh]);
 
-  const handleForget = useCallback(
-    async (miss: ReflectionMiss) => {
-      if (!window.confirm(`Forget this one?\n\n${miss.message}`)) return;
-      try {
-        await forgetReflectionMiss(miss.id);
-      } catch {
-        window.alert("Failed to forget.");
-        return;
-      }
-      void refresh();
-    },
-    [refresh],
-  );
+  // Leaving the screen sends what is waiting rather than dropping it: on
+  // unmount, and when the tab closes or reloads (keepalive, since the page
+  // is going away and nothing will read the answer).
+  useEffect(() => {
+    mounted.current = true;
+    const onPageHide = () => void queue.flush({ keepalive: true });
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      mounted.current = false;
+      void queue.flush();
+    };
+  }, [queue]);
 
-  const handleForgetLesson = useCallback(
-    async (lesson: ReflectionLesson) => {
-      if (!window.confirm(`Stop saying this?\n\n${lesson.text}`)) return;
-      try {
-        await forgetReflectionLesson(lesson.id);
-      } catch {
-        window.alert("Failed to forget.");
-        return;
-      }
-      void refresh();
-    },
-    [refresh],
-  );
+  const pick = useCallback((next: View) => {
+    setView(next);
+    setSelected(new Set());
+    setOpen(new Set());
+  }, []);
 
-  if (failed) return <EmptyState message="This is unavailable right now." />;
-  if (state === undefined) return <div className="text-fg-muted text-[15px] py-4">Loading…</div>;
+  const forgetSelected = useCallback(() => {
+    if (selected.size === 0) return;
+    const items = [...selected].map((id) => ({ view, id }));
+    setHidden((h) => new Set([...h, ...items.map(keyOf)]));
+    setSelected(new Set());
+    const n = items.length;
+    setToast(view === "misses" ? `Forgot ${n}.` : `Stopped saying ${n === 1 ? "it" : n}.`);
+    queue.hold(items, (sent, failedSends) => {
+      if (!mounted.current) return;
+      // Drop the toast unless a newer forget is waiting, then reload.
+      setToast((t) => (queue.waiting.length ? t : null));
+      if (failedSends > 0) window.alert("Some of them couldn't be forgotten.");
+      void refresh().then(() => {
+        const done = new Set(sent.map(keyOf));
+        setHidden((h) => new Set([...h].filter((k) => !done.has(k))));
+      });
+    });
+  }, [queue, refresh, selected, view]);
+
+  const undo = useCallback(() => {
+    const back = new Set(queue.undo().map(keyOf));
+    setHidden((h) => new Set([...h].filter((k) => !back.has(k))));
+    setToast(null);
+  }, [queue]);
+
+  if (failed) return <Card><EmptyState message="This is unavailable right now." /></Card>;
+  if (state === undefined) return <PageSpinner />;
   if (state === null) {
     return (
-      <EmptyState message="There is nothing for you here. It's kept for people on the People list, once they're signed in." />
+      <Card>
+        <EmptyState message="There is nothing for you here. It's kept for people on the People list, once they're signed in." />
+      </Card>
     );
   }
 
-  const { misses, lessons, weeks, replay, sees_everyone: seesEveryone } = state;
-  const company = misses.filter((m) => m.kind === "company");
-  const product = misses.filter((m) => m.kind === "product");
+  const { replay, sees_everyone: seesEveryone } = state;
+  const misses = nowRight(state.misses.filter((m) => !hidden.has(`m:${m.id}`)));
+  const lessons = state.lessons.filter((l) => !hidden.has(`l:${l.id}`));
   const live = lessons.filter((l) => l.retired_at === null);
   const retired = lessons.filter((l) => l.retired_at !== null);
+  const shownIds = view === "misses" ? misses.map((m) => m.id) : live.map((l) => l.id);
+  const quick = view === "misses" ? [] : unhelpfulLessonIds(live);
+  const allSelected = shownIds.length > 0 && shownIds.every((id) => selected.has(id));
+  const toggle = (id: number) =>
+    setSelected((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const toggleOpen = (id: number) =>
+    setOpen((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   return (
-    <div className="space-y-4 py-3">
-      <Trend weeks={weeks} />
-      <WouldGoRight replay={replay} />
-      {misses.length === 0 ? (
-        <EmptyState message={EMPTY} />
-      ) : (
-        <p className="text-sm text-fg-muted">
-          {seesEveryone ? "Your chats and the shared ones, newest first." : "Your chats, newest first."} Each one links to the
-          conversation. Forget one to drop it from this record.
-        </p>
-      )}
-      {company.length > 0 && (
-        <Group
-          title="Something to learn"
-          blurb="A term, a fact, a preference or the right specialist would have fixed these."
-          misses={company}
-          seesEveryone={seesEveryone}
-          onForget={handleForget}
-        />
-      )}
-      {product.length > 0 && (
-        <Group
-          title="Couldn't do it"
-          blurb="A tool failed, or it was asked for something it can't do yet."
-          misses={product}
-          seesEveryone={seesEveryone}
-          onForget={handleForget}
-        />
-      )}
-      {lessons.length > 0 && (
-        <section>
-          <div className="text-base font-semibold text-fg">What it learned</div>
-          <p className="text-sm text-fg-muted mb-1">
-            One line each, in your own words, from the misses above. It reads them on your later chats about
-            the same thing, and keeps count of how those went. One that doesn&apos;t help stops on its own.
-            {seesEveryone && " A lesson you taught it in a channel or group chat reaches everyone's chats."}
-          </p>
-          <div className="divide-y divide-line">
-            {live.map((l) => (
-              <LessonRow key={l.id} lesson={l} seesEveryone={seesEveryone} onForget={() => handleForgetLesson(l)} />
-            ))}
-          </div>
-          {retired.length > 0 && (
-            <details className="mt-2">
-              <summary className="cursor-pointer text-sm text-fg-muted min-h-[40px] flex items-center">
-                Stopped saying it ({retired.length})
-              </summary>
-              <div className="divide-y divide-line">
-                {retired.map((l) => (
-                  <LessonRow key={l.id} lesson={l} seesEveryone={seesEveryone} />
+    <div className="space-y-5">
+      <GettingBetter lessons={lessons} misses={misses} replay={replay} />
+
+      <SectionTabs<View>
+        label="Show"
+        idBase={tabsId}
+        active={view}
+        onChange={pick}
+        tabs={[
+          { id: "lessons", label: "What I learned", count: live.length },
+          { id: "misses", label: "Now gets right", count: misses.length },
+        ]}
+      />
+
+      <Card {...sectionPanelProps(tabsId, view)}>
+        {shownIds.length === 0 && (view === "misses" || retired.length === 0) ? (
+          <EmptyState message={view === "misses" ? EMPTY_FIXED : EMPTY_LESSONS} />
+        ) : (
+          <>
+            {shownIds.length > 0 && (
+              <div className="flex items-center justify-between gap-3 py-1.5 border-b border-line">
+                <label className="flex items-center gap-3 min-h-[44px] text-sm text-fg-muted cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    onChange={() => setSelected((s) => toggleAll(s, shownIds))}
+                    className="h-[18px] w-[18px] accent-accent-strong"
+                  />
+                  Select all
+                </label>
+                {quick.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setSelected(new Set(quick))}
+                    className="min-h-[40px] text-sm font-semibold text-accent hover:underline"
+                  >
+                    {`Select the ${quick.length} not helping`}
+                  </button>
+                )}
+              </div>
+            )}
+            {view === "misses" && (
+              <div className="pb-2">
+                {misses.map((m, i) => (
+                  <FixedRow
+                    key={m.id}
+                    miss={m}
+                    first={i === 0}
+                    seesEveryone={seesEveryone}
+                    selected={selected.has(m.id)}
+                    onToggle={() => toggle(m.id)}
+                    expanded={open.has(m.id)}
+                    onExpand={() => toggleOpen(m.id)}
+                  />
                 ))}
               </div>
-            </details>
+            )}
+            {view === "lessons" && (
+              <div className="pb-2">
+                {live.length > 0 && seesEveryone && (
+                  <p className="text-sm text-fg-muted pt-3">
+                    Each lesson applies only to the chats of the person it came from.
+                  </p>
+                )}
+                {live.map((l, i) => (
+                  <LessonRow
+                    key={l.id}
+                    lesson={l}
+                    first={i === 0}
+                    seesEveryone={seesEveryone}
+                    selected={selected.has(l.id)}
+                    onToggle={() => toggle(l.id)}
+                    expanded={open.has(l.id)}
+                    onExpand={() => toggleOpen(l.id)}
+                  />
+                ))}
+                {retired.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setShowRetired((v) => !v)}
+                      aria-expanded={showRetired}
+                      className="mt-1 min-h-[44px] text-sm text-fg-muted hover:text-fg"
+                    >
+                      {showRetired ? "Hide stopped lessons" : `Show ${retired.length} stopped`}
+                    </button>
+                    {showRetired && (
+                      <div>
+                        <GroupHeading title="Stopped saying it" count={retired.length} />
+                        {retired.map((l, i) => (
+                          <LessonRow
+                            key={l.id}
+                            lesson={l}
+                            first={i === 0}
+                            seesEveryone={seesEveryone}
+                            expanded={open.has(l.id)}
+                            onExpand={() => toggleOpen(l.id)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </Card>
+
+      {(selected.size > 0 || toast) && (
+        <div className="sticky bottom-4 z-10 flex flex-col items-start gap-2">
+          {toast && (
+            <div
+              role="status"
+              className="flex max-w-full items-center gap-2 rounded-2xl border border-line-strong bg-surface-overlay py-1.5 pl-5 pr-1.5 shadow-lg"
+            >
+              <span className="text-sm text-fg">{toast}</span>
+              <Button variant="ghost" size="sm" className="!text-accent" onClick={undo}>
+                Undo
+              </Button>
+            </div>
           )}
-        </section>
+          {selected.size > 0 && (
+            <div
+              role="region"
+              aria-label="Selection"
+              className="flex w-full items-center gap-2 rounded-2xl border border-line-strong bg-surface-overlay py-2 pl-5 pr-2 shadow-lg"
+            >
+              <span className="flex-1 text-[15px] font-semibold text-fg">{selected.size} selected</span>
+              <Button variant="ghost" size="sm" onClick={() => setSelected(new Set())}>
+                Cancel
+              </Button>
+              <Button variant="danger" size="sm" onClick={forgetSelected}>
+                {view === "misses" ? `Forget ${selected.size}` : `Stop saying ${selected.size}`}
+              </Button>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
 }
 
-const RETIRED_LABEL: Record<NonNullable<ReflectionLesson["retired_reason"]>, string> = {
-  unhelpful: "stopped: the chats it reached went worse, not better",
-  forgotten: "stopped: forgotten",
-  room: "stopped: made room for newer ones",
-  replay: "stopped: replaying the chats showed it didn't help",
-};
-
-/** "Of the N things that went wrong in the last 30 days, M would go right today." */
-function WouldGoRight({ replay }: { replay: ReflectionReplay }) {
-  if (replay.misses === 0) return null;
-  const ran = replay.last_run_at !== null;
+function Card({ children, ...rest }: { children: React.ReactNode } & React.HTMLAttributes<HTMLDivElement>) {
   return (
-    <section className="rounded-xl border border-line bg-surface-panel px-4 py-3">
-      <div className="text-lg font-semibold text-fg">
-        {replay.would_pass} <span className="text-base font-semibold text-fg-muted">of {replay.misses}</span>
+    <div {...rest} className="rounded-2xl border border-line bg-surface-elevated px-4 sm:px-5 py-1">
+      {children}
+    </div>
+  );
+}
+
+function GroupHeading({ title, count }: { title: string; count: number }) {
+  return (
+    <h3 className="flex items-baseline gap-2 pt-5 pb-1 text-base font-semibold text-fg">
+      {title}
+      <span className="text-sm font-normal text-fg-subtle tabular-nums">{count}</span>
+    </h3>
+  );
+}
+
+const STEPS: { title: string; body: string; when?: string }[] = [
+  {
+    title: "You chat",
+    body: "On the web, your phone or a chat app. Every chat counts. It notices when you correct it or ask again.",
+  },
+  {
+    title: "It looks back",
+    body: "Once the chat goes quiet, it checks each answer. It finishes anything left undone and notes what it could do better.",
+    when: "30 min after",
+  },
+  {
+    title: "It keeps a lesson",
+    body: "One line in your own words. It reads it the next time you ask about the same thing.",
+    when: "Same pass",
+  },
+  {
+    title: "It checks itself",
+    body: "Each night it reruns those answers with what it has learned, in a dry run nobody receives. A lesson that doesn't help is dropped.",
+    when: "Every night",
+  },
+];
+
+/** What came of the learning so far, with the four steps of how it learns behind a link. */
+function GettingBetter({
+  lessons,
+  misses,
+  replay,
+}: {
+  lessons: ReflectionLesson[];
+  misses: ReflectionMiss[];
+  replay: ReflectionReplay;
+}) {
+  const [how, setHow] = useState(false);
+  const stats = learningStats(lessons, misses);
+  const lastRun = replay.last_run_at ? formatRunAt(replay.last_run_at).absolute : null;
+  const numbers: { value: string; label: string; tone: StatTone }[] = [
+    { value: String(stats.lessons), label: stats.lessons === 1 ? "lesson in use" : "lessons in use", tone: "accent" },
+    { value: String(stats.uses), label: stats.uses === 1 ? "time used in a chat" : "times used in chats", tone: "default" },
+    {
+      value: String(stats.nowRight),
+      label: stats.nowRight === 1 ? "thing I now get right" : "things I now get right",
+      tone: stats.nowRight > 0 ? "emerald" : "default",
+    },
+  ];
+  return (
+    <section aria-labelledby="learning-getting-better" className="rounded-2xl border border-line bg-surface-elevated p-4 sm:p-6">
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <h2 id="learning-getting-better" className="text-lg font-semibold text-fg">
+          Getting better
+        </h2>
+        <button
+          type="button"
+          onClick={() => setHow((v) => !v)}
+          aria-expanded={how}
+          className="inline-flex h-10 items-center gap-1 rounded-xl px-2 -mr-2 text-sm font-semibold text-accent hover:bg-surface-overlay transition-colors"
+        >
+          How I learn
+          <Icon name="chevron-right" size="w-4 h-4" className={how ? "rotate-90" : ""} />
+        </button>
       </div>
-      <div className="text-sm text-fg-muted">
-        {ran
-          ? "of the things that went wrong in the last 30 days would go right today."
-          : "of the things that went wrong in the last 30 days have been replayed so far; the first replay runs tonight."}
-        {replay.evidence > 0 &&
-          ` ${replay.evidence} ${replay.evidence === 1 ? "depends" : "depend"} on what that day's calendar or inbox held, so ${replay.evidence === 1 ? "it is" : "they are"} kept as evidence only.`}
-      </div>
-      <div className="text-xs text-fg-muted mt-1">
-        Each night it replays the misses with everything it has learned since, in a dry run nobody receives, and
-        a judge says whether each would now go right.
-        {ran && ` Last replayed ${formatDate(replay.last_run_at as string)}.`}
-      </div>
+      <dl className="grid grid-cols-3 gap-4 sm:gap-6">
+        {numbers.map((n) => (
+          <div key={n.label} className="min-w-0 flex flex-col-reverse">
+            <dt className="text-sm text-fg-muted mt-1">{n.label}</dt>
+            <dd className={`text-2xl sm:text-3xl font-bold tabular-nums leading-tight ${STAT_VALUE_TONE[n.tone]}`}>
+              {n.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      {how && (
+        <div className="mt-5 border-t border-line pt-5">
+          <ol className="grid grid-cols-1 lg:grid-cols-4 gap-3">
+            {STEPS.map((step, i) => (
+              <li
+                key={step.title}
+                className="rounded-xl border border-line bg-surface p-4 grid grid-cols-[2.25rem_1fr] lg:block gap-x-3"
+              >
+                <div className="h-8 w-8 rounded-full bg-accent/15 text-accent font-bold flex items-center justify-center lg:mb-3">
+                  {i + 1}
+                </div>
+                <div>
+                  <div className="text-base font-semibold text-fg">{step.title}</div>
+                  <p className="text-sm text-fg-muted mt-1">{step.body}</p>
+                  {step.when && (
+                    <span className="inline-block mt-2 rounded-full bg-accent/15 px-2.5 py-0.5 text-xs font-semibold text-accent">
+                      {step.when}
+                    </span>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ol>
+          <p className="text-sm text-fg-muted mt-3">
+            Chats that read your mail are looked at for you alone.
+            {lastRun ? ` Last checked ${lastRun}.` : " The first nightly check hasn't run yet."}
+          </p>
+        </div>
+      )}
     </section>
   );
 }
 
-const REPLAY_PILL: Record<ReflectionMiss["replay_state"], string> = {
-  open: "bg-surface-input/60 text-fg-muted",
-  closed: "bg-emerald-500/15 text-emerald-500",
-  evidence: "bg-surface-input/60 text-fg-muted",
-};
+/** One selectable row: a checkbox, then the line and its meta, which open the detail. */
+function Row({
+  first,
+  title,
+  meta,
+  selected,
+  onToggle,
+  expanded,
+  onExpand,
+  children,
+}: {
+  first: boolean;
+  title: string;
+  meta: React.ReactNode;
+  selected?: boolean;
+  onToggle?: () => void;
+  expanded: boolean;
+  onExpand: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={first ? "" : "border-t border-line"}>
+      <div className="flex items-start gap-3">
+        {onToggle ? (
+          <label className="flex min-h-[44px] flex-none cursor-pointer items-start pt-[15px]">
+            <input
+              type="checkbox"
+              checked={!!selected}
+              onChange={onToggle}
+              aria-label={`Select: ${title}`}
+              className="h-[18px] w-[18px] accent-accent-strong"
+            />
+          </label>
+        ) : (
+          <span className="w-[18px] flex-none" />
+        )}
+        <button
+          type="button"
+          onClick={onExpand}
+          aria-expanded={expanded}
+          className="flex min-w-0 flex-1 flex-col gap-1 py-3.5 text-left"
+        >
+          <span className="text-[15px] font-medium leading-snug text-fg">{title}</span>
+          <span className="text-sm text-fg-muted">{meta}</span>
+        </button>
+      </div>
+      {expanded && <div className="ml-[30px] -mt-1 pb-3.5 space-y-1 text-sm text-fg-muted">{children}</div>}
+    </div>
+  );
+}
 
-/** The miss's last replay: still wrong, would go right now, or evidence only. */
-function replayLabel(miss: ReflectionMiss): string | null {
-  if (miss.replay_state === "closed" && miss.closed_at) return `Would go right today (since ${formatDate(miss.closed_at)})`;
-  if (miss.replay_state === "evidence") return "Can't be replayed: depends on that day";
-  if (miss.replayed_at) return `Still goes wrong (replayed ${formatDate(miss.replayed_at)})`;
-  return null;
+/** A miss the nightly recheck now gets right: what was asked, and since when. */
+function FixedRow({
+  miss,
+  first,
+  seesEveryone,
+  selected,
+  onToggle,
+  expanded,
+  onExpand,
+}: {
+  miss: ReflectionMiss;
+  first: boolean;
+  seesEveryone: boolean;
+  selected: boolean;
+  onToggle: () => void;
+  expanded: boolean;
+  onExpand: () => void;
+}) {
+  return (
+    <Row
+      first={first}
+      title={miss.message}
+      selected={selected}
+      onToggle={onToggle}
+      expanded={expanded}
+      onExpand={onExpand}
+      meta={
+        <>
+          <span className="text-emerald-500">
+            Gets it right{miss.closed_at ? ` since ${formatDate(miss.closed_at)}` : " now"}
+          </span>
+          {seesEveryone && miss.person_name && ` · ${miss.person_name}`}
+        </>
+      }
+    >
+      {miss.wanted && (
+        <p className="text-fg">
+          <span className="font-medium text-fg-muted">Wanted: </span>
+          {miss.wanted}
+        </p>
+      )}
+      <Link
+        href={`/?session=${encodeURIComponent(miss.session_id)}`}
+        className="inline-flex min-h-[40px] items-center font-semibold text-accent hover:underline"
+      >
+        See the conversation
+      </Link>
+    </Row>
+  );
 }
 
 function LessonRow({
   lesson,
+  first,
   seesEveryone,
-  onForget,
+  selected,
+  onToggle,
+  expanded,
+  onExpand,
 }: {
   lesson: ReflectionLesson;
+  first: boolean;
   seesEveryone: boolean;
-  onForget?: () => void;
+  selected?: boolean;
+  onToggle?: () => void;
+  expanded: boolean;
+  onExpand: () => void;
 }) {
   const reached = lesson.shown;
+  // "not helping yet" is what "Select the N not helping" picks by.
   const went =
     reached === 0
-      ? "Not reached a chat yet"
-      : `Reached ${reached} ${reached === 1 ? "chat" : "chats"}: ${lesson.fine_after} went fine, ${lesson.miss_after} fell short`;
+      ? "not used yet"
+      : `used in ${reached} ${reached === 1 ? "chat" : "chats"}${lesson.miss_after > lesson.fine_after ? " · not helping yet" : ""}`;
   return (
-    <div className="py-3 flex gap-3">
-      <div className="flex-1 min-w-0 space-y-1">
-        <div className="text-[15px] text-fg">{lesson.text}</div>
-        <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
-          <span>{formatDate(lesson.created_at)}</span>
-          {seesEveryone && lesson.person_name && <span>· {lesson.person_name}</span>}
-          <span>· {went}</span>
-          {seesEveryone && lesson.shared && (
-            <span className="rounded-full bg-surface-input/60 px-2 py-0.5">reaches everyone</span>
-          )}
-          {lesson.retired_reason && (
-            <span className="rounded-full bg-surface-input/60 px-2 py-0.5">{RETIRED_LABEL[lesson.retired_reason]}</span>
-          )}
-        </div>
-        <div className="text-sm text-fg-muted" title={lesson.quote}>
-          <span className="font-medium">From: </span>&ldquo;{lesson.quote}&rdquo;
-        </div>
-      </div>
-      {onForget && (
-        <OverflowMenu label="Options for this lesson" items={[{ label: "Forget", onSelect: onForget, danger: true }]} />
-      )}
-    </div>
-  );
-}
-
-/** Graded turns and misses by week, oldest left, with the share as a bar. */
-function Trend({ weeks }: { weeks: ReflectionWeek[] }) {
-  if (weeks.length === 0) return null;
-  const ordered = [...weeks].reverse().slice(-12);
-  const graded = ordered.reduce((n, w) => n + w.graded, 0);
-  const misses = ordered.reduce((n, w) => n + w.misses, 0);
-  const share = graded ? Math.round((misses / graded) * 100) : 0;
-  return (
-    <section
-      aria-label="Misses by week"
-      className="rounded-xl border border-line bg-surface px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-3"
+    <Row
+      first={first}
+      title={lesson.text}
+      selected={selected}
+      onToggle={onToggle}
+      expanded={expanded}
+      onExpand={onExpand}
+      meta={
+        <>
+          {formatDate(lesson.created_at)}
+          {seesEveryone && lesson.person_name && ` · ${lesson.person_name}`}
+          {` · ${lesson.retired_reason ? RETIRED_LABEL[lesson.retired_reason] : went}`}
+        </>
+      }
     >
-      <div className="min-w-0 sm:w-56">
-        <div className="text-2xl font-bold tabular-nums text-fg leading-tight">
-          {misses} <span className="text-base font-semibold text-fg-muted">of {graded}</span>
-        </div>
-        <div className="text-sm text-fg-muted">
-          turns fell short over {ordered.length === 1 ? "the last week" : `the last ${ordered.length} weeks`} ({share}%)
-        </div>
-      </div>
-      <ol className="flex items-end gap-1.5 h-14 flex-1" aria-hidden="true">
-        {ordered.map((w) => {
-          const pct = w.graded ? Math.round((w.misses / w.graded) * 100) : 0;
-          return (
-            <li
-              key={w.week}
-              title={`${weekLabel(w.week)}: ${w.misses} of ${w.graded}`}
-              className="flex-1 flex flex-col items-center justify-end gap-1 min-w-0"
-            >
-              <div
-                className="w-full max-w-6 rounded-t bg-amber-500/60"
-                style={{ height: `${Math.max(4, pct)}%` }}
-              />
-              <span className="text-[10px] text-fg-muted tabular-nums truncate">{weekLabel(w.week)}</span>
-            </li>
-          );
-        })}
-      </ol>
-    </section>
-  );
-}
-
-function Group({
-  title,
-  blurb,
-  misses,
-  seesEveryone,
-  onForget,
-}: {
-  title: string;
-  blurb: string;
-  misses: ReflectionMiss[];
-  seesEveryone: boolean;
-  onForget: (miss: ReflectionMiss) => void;
-}) {
-  return (
-    <section>
-      <div className="text-base font-semibold text-fg">{title}</div>
-      <p className="text-sm text-fg-muted mb-1">{blurb}</p>
-      <div className="divide-y divide-line">
-        {misses.map((m) => (
-          <MissRow key={m.id} miss={m} seesEveryone={seesEveryone} onForget={() => onForget(m)} />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function MissRow({
-  miss,
-  seesEveryone,
-  onForget,
-}: {
-  miss: ReflectionMiss;
-  seesEveryone: boolean;
-  onForget: () => void;
-}) {
-  return (
-    <div className="py-3 flex gap-3">
-      <div className="flex-1 min-w-0 space-y-1.5">
-        <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
-          <span
-            className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${KIND_PILL[miss.kind]}`}
-          >
-            {KIND_LABEL[miss.kind]}
-          </span>
-          <span>{formatDate(miss.created_at)}</span>
-          {seesEveryone && miss.person_name && <span>· {miss.person_name}</span>}
-          {miss.signals.map((s) => (
-            <span key={s} className="rounded-full bg-surface-input/60 px-2 py-0.5">
-              {s}
-            </span>
-          ))}
-          {replayLabel(miss) && (
-            <span
-              className={`rounded-full px-2 py-0.5 ${REPLAY_PILL[miss.replay_state]}`}
-              title={miss.replay_notes || undefined}
-            >
-              {replayLabel(miss)}
-            </span>
-          )}
-        </div>
-        <div className="text-[15px] text-fg">
-          <span className="text-fg-muted">They asked: </span>
-          {miss.message}
-        </div>
-        <div className="text-sm text-fg-muted line-clamp-2" title={miss.reply}>
-          <span className="font-medium">It said: </span>
-          {miss.reply}
-        </div>
-        {miss.wanted && (
-          <div className="text-[15px] text-fg">
-            <span className="text-fg-muted">They wanted: </span>
-            {miss.wanted}
-          </div>
-        )}
-        <Link
-          href={`/?session=${encodeURIComponent(miss.session_id)}`}
-          className="inline-flex min-h-[40px] items-center text-sm font-medium text-accent hover:underline"
-        >
-          See the conversation
-        </Link>
-      </div>
-      <OverflowMenu label="Options for this miss" items={[{ label: "Forget", onSelect: onForget, danger: true }]} />
-    </div>
+      <p title={lesson.quote}>
+        <span className="font-medium">From: </span>&ldquo;{lesson.quote}&rdquo;
+      </p>
+      <Link
+        href={`/?session=${encodeURIComponent(lesson.session_id)}`}
+        className="inline-flex min-h-[40px] items-center font-semibold text-accent hover:underline"
+      >
+        See the conversation
+      </Link>
+    </Row>
   );
 }

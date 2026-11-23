@@ -35,6 +35,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How a review grades a goal, shared by the check-in, the weekly review and
+# the review of goals no check-in covers (departments/goal_review.py). A goal
+# with no number is still graded (skipped, it was never reviewed), and one
+# whose progress says it is finished is closed, not left open as "Done".
+VERDICT_STATUS_SHAPE = '"status": "on_track" | "at_risk" | "off_track" | "done", '
+GRADING_RULES = (
+    "Grade every goal. One with a number: its current value against its target and how "
+    "much of its period is left. One with no number: from its progress text, its period "
+    "and what the context shows was done: on_track while it is moving or its period has "
+    "time left, at_risk when its period is nearly over with little shown, off_track when "
+    "its period has passed unfinished. Use done only when its progress says it is "
+    "finished or its target is met. Never invent a number that is not given."
+)
+
 # Actor on the check-in's own `goal_status_review` audit row. `needs_check_in`
 # ignores that row: it lands after the Goals are stamped reviewed, so counting
 # it as "new" would re-run every check-in.
@@ -196,16 +210,17 @@ class DepartmentCheckInWorkflow(Workflow):
             query=(
                 f"Review the current Goal progress for the {state.config.title} department "
                 f"for the period {period}. For each Goal, assess whether it is "
-                "on_track, at_risk, or off_track based on the current value vs. target.\n\n"
+                "on_track, at_risk, off_track or done.\n\n"
+                f"{GRADING_RULES}\n\n"
                 "Return ONLY a JSON object on its own — no prose before or after, "
                 "no markdown fences — with this exact shape:\n"
                 '{"verdicts": [{"goal_id": <int from the [id=N] prefix>, '
-                '"status": "on_track" | "at_risk" | "off_track", '
+                f"{VERDICT_STATUS_SHAPE}"
                 '"rationale": "<one short sentence>"}, ...], '
                 '"narrative": "<one paragraph rendered into the check-in report; '
                 'mention any goal that moved status since the last period>"}\n\n'
                 "Use the integer id from each Goal's `[id=N]` prefix below. "
-                "Skip Goals you cannot grade. Include every Goal you do grade — "
+                "Include every Goal you grade — "
                 "the verdict is persisted back to the database.\n\n"
                 f"{goal_context}"
             ),
@@ -373,15 +388,16 @@ def needs_check_in(state: DepartmentState, now: datetime) -> str | None:
     slug = state.config.slug
     if not state.config.specialist_key:
         return "informational department (no specialist agent)"
-    if not state.goals:
+    open_goals = [g for g in state.goals if g.status != "done"]
+    if not open_goals:
         return "no Goals to review"
 
-    reviewed = [parse_aware(g.last_reviewed_at) for g in state.goals]
+    reviewed = [parse_aware(g.last_reviewed_at) for g in open_goals]
     if any(r is None for r in reviewed):
         return None  # a Goal was never graded
     baseline = min(r for r in reviewed if r is not None)
 
-    for goal, goal_reviewed in zip(state.goals, reviewed, strict=True):
+    for goal, goal_reviewed in zip(open_goals, reviewed, strict=True):
         edited = parse_aware(goal.updated_at)
         if edited is not None and goal_reviewed is not None and edited > goal_reviewed:
             return None
@@ -424,10 +440,13 @@ def needs_check_in(state: DepartmentState, now: datetime) -> str | None:
 def _render_goals(state: object) -> str:  # type: ignore[type-arg]
     from openexecutive.departments.models import DepartmentState
     assert isinstance(state, DepartmentState)
-    if not state.goals:
+    # A done goal is finished, so the grader never sees it
+    # (``persist_goal_verdicts`` would drop a verdict for one anyway).
+    open_goals = [g for g in state.goals if g.status != "done"]
+    if not open_goals:
         return "No Goals configured for this department."
     lines = ["**Goals:**"]
-    for goal in state.goals:
+    for goal in open_goals:
         current = f" (current: {goal.current})" if goal.current else ""
         target = f" — target: {goal.target}" if goal.target else ""
         period_label = (
@@ -471,7 +490,7 @@ def _render_audit(entries: Sequence[object]) -> str:
     return "\n".join(lines)
 
 
-_VALID_GOAL_STATUSES = frozenset({"on_track", "at_risk", "off_track"})
+_VALID_GOAL_STATUSES = frozenset({"on_track", "at_risk", "off_track", "done"})
 
 
 def _parse_verdicts(text: str) -> tuple[list[dict[str, Any]], str]:
@@ -560,7 +579,8 @@ def persist_goal_verdicts(
     overwrites — the one ``goal_status_review`` audit row (tagged with
     ``actor``) keeps each prior status for the diff trail, and the principal
     keeps the manual UI edit as the final override. A verdict for a goal id
-    not in ``state.goals`` (a hallucinated id) is dropped, and a failed write
+    not in ``state.goals`` (a hallucinated id) or for a goal a person marked
+    done is dropped, and a failed write
     skips that goal: persistence is best-effort, the artifact still ships.
     Returns one ``{goal_id, from, to, rationale}`` per goal written.
     """
@@ -573,11 +593,11 @@ def persist_goal_verdicts(
     transitions: list[dict[str, Any]] = []
     for v in verdicts:
         goal = goals_by_id.get(v["goal_id"])
-        if goal is None:
+        if goal is None or goal.status == "done":
             continue
         prior_status = goal.status
         try:
-            _dept_store.record_goal_review(
+            written = _dept_store.record_goal_review(
                 v["goal_id"],
                 status=v["status"],
                 last_reviewed_at=now.isoformat(),
@@ -587,6 +607,9 @@ def persist_goal_verdicts(
                 "check_in: record_goal_review failed slug=%s goal_id=%s",
                 slug, v["goal_id"],
             )
+            continue
+        if not written:
+            # Marked done (or deleted) while the review ran: nothing changed.
             continue
         transitions.append({
             "goal_id": v["goal_id"],
@@ -603,7 +626,7 @@ def persist_goal_verdicts(
                 "goal_status_review",
                 f"{state.config.title}: reviewed {len(transitions)} goal(s)",
                 actor=actor,
-                department=slug,
+                department=slug or None,  # "" = goals with no department (goal_review)
                 details={"period": period, "transitions": transitions},
             )
         except Exception:  # noqa: BLE001 - audit must not break the workflow.
@@ -675,7 +698,9 @@ def _assemble_artifact(
     assert isinstance(state, DepartmentState)
 
     title = state.config.title
-    authority = state.config.authority_level.value.replace("_", " ")
+    from openexecutive.departments.authority import department_level
+
+    authority = department_level(state.config.slug).value.replace("_", " ")
 
     action_lines: list[str] = []
     for a in gated_actions:

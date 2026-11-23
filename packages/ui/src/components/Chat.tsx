@@ -1,14 +1,24 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import Message from "./Message";
+import HeldStepsCard, { APPROVE_MESSAGE } from "./HeldStepsCard";
+import { APPROVED_MESSAGE } from "./ChatHeldActionCard";
+import BrowserExtensionCard, { BROWSER_GO_AHEAD } from "./browser/BrowserExtensionCard";
+import BrowserWelcomeCard from "./browser/BrowserWelcomeCard";
+import { browserWelcomeClosed, closeBrowserWelcome, showBrowserWelcome } from "@/lib/browserWelcome";
 import BrandMark from "./BrandMark";
 import TurnStatusRow, { useTurnClock } from "./TurnStatusRow";
+import TurnSteps from "./TurnSteps";
+import HandOverAsk from "./HandOverAsk";
+import { toHandOverAsk, type HandOverAsk as HandOverAskState } from "@/lib/handOverAsk";
 import Icon from "./Icon";
+import MicButton from "./MicButton";
 import InfoTip from "./InfoTip";
 import OverflowMenu from "./ui/OverflowMenu";
 import { SharePanel } from "./sessions/ChatHistory";
+import { MemoryUpdatedChip } from "./memories/MemoryChanges";
 import {
   MAX_FILES_PER_TURN,
   mergePickedFiles,
@@ -20,6 +30,8 @@ import {
   CommitteePhase,
   DebugEvent,
   FALLBACK_ACTIVITY_LABEL,
+  getBrowserStarters,
+  getBrowserStatus,
   getFollowupSuggestion,
   getSessionMessages,
   getSessionPeople,
@@ -32,6 +44,7 @@ import {
   type ChatPeople,
   type LiveChatEvent,
 } from "@/lib/api";
+import { joinDictation } from "@/lib/dictation";
 import { initials } from "@/lib/initials";
 import {
   applyLiveEvent,
@@ -49,13 +62,26 @@ import { answerSourcesFrom, type AnswerSources } from "@/lib/answerSources";
 import { matchingMessages } from "@/lib/chatSearch";
 import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
 import {
+  WRITING_FROM_CHARS,
+  addReads,
+  addStep,
+  applyProgress,
+  liveLineKind,
+  type ReadCounts,
+  type TurnProgress,
+} from "@/lib/turnSteps";
+import {
   composerText,
   markTaken,
   settleQueue,
   type QueuedMessage,
 } from "@/lib/queuedMessages";
 import { newClientTurnId } from "@/lib/turn-id";
+import RepeatOfferCard from "@/components/jobs/RepeatOfferCard";
+import type { RepeatOffer } from "@/lib/api";
 import { turnStatus } from "@/lib/turnStatus";
+import { isNearBottom, lastUserIndex, pinScrollTop, pinSpacerHeight } from "@/lib/chatPin";
+import { isImeComposing } from "@/lib/imeComposing";
 
 interface ChatProps {
   onDebugEvent?: (event: DebugEvent) => void;
@@ -88,6 +114,10 @@ interface ChatProps {
   member?: { sharedBy: string; onLeft?: () => void };
   // Bumped by the parent to open the Share panel (its ⋯ menu's Share).
   shareRequest?: number;
+  // Opened from a working row's Watch on Home: the chat may have a turn
+  // running on the server with no page of its own (an approved card's turn),
+  // which saves nothing until it ends, so follow it live meanwhile.
+  watch?: boolean;
 }
 
 // The browser's own highlight for found words, where it has one
@@ -117,13 +147,19 @@ function endsOnReply(messages: ChatMessage[] | undefined): boolean {
 const FALLBACK_SUBTITLE =
   "Pick up where we left off — decisions to revisit, drafts to push forward, people to pull in.";
 
-export default function Chat({ onDebugEvent, initialMessages, initialSessionId, initialInput, autoSubmitInitialInput, initialMemoryText, onTurnComplete, onTurnStart, initialFind, member, shareRequest }: ChatProps) {
+export default function Chat({ onDebugEvent, initialMessages, initialSessionId, initialInput, autoSubmitInitialInput, initialMemoryText, onTurnComplete, onTurnStart, initialFind, member, shareRequest, watch }: ChatProps) {
   const { data: session } = useSession();
   const firstName = session?.user?.name?.trim().split(/\s+/)[0];
   const executiveName = useExecutiveName();
 
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages ?? []);
   const [input, setInput] = useState(initialInput ?? "");
+  // While the mic listens: what the box held when it started (the heard
+  // words go after it), and the browser's guess at the latest words, drawn
+  // tinted after the box's text until they settle.
+  const dictationBaseRef = useRef<string | null>(null);
+  const [dictating, setDictating] = useState(false);
+  const [heardPending, setHeardPending] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const { isStopping, beginTurn, stop: handleStop, serverAcknowledgedStop, endTurn } =
     useStoppableTurn();
@@ -132,8 +168,58 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // Inline action chips that arrived for the in-flight assistant message.
   // Reset on every turn; frozen onto the message at `done` event time.
   const [streamingActions, setStreamingActions] = useState<ActionTaken[]>([]);
+  // An offer to do what they keep asking for on a schedule, under the reply
+  // to the repeated ask (workflows/repeat_asks.py). Gone once answered or
+  // when they send the next message; it stays on Workflows until answered.
+  const [repeatOffer, setRepeatOffer] = useState<{ offer: RepeatOffer; sessionId?: string } | null>(null);
+  // Replies this browser saw finish, by row id: the window the "Memory
+  // updated" chip under each looks in; `memorySeen` keeps a change on one
+  // chip only.
+  const [memoryWatch, setMemoryWatch] = useState<Record<number, { sessionId: string; since: string }>>({});
+  const memorySeen = useMemo(() => new Set<string>(), []);
+  // Replies whose Memory updated chip has rows: only those drop their own
+  // remember_fact chip, so a saved fact always shows one or the other.
+  const [memoryShown, setMemoryShown] = useState<Set<number>>(() => new Set());
+  const markMemoryShown = useCallback((id: number) => {
+    setMemoryShown((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+  }, []);
   const [isConsulting, setIsConsulting] = useState(false);
+  // The reply whose held steps the person put off with Not now (its index).
+  const [heldDismissed, setHeldDismissed] = useState<number | null>(null);
+  const [browserDismissed, setBrowserDismissed] = useState<number | null>(null);
+  // "Your browser is connected" on a new chat
+  // (components/browser/BrowserWelcomeCard.tsx): asked once per page.
+  const [browserWelcome, setBrowserWelcome] = useState<string[] | null>(null);
+  const [browserWelcomeShut, setBrowserWelcomeShut] = useState(false);
+  const browserWelcomeWanted = !member && !(initialMessages && initialMessages.length > 0);
+  useEffect(() => {
+    if (!browserWelcomeWanted || browserWelcomeClosed()) return;
+    const ctrl = new AbortController();
+    getBrowserStatus()
+      .then(async (status) => {
+        if (!status.connected || status.available === false || ctrl.signal.aborted) return;
+        const starters = await getBrowserStarters(ctrl.signal);
+        if (!ctrl.signal.aborted) setBrowserWelcome(starters);
+      })
+      .catch(() => undefined);
+    return () => ctrl.abort();
+  }, [browserWelcomeWanted]);
   const [activityLabel, setActivityLabel] = useState<string | null>(null);
+  // The running turn's steps (lib/turnSteps.ts), and whether the person
+  // pressed I'll finish it and the turn is writing up what it has.
+  const [turnSteps, setTurnSteps] = useState<string[]>([]);
+  // What the turn shows while it works, if it sent any (task, live line,
+  // used, found), the reads counted from its rounds, the card's live line,
+  // and whether the reply itself is being written (answer text since the
+  // last tool round).
+  const [turnProgress, setTurnProgress] = useState<TurnProgress | null>(null);
+  const [turnReads, setTurnReads] = useState<ReadCounts>({});
+  const [liveLine, setLiveLine] = useState<string | null>(null);
+  const [writingReply, setWritingReply] = useState(false);
+  const [handingOver, setHandingOver] = useState(false);
+  // A step in their browser only they can do, asked here with Done and Stop
+  // while the turn waits (components/HandOverAsk.tsx).
+  const [handOverAsk, setHandOverAsk] = useState<HandOverAskState | null>(null);
   const [committeeEnabled, setCommitteeEnabled] = useState(false);
   const [committeePhase, setCommitteePhase] = useState<CommitteePhase | null>(null);
   const turnClock = useTurnClock(isLoading);
@@ -147,6 +233,15 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   const [followup, setFollowup] = useState<string | null>(null);
   const followupCtrlRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Scrolling: the message you send moves to the top of the view with room
+  // under it for the reply (lib/chatPin). Until you send one (an opened
+  // chat, someone else's turn), the view follows the bottom while you are
+  // at it.
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const spacerRef = useRef<HTMLDivElement>(null);
+  const [pinned, setPinned] = useState(false);
+  const pinScrollPendingRef = useRef(false);
+  const followBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const adoptedSessionIdRef = useRef<string | undefined>(initialSessionId);
@@ -257,6 +352,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     if (initialSessionId === adoptedSessionIdRef.current) return;
     adoptedSessionIdRef.current = initialSessionId;
     setMessages(initialMessages ?? []);
+    setPinned(false);
+    pinScrollPendingRef.current = false;
+    followBottomRef.current = true;
     setSessionId(initialSessionId);
     setStreamingContent("");
     setFind(initialFind?.trim() || null);
@@ -316,6 +414,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setSettling(null);
   }, []);
 
+  // Watch (see the prop): follow the server's turn live while the chat it
+  // opened has nothing saved, until that turn ends.
+  const [watchDone, setWatchDone] = useState<string | null>(null);
+  const watching = Boolean(watch) && Boolean(sessionId) && sessionId === initialSessionId
+    && watchDone !== sessionId && messages.length === 0 && !isLoading && !streamingContent;
+
   const onLiveEvent = (event: LiveChatEvent) => {
     const before = liveRef.current;
     const step = applyLiveEvent(before, event, {
@@ -329,9 +433,13 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     if (step.state.typing.length) setClock(Date.now());
     if (step.reload) void reloadMessages();
     if (step.people) setPeopleVersion((v) => v + 1);
-    if (step.closed) setClosed(step.closed);
+    // A watched chat that isn't shared has no one to close it: a "removed"
+    // there means the turn hasn't started or left nothing saved, so stop
+    // following instead of showing the chat as closed.
+    if (watching && (event.type === "turn_ended" || step.closed)) setWatchDone(sessionId ?? null);
+    else if (step.closed) setClosed(step.closed);
   };
-  useLiveChat(sessionId, shared && !closed, onLiveEvent);
+  useLiveChat(sessionId, (shared || watching || live.turn !== null) && !closed, onLiveEvent);
 
   // "Is typing" fades on its own: tick while anyone is.
   useEffect(() => {
@@ -340,11 +448,60 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     return () => clearInterval(timer);
   }, [live.typing.length]);
 
+  const pinnedIndex = pinned ? lastUserIndex(messages) : null;
+
+  // Size the room under the chat so the pinned message can reach the top,
+  // and keep it sized as the reply, cards or the window change. Written to
+  // the DOM directly: it must apply before the scroll in the same frame.
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    const content = messagesRef.current;
+    const spacer = spacerRef.current;
+    if (!scroller || !content || !spacer) return;
+    const size = () => {
+      const msg =
+        pinnedIndex === null
+          ? null
+          : content.querySelector<HTMLElement>(`[data-msg-index="${pinnedIndex}"]`);
+      if (!msg) {
+        spacer.style.height = "0px";
+        return null;
+      }
+      const top = msg.getBoundingClientRect().top;
+      spacer.style.height = `${pinSpacerHeight(
+        scroller.clientHeight,
+        top,
+        content.getBoundingClientRect().bottom,
+      )}px`;
+      return top;
+    };
+    const top = size();
+    if (top !== null && pinScrollPendingRef.current) {
+      pinScrollPendingRef.current = false;
+      scroller.scrollTo({
+        top: pinScrollTop(scroller.scrollTop, top, scroller.getBoundingClientRect().top),
+        behavior: "smooth",
+      });
+    }
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => void size());
+    observer.observe(content);
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [pinnedIndex, messages.length]);
+
+  // Not pinned: follow new content while at the bottom.
   useEffect(() => {
     // While finding, the chat stays on the match instead.
-    if (find) return;
+    if (find || pinned || !followBottomRef.current) return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, streamingContent, find]);
+  }, [messages, streamingContent, live.turn, settling, find, pinned]);
+
+  function onScroll() {
+    const el = scrollerRef.current;
+    if (!el || pinned) return;
+    followBottomRef.current = isNearBottom(el.scrollTop, el.clientHeight, el.scrollHeight);
+  }
 
   // Bring the current match into view and mark every occurrence of the words.
   useEffect(() => {
@@ -441,7 +598,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
 
   // `queuedFollowup`: the leftovers of a turn, sent on their own. They carry
   // no files and leave alone whatever is being typed in the composer now.
-  async function handleSend(text?: string, memoryText?: string, queuedFollowup = false) {
+  async function handleSend(
+    text?: string,
+    memoryText?: string,
+    queuedFollowup = false,
+    approveCard?: { id: number; input?: Record<string, string> },
+  ) {
     // Carrying on in the chat ends the find, so the reply scrolls into view.
     closeFind();
     if (isLoading && text === undefined) {
@@ -469,13 +631,26 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     }
     clearFollowup();
     setMessages((prev) => [...prev, { role: "user", content: userBubbleContent }]);
+    pinScrollPendingRef.current = true;
+    setPinned(true);
     setIsLoading(true);
     isLoadingRef.current = true;
     turnClock.start();
+    // Back a little, so a clock a few seconds ahead of the server's still
+    // catches what this turn keeps.
+    const turnSince = new Date(Date.now() - 30_000).toISOString();
     setStreamingContent("");
     setStreamingActions([]);
+    setRepeatOffer(null);
     setIsConsulting(false);
     setActivityLabel(null);
+    setTurnSteps([]);
+    setTurnProgress(null);
+    setTurnReads({});
+    setLiveLine(null);
+    setWritingReply(false);
+    setHandingOver(false);
+    setHandOverAsk(null);
     setCommitteePhase(null);
     const { clientTurnId, signal } = beginTurn();
     turnIdRef.current = clientTurnId;
@@ -490,11 +665,19 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     // Declared outside the try so the abort path in `catch` can still commit
     // whatever streamed before the stop.
     let accumulated = "";
+    // Answer text since the last tool round (WRITING_FROM_CHARS).
+    let roundText = 0;
+    // Whether this round's show_progress already set the live line.
+    let progressThisRound = false;
     // Local mirror of streamingActions so the closure builds the final
     // message without depending on the async setState applying first.
     const turnActions: ActionTaken[] = [];
     // What the reply looked at; sent once, just before `done`.
     let turnSources: AnswerSources | undefined;
+    // Steps the turn held for an outside read; sent once, just before `done`.
+    let turnHeld: string[] | undefined;
+    let turnFlags: string[] | undefined;
+    let turnBrowser: { store_url: string | null } | undefined;
     let wasStopped = false;
     // Row id of the persisted reply, from `done`; it is what makes the reply
     // rateable with 👍/👎.
@@ -522,6 +705,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         clientTurnId,
         signal,
         memoryText: turnMemoryText,
+        approveCard,
       })) {
         turnClock.markEvent();
         if (item.type === "debug_event") {
@@ -531,15 +715,45 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         if (item.type === "chunk" && item.content) {
           if (item.session_id) adoptSessionId(item.session_id);
           accumulated += item.content;
+          roundText += item.content.length;
+          if (roundText >= WRITING_FROM_CHARS) setWritingReply(true);
           setIsConsulting(false);
           setActivityLabel(null);
+          // Words of the reply: the step it asked about is over.
+          setHandOverAsk(null);
           setStreamingContent(accumulated);
+        } else if (item.type === "rewrite") {
+          // Written again whole: the next chunks replace what came so far.
+          accumulated = "";
+          roundText = 0;
+          setStreamingContent("");
         } else if (item.type === "activity") {
           // Arrives immediately before `thinking`, so the label is in place
           // before the indicator turns on. Deliberately not cleared by
           // `action_taken`: a chip can land while the same round is still
           // running, and clearing there would flicker the line off and on.
           setActivityLabel(item.label);
+          // A new round: the ask the last one waited on was answered.
+          setHandOverAsk(null);
+          setTurnSteps((prev) => addStep(prev, item.label));
+          setTurnReads((prev) => addReads(prev, item.reads));
+          // The turn's own words for this round, when it sent them just
+          // before (show_progress comes ahead of the round's activity), say
+          // more than the generic label.
+          if (!progressThisRound) setLiveLine(item.label);
+          progressThisRound = false;
+          roundText = 0;
+          setWritingReply(false);
+        } else if (item.type === "progress") {
+          setTurnProgress((prev) => applyProgress(prev, item));
+          if (item.now?.trim()) {
+            setLiveLine(item.now.trim());
+            progressThisRound = true;
+          }
+        } else if (item.type === "handing_over") {
+          setHandingOver(true);
+        } else if (item.type === "hand_over") {
+          setHandOverAsk(toHandOverAsk(item));
         } else if (item.type === "thinking") {
           setIsConsulting(true);
         } else if (item.type === "phase" && item.phase) {
@@ -553,8 +767,16 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         } else if (item.type === "action_taken") {
           turnActions.push(item);
           setStreamingActions([...turnActions]);
+        } else if (item.type === "repeat_offer") {
+          setRepeatOffer({ offer: item.offer, sessionId: item.session_id });
         } else if (item.type === "sources") {
           turnSources = answerSourcesFrom(item);
+        } else if (item.type === "held_steps") {
+          turnHeld = item.steps.length > 0 ? item.steps : undefined;
+        } else if (item.type === "flags") {
+          turnFlags = item.flags.length > 0 ? item.flags : undefined;
+        } else if (item.type === "browser_needed") {
+          turnBrowser = { store_url: item.store_url ?? null };
         } else if (item.type === "message_added") {
           setQueued(markTaken(queuedRef.current, item.ids));
         } else if (item.type === "stopped") {
@@ -613,11 +835,19 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
             stopped: wasStopped || undefined,
             sources: turnSources,
             id: replyId,
+            held_steps: turnHeld,
+            flags: turnFlags,
+            browser_needed: turnBrowser,
           },
         ]);
         // Only a complete, persisted reply gets a follow-up: a stopped one
         // is half an answer, and without an id there is nothing to key on.
         if (!wasStopped && replyId && doneSessionId) loadFollowup(doneSessionId);
+        if (replyId && doneSessionId) {
+          const watched = { sessionId: doneSessionId, since: turnSince };
+          const id = replyId;
+          setMemoryWatch((prev) => ({ ...prev, [id]: watched }));
+        }
       }
       setStreamingContent("");
       setStreamingActions([]);
@@ -673,6 +903,13 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       }
       setIsConsulting(false);
       setActivityLabel(null);
+      setTurnSteps([]);
+      setTurnProgress(null);
+      setTurnReads({});
+      setLiveLine(null);
+      setWritingReply(false);
+      setHandingOver(false);
+      setHandOverAsk(null);
       setCommitteePhase(null);
       textareaRef.current?.focus();
     }
@@ -780,6 +1017,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // Enter and the Send button: an edit replaces the last turn.
   function submit() {
     if (redoing) return;
+    // The mic is still listening or writing it out: stop it first.
+    if (dictating) return;
     // One turn at a time in a shared chat: wait for someone else's to end.
     if (!editing && !isLoading && liveRef.current.turn) return;
     if (editing) void sendEdit();
@@ -799,6 +1038,38 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     fallbackLabel: FALLBACK_ACTIVITY_LABEL,
   });
 
+  // One "still working" line a turn: the steps line on a long turn, else the
+  // plain status. Never both (lib/turnSteps.ts liveLineKind).
+  const liveKind = liveLineKind({
+    isLoading,
+    steps: turnSteps,
+    hasProgress: turnProgress !== null,
+    inCommittee: committeePhase !== null,
+    statusShown: status.show,
+  });
+  const liveStatus =
+    liveKind === "steps" ? (
+      <TurnSteps
+        progress={turnProgress}
+        reads={turnReads}
+        liveLine={writingReply ? "Writing the answer" : liveLine}
+        elapsed={status.elapsed}
+        handingOver={handingOver}
+      />
+    ) : liveKind === "status" ? (
+      <TurnStatusRow status={status} committeePhase={committeePhase} showMark={Boolean(streamingContent)} />
+    ) : null;
+  // The ask the turn waits on, under the line.
+  const liveSlot =
+    liveStatus || (isLoading && handOverAsk) ? (
+      <>
+        {liveStatus}
+        {isLoading && handOverAsk && (
+          <HandOverAsk key={handOverAsk.id} ask={handOverAsk} onAnswered={() => setHandOverAsk(null)} />
+        )}
+      </>
+    ) : null;
+
   // Fill the composer with the suggestion without sending it, so the user
   // can edit first. The suggestion is kept: clearing the box shows it again.
   function acceptFollowup() {
@@ -814,7 +1085,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     });
   }
 
-  const showFollowup = Boolean(followup) && !input && !isLoading && !live.turn;
+  const showFollowup = Boolean(followup) && !input && !isLoading && !live.turn && !dictating;
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     // Tab / → take the suggestion only while the box is empty; otherwise
@@ -827,7 +1098,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       acceptFollowup();
       return;
     }
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !isImeComposing(e) && !e.shiftKey) {
       e.preventDefault();
       submit();
     }
@@ -977,7 +1248,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         </div>
       )}
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollerRef} onScroll={onScroll} className="flex-1 overflow-y-auto">
         {find && (
           <div
             role="status"
@@ -1064,6 +1335,26 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                       </button>
                     ))}
               </div>
+              {browserWelcome &&
+                showBrowserWelcome({
+                  landing: isEmpty,
+                  connected: true,
+                  starters: browserWelcome,
+                  closed: browserWelcomeShut,
+                }) && (
+                  <BrowserWelcomeCard
+                    starters={browserWelcome}
+                    onPick={(text) => {
+                      setBrowserWelcomeShut(true);
+                      closeBrowserWelcome();
+                      setInput(text);
+                    }}
+                    onClose={() => {
+                      setBrowserWelcomeShut(true);
+                      closeBrowserWelcome();
+                    }}
+                  />
+                )}
             </div>
           ) : (
             <>
@@ -1080,7 +1371,14 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 <Message
                   role={msg.role}
                   content={msg.content}
-                  actions={msg.role === "assistant" ? msg.actions : undefined}
+                  actions={
+                    msg.role !== "assistant"
+                      ? undefined
+                      : msg.id && memoryShown.has(msg.id)
+                        ? // The Memory updated chip below says it, with an Undo.
+                          msg.actions?.filter((a) => a.tool !== "remember_fact")
+                        : msg.actions
+                  }
                   stopped={msg.role === "assistant" ? msg.stopped : undefined}
                   sources={msg.role === "assistant" ? msg.sources : undefined}
                   feedback={msg.role === "assistant" && !member ? msg.feedback : undefined}
@@ -1094,9 +1392,49 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                       ? (v) => handleFeedback(i, v)
                       : undefined
                   }
+                  // Sent on its own (`queuedFollowup`): no files from the composer,
+                  // which would take the upload route that approves nothing.
+                  onApproveCard={
+                    member ? undefined : (id, input) => handleSend(APPROVED_MESSAGE, undefined, true, { id, input })
+                  }
+                  approveDisabled={isLoading}
                   onRetry={canRedo && i === turn.replyIndex ? () => void handleRetry() : undefined}
                   onEdit={canRedo && !editing && i === turn.userIndex ? startEdit : undefined}
+                  memory={
+                    msg.role === "assistant" && msg.id && memoryWatch[msg.id] ? (
+                      <MemoryUpdatedChip
+                        {...memoryWatch[msg.id]}
+                        seen={memorySeen}
+                        onShown={() => markMemoryShown(msg.id as number)}
+                      />
+                    ) : undefined
+                  }
                 />
+                {!member &&
+                  msg.role === "assistant" &&
+                  i === messages.length - 1 &&
+                  heldDismissed !== i &&
+                  msg.held_steps &&
+                  msg.held_steps.length > 0 && (
+                    <HeldStepsCard
+                      steps={msg.held_steps}
+                      reasons={msg.flags}
+                      disabled={isLoading}
+                      onApprove={() => void handleSend(APPROVE_MESSAGE)}
+                      onDismiss={() => setHeldDismissed(i)}
+                    />
+                  )}
+                {msg.role === "assistant" && i === messages.length - 1 && browserDismissed !== i && msg.browser_needed && (
+                  <BrowserExtensionCard
+                    storeUrl={msg.browser_needed.store_url}
+                    onDismiss={() => setBrowserDismissed(i)}
+                    disabled={isLoading}
+                    onGoAhead={() => {
+                      setBrowserDismissed(i);
+                      void handleSend(BROWSER_GO_AHEAD);
+                    }}
+                  />
+                )}
                 </div>
               ))}
 
@@ -1111,30 +1449,27 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 </div>
               ))}
 
-              {streamingContent && (
+              {streamingContent ? (
                 <Message
                   role="assistant"
                   content={streamingContent}
                   isStreaming
+                  paused={status.show}
                   actions={streamingActions.length > 0 ? streamingActions : undefined}
-                  status={
-                    status.show ? (
-                      <TurnStatusRow status={status} committeePhase={committeePhase} />
-                    ) : undefined
-                  }
+                  status={liveSlot ?? undefined}
                 />
-              )}
-
-              {status.show && !streamingContent && (
-                <div className="flex gap-4 mb-8">
-                  <div className="flex-shrink-0 mt-1">
-                    <BrandMark size="md" consulting />
+              ) : (
+                liveSlot && (
+                  <div className="flex gap-4 mb-8">
+                    <div className="flex-shrink-0 mt-1">
+                      <BrandMark size="md" consulting />
+                    </div>
+                    <div className="flex-1 pt-1.5">
+                      <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">{executiveName}</div>
+                      {liveSlot}
+                    </div>
                   </div>
-                  <div className="flex-1 pt-1.5">
-                    <div className="text-xs text-fg-muted mb-3 font-medium tracking-wide uppercase">{executiveName}</div>
-                    <TurnStatusRow status={status} committeePhase={committeePhase} showMark={false} />
-                  </div>
-                </div>
+                )
               )}
 
               {/* Someone else's turn, as it happens. */}
@@ -1169,8 +1504,16 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
               )}
             </>
           )}
+          {repeatOffer && !isLoading && (!repeatOffer.sessionId || repeatOffer.sessionId === sessionId) && (
+            <RepeatOfferCard
+              offer={repeatOffer.offer}
+              onDone={() => setRepeatOffer(null)}
+              className="mb-8 sm:ml-12"
+            />
+          )}
           <div ref={bottomRef} />
         </div>
+        <div ref={spacerRef} aria-hidden="true" />
       </div>
 
       {closed ? (
@@ -1260,12 +1603,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
               {fileError}
             </p>
           )}
-          <div className="relative flex items-end gap-1.5 sm:gap-2 bg-surface-elevated border border-line-strong rounded-2xl p-1.5 sm:p-2 shadow-sm focus-within:border-accent/60 transition-colors">
+          <div className="ask-box relative flex items-end gap-1.5 sm:gap-2 rounded-2xl p-1.5 sm:p-2 transition-shadow">
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/png,image/jpeg,image/gif,image/webp,.pdf,.docx,.doc,.txt,.md,.csv"
+              accept="image/png,image/jpeg,image/gif,image/webp,.pdf,.docx,.doc,.xlsx,.xlsm,.txt,.md,.csv"
               onChange={handleFilesPicked}
               className="hidden"
               aria-hidden="true"
@@ -1307,13 +1650,27 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                   {followup}
                 </div>
               )}
+              {dictating && heardPending && (
+                <div
+                  aria-hidden
+                  className="col-start-1 row-start-1 pointer-events-none text-sm sm:text-base leading-relaxed whitespace-pre-wrap break-words max-h-40 overflow-hidden"
+                >
+                  <span className="text-transparent">{input ? `${input} ` : ""}</span>
+                  <span className="text-fg-muted bg-accent/15 rounded">{heardPending}</span>
+                </div>
+              )}
               <textarea
                 ref={textareaRef}
                 value={input}
                 onChange={handleTextareaChange}
                 onKeyDown={handleKeyDown}
+                readOnly={dictating}
                 placeholder={
-                  isLoading
+                  dictating
+                    ? heardPending
+                      ? ""
+                      : "Listening… start talking"
+                    : isLoading
                     ? WORKING_PLACEHOLDER
                     : blockedBy
                       ? `The Executive is answering ${blockedBy}…`
@@ -1328,6 +1685,29 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 style={{ minHeight: "24px" }}
               />
             </div>
+            {/* Talk instead of typing: the words land in the box to send. */}
+            {!isLoading && (
+              <MicButton
+                disabled={Boolean(blockedBy)}
+                onLive={(settled, pending) => {
+                  if (dictationBaseRef.current === null) dictationBaseRef.current = input;
+                  setDictating(true);
+                  setInput(joinDictation(dictationBaseRef.current, settled));
+                  setHeardPending(pending);
+                }}
+                onText={(text) => {
+                  // The written-out words replace the live ones.
+                  const base = dictationBaseRef.current;
+                  dictationBaseRef.current = null;
+                  setDictating(false);
+                  setHeardPending("");
+                  setInput((prev) => joinDictation(base ?? prev, text));
+                  setFileError(null);
+                  textareaRef.current?.focus();
+                }}
+                onError={setFileError}
+              />
+            )}
             {isLoading && (
               <button
                 type="button"
@@ -1347,8 +1727,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 onClick={submit}
                 disabled={
                   editing
-                    ? !input.trim() || redoing
-                    : Boolean(blockedBy) || (!input.trim() && pendingFiles.length === 0)
+                    ? dictating || !input.trim() || redoing
+                    : dictating || Boolean(blockedBy) || (!input.trim() && pendingFiles.length === 0)
                 }
                 aria-label={isLoading ? "Add to what it's working on" : editing ? "Send edited message" : "Send message"}
                 className="flex-shrink-0 w-11 h-11 rounded-xl bg-accent-strong hover:bg-accent-strong/90 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 flex items-center justify-center cursor-pointer"

@@ -29,6 +29,8 @@ from typing import Any
 
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit.redaction import ERROR_DETAIL_LEN
+from openexecutive.orchestrator import turn_live
+from openexecutive.workflows import run_control
 
 logger = logging.getLogger(__name__)
 
@@ -142,9 +144,19 @@ LIST_WORKFLOWS_TOOL: dict[str, Any] = {
         "title, description, section, estimated_minutes, and the input fields "
         "it expects (name → type/description/required). Call this when the "
         "principal asks what you can run, or to discover a workflow's name and "
-        "required inputs before calling run_workflow."
+        "required inputs before calling run_workflow. Pass `name` of a custom "
+        "workflow to read its full definition (steps, tools, schedule), e.g. to "
+        "work out why a run went wrong and draft a fix with draft_workflow."
     ),
-    "input_schema": {"type": "object", "properties": {}},
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "A custom workflow's name, to get its full definition instead of the list.",
+            },
+        },
+    },
 }
 
 
@@ -239,8 +251,37 @@ def _input_fields(input_schema: dict[str, Any]) -> dict[str, Any]:
     return fields
 
 
+def _definition_of(name: str) -> str:
+    """A custom workflow's full definition, for the account owner or its
+    creator in a conversation only they read: its steps can quote addresses
+    and what it does."""
+    from openexecutive.orchestrator.workflow_change import may_read
+    from openexecutive.workflows.dynamic_store import get_definition
+
+    # Refused before looking it up, so a refusal doesn't say whether it exists.
+    refused = may_read(name)
+    if refused is not None:
+        return _err("list_workflows", refused)
+    defn = get_definition(name)
+    if defn is None:
+        return _err("list_workflows", f"There is no custom workflow named {name!r}.")
+    _audit("list_workflows", "read", True, f"list_workflows read {name}", {"name": name})
+    return json.dumps({
+        "definition": defn.model_dump(mode="json", exclude={"created_at", "updated_at"}),
+        "note": (
+            "is_active says whether it is switched on. To fix it, draft the whole corrected "
+            "definition under the same name with draft_workflow, then save_workflow with "
+            "overwrite=true."
+        ),
+    })
+
+
 async def handle_list_workflows(tool_input: dict[str, Any]) -> str:
     from openexecutive.workflows import list_workflows as _list_workflows
+
+    name = str(tool_input.get("name") or "").strip()
+    if name:
+        return _definition_of(name)
 
     try:
         workflows = _list_workflows()
@@ -248,6 +289,7 @@ async def handle_list_workflows(tool_input: dict[str, Any]) -> str:
         logger.exception("list_workflows: failed")
         return _err("list_workflows", str(exc))
 
+    made_by = _made_by()
     out: list[dict[str, Any]] = []
     for wf in workflows:
         if wf.name in _CHAT_LAUNCH_BLOCKLIST:
@@ -264,11 +306,46 @@ async def handle_list_workflows(tool_input: dict[str, Any]) -> str:
             "section": meta.section.value,
             "estimated_minutes": meta.estimated_minutes,
             "is_custom": meta.is_custom,
+            **({"made_by": made_by(meta.name)} if meta.is_custom else {}),
             "inputs": _input_fields(meta.input_schema),
         })
 
     _audit("list_workflows", "read", True, f"list_workflows returned {len(out)}", {"count": len(out)})
-    return json.dumps({"workflows": out, "count": len(out)})
+    return json.dumps({
+        "workflows": out,
+        "count": len(out),
+        "note": (
+            "made_by says whose a saved workflow is: \"you\" (the person you're speaking with) "
+            "or someone else on the team by name. Never call someone else's workflow theirs."
+        ),
+    })
+
+
+def _made_by() -> Callable[[str], str]:
+    """Who made each saved workflow, as the speaker reads it: "you", a
+    teammate's name, or "someone on the team" when it isn't known."""
+    from openexecutive.orchestrator.speaker import speaker
+    from openexecutive.people.store import get_person
+    from openexecutive.workflows.dynamic_store import get_owner
+
+    me = getattr(speaker(), "id", None)
+    names: dict[int, str] = {}
+
+    def made_by(name: str) -> str:
+        try:
+            owner = get_owner(name)
+            if owner is None:
+                return "someone on the team"
+            if me is not None and owner == me:
+                return "you"
+            if owner not in names:
+                person = get_person(owner)
+                names[owner] = " ".join(((person.full_name or "") if person else "").split()) or "someone on the team"
+            return names[owner]
+        except Exception:
+            return "someone on the team"
+
+    return made_by
 
 
 def _principal_only_refusal(name: str, workflow: Any) -> str | None:
@@ -379,6 +456,13 @@ async def handle_run_workflow(tool_input: dict[str, Any]) -> str:
         # Surface the validation error so the model can correct its inputs.
         return _err("run_workflow", f"invalid inputs for {name}: {exc}", kind="write")
 
+    from openexecutive.delegation.workflow_reads import chat_run_refusal
+
+    # One that reads its creator's mail runs only for them, and marks this
+    # turn (only now, once the run is about to start).
+    if (refused := chat_run_refusal(name)) is not None:
+        return _err("run_workflow", refused, kind="write")
+
     run_id = uuid.uuid4().hex
     try:
         from openexecutive.orchestrator.artifact_records import turn_owner
@@ -415,42 +499,60 @@ async def handle_run_workflow(tool_input: dict[str, Any]) -> str:
     last_error = ""
     private_to_principal = False
     awaiting: dict[str, Any] | None = None
-    try:
-        async for event in workflow.run(inputs=wf_inputs, store=store):
-            # An approval-gate step yields a WaitForHumanEvent (not a
-            # WorkflowEvent): checkpoint the run and stop. Mirrors
-            # api/routes/workflows.py — the resumer applies the timeout policy
-            # and the inbound resolver records the human's reply.
-            if isinstance(event, WaitForHumanEvent):
-                # Delivery + checkpoint live in `workflows.gate`, shared with
-                # the HTTP route and the resumer. Deliberately NOT suppressed:
-                # if the checkpoint can't be written the run must NOT be
-                # reported as awaiting_human — a silently-dropped checkpoint
-                # would orphan the run in 'running' where the resumer and the
-                # inbound resolver can never find it. Let the failure fall
-                # through to the outer handler, which fails the run.
-                pause = await checkpoint_gate(
-                    run_id=run_id,
-                    event=event,
-                    workflow_title=workflow.title,
-                )
-                awaiting = {
-                    "person_id": pause.person_id,
-                    "question": pause.question,
-                    "awaiting_until": pause.awaiting_until.isoformat(),
-                    "delivery": pause.delivery,
-                    "resumable": pause.resumable,
-                }
-                break
-            if event.type == "artifact" and event.content:
-                artifact = event.content
-            elif event.type == "result" and event.data and event.data.get("private_to_principal"):
-                private_to_principal = True
-            elif event.type == "error" and event.message:
-                last_error = event.message
-    except Exception as exc:
-        logger.exception("run_workflow: workflow.run crashed")
-        last_error = str(exc)[:_EXC_SNIPPET_MAXLEN]
+    from openexecutive.delegation.workflow_reads import private_run
+
+    with private_run(name):
+        try:
+            async for event in run_control.watch(run_id, workflow.run(inputs=wf_inputs, store=store)):
+                # An approval-gate step yields a WaitForHumanEvent (not a
+                # WorkflowEvent): checkpoint the run and stop. Mirrors
+                # api/routes/workflows.py — the resumer applies the timeout policy
+                # and the inbound resolver records the human's reply.
+                if isinstance(event, WaitForHumanEvent):
+                    # Delivery + checkpoint live in `workflows.gate`, shared with
+                    # the HTTP route and the resumer. Deliberately NOT suppressed:
+                    # if the checkpoint can't be written the run must NOT be
+                    # reported as awaiting_human — a silently-dropped checkpoint
+                    # would orphan the run in 'running' where the resumer and the
+                    # inbound resolver can never find it. Let the failure fall
+                    # through to the outer handler, which fails the run.
+                    pause = await checkpoint_gate(
+                        run_id=run_id,
+                        event=event,
+                        workflow_title=workflow.title,
+                    )
+                    awaiting = {
+                        "person_id": pause.person_id,
+                        "question": pause.question,
+                        "awaiting_until": pause.awaiting_until.isoformat(),
+                        "delivery": pause.delivery,
+                        "resumable": pause.resumable,
+                    }
+                    break
+                if event.type == "step_start" and event.step_title:
+                    # The chat follows the run step by step (turn_live).
+                    turn_live.say(event.step_title)
+                if event.type == "artifact" and event.content:
+                    artifact = event.content
+                elif event.type == "result" and event.data and event.data.get("private_to_principal"):
+                    private_to_principal = True
+                elif event.type == "error" and event.message:
+                    last_error = event.message
+        except run_control.RunStopped:
+            _audit(
+                "run_workflow", "write", False,
+                f"run_workflow {name} stopped run_id={run_id}",
+                {"workflow": name, "run_id": run_id, "status": "stopped"},
+            )
+            return json.dumps({
+                "status": "stopped",
+                "workflow": name,
+                "run_id": run_id,
+                "presentation_hint": "Someone pressed Stop on this run. Say it was stopped; do not re-run it.",
+            })
+        except Exception as exc:
+            logger.exception("run_workflow: workflow.run crashed")
+            last_error = str(exc)[:_EXC_SNIPPET_MAXLEN]
 
     if awaiting is not None:
         _audit(

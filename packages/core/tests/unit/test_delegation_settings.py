@@ -75,9 +75,10 @@ def _person(**kw: object) -> Person:
     return Person(**{"id": 1, "full_name": "X", **kw})  # type: ignore[arg-type]
 
 
-def test_only_the_principal_may_have_it() -> None:
+def test_anyone_on_the_team_may_have_it() -> None:
     assert can_delegate(_person(is_principal=True)) is True
-    assert can_delegate(_person()) is False
+    assert can_delegate(_person()) is True
+    assert can_delegate(_person(archived=True)) is False
     assert can_delegate(_person(is_principal=True, archived=True)) is False
     assert can_delegate(_person(is_principal=True, id=None)) is False
     assert can_delegate(None) is False
@@ -99,11 +100,9 @@ def test_a_missing_file_or_table_reads_as_off(tmp_path: Path) -> None:
     assert is_enabled(None) is False
 
 
-def test_the_install_flag_is_the_principals_setting(roster: SimpleNamespace) -> None:
-    # A teammate's row (which the route never writes) does not count.
-    set_enabled(roster.teammate, True, updated_by="test")
+def test_the_install_flag_counts_anyone_on_the_team(roster: SimpleNamespace) -> None:
     assert enabled_for_install() is False
-    set_enabled(roster.principal, True, updated_by="test")
+    set_enabled(roster.teammate, True, updated_by="test")
     assert enabled_for_install() is True
 
 
@@ -158,7 +157,7 @@ def _web(person_id: int, *, signed_in: bool = True) -> Session:
     ("an adapter-verified chat started by an email",
      lambda r: Session(session_id="otherchat:dm:1", origin_channel="otherchat", email_from="olivia@co.example",
                        caller_person_id=r.principal, speaker_verified=True, private_chat=True), False),
-    ("a teammate on the web", lambda r: _web(r.teammate), False),
+    ("a teammate on the web who turned it on", lambda r: _web(r.teammate), True),
     ("an email turn about the principal's mail",
      lambda r: Session(caller_person_id=r.principal, private_to_principal=True), False),
     ("an unattended run", lambda r: Session(caller_person_id=r.principal, unattended=True), False),
@@ -167,7 +166,7 @@ def _web(person_id: int, *, signed_in: bool = True) -> Session:
 ])
 def test_who_is_offered_it(roster: SimpleNamespace, name: str, make, offered: bool) -> None:
     set_enabled(roster.principal, True, updated_by="test")
-    # A teammate with a row of their own is still refused (can_delegate).
+    # A teammate with it on is offered it on their own turn, like the owner.
     set_enabled(roster.teammate, True, updated_by="test")
     session = make(roster)
     pinned = pin_turn_delegation(session, "hi")
@@ -278,10 +277,10 @@ def test_typed_addresses_skip_quoted_backstory() -> None:
 
 
 def test_its_tables_are_per_company() -> None:
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
-    from openexecutive.delegation.schema import TABLES
+    from openexecutive.cli.fixture_loader import RESET_KEEPS
+    from openexecutive.delegation.schema import TABLES, UPGRADES_TABLE
 
-    assert set(TABLES) <= set(_BLANK_WIPE_TABLES)
+    assert set(TABLES) & RESET_KEEPS == {UPGRADES_TABLE}
 
 
 # --------------------------------------------------------------------------- #
@@ -308,7 +307,7 @@ def test_the_setup_check(roster: SimpleNamespace, monkeypatch: pytest.MonkeyPatc
     assert _check(None, "connected", monkeypatch)[0] == "off"
     assert _check(owner, "not_configured", monkeypatch)[0] == "off"
     state, summary = _check(owner, "connected", monkeypatch)
-    assert state == "ok" and "Turn Act as me on" in summary
+    assert state == "ok" and "Turn As you on" in summary
     # Their address is the Executive's own: nothing to fix while it's off.
     assert _check(owner, "shared_mailbox", monkeypatch)[0] == "off"
     assert _check(owner, "needs_reconnect", monkeypatch)[0] == "warn"
@@ -327,7 +326,7 @@ def test_the_setup_check_shows_the_inbox_watcher(roster: SimpleNamespace, monkey
     set_enabled(owner.id, True, updated_by="test")
     inbox.set_watch(owner.id, True, updated_by="test")
     state, summary = _check(owner, "connected", monkeypatch)
-    assert state == "ok" and summary.endswith("Draft replies to my inbox is on.")
+    assert state == "ok" and summary.endswith("Draft replies to your inbox is on.")
     inbox._update_watch(owner.id, status="rate_limited")
     state, summary = _check(owner, "connected", monkeypatch)
     assert state == "warn" and "slow down" in summary

@@ -1,11 +1,11 @@
 """Anthropic tool definitions + handlers for calendar booking (first-climb autonomy).
 
 Exposes two tools to the Executive:
-- `create_calendar_event` — propose (or auto-execute when promoted) a meeting
+- `create_calendar_event` — book a meeting, or propose it when Approvals holds it
 - `cancel_calendar_event` — cancel a previously booked event
 
-The handler enforces code-enforced caps regardless of trust-ledger mode, routes
-through gate_action for the MEETING_SCHEDULING scope, writes a decision_instances
+The handler checks the request is well formed, lets Approvals
+(``orchestrator.levels``) decide whether it books or waits on a card, writes a decision_instances
 row so the trust ledger fills, and delegates the actual calendar operation to the
 configured backend (`integrations.workspace`: Google Calendar via workspace-mcp
 or Outlook via ms-365-mcp-server, per CALENDAR_PROVIDER).
@@ -21,6 +21,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+
+from openexecutive.memory import workspace_settings
+from openexecutive.memory.workspace_settings import COMPANY_TIME_HINT
 
 if TYPE_CHECKING:
     from openexecutive.departments.authority import GateDecision
@@ -61,15 +64,16 @@ CREATE_CALENDAR_EVENT_TOOL: dict[str, Any] = {
     "description": (
         "Schedule a FUTURE calendar meeting with one or more people from the "
         "roster (use create_instant_meeting for a call happening right now). "
-        "In propose-only mode (default) this creates a Proposal that the "
-        "approver must action before the event is actually created. A video-"
+        "It books when the principal asked for it, or under Hands-off; "
+        "otherwise it creates a Proposal that the approver must action before "
+        "the event is actually created. A video-"
         "meeting link (Google Meet or Microsoft Teams, per the configured "
         "calendar) is attached automatically unless you set "
         "add_video_link=false for an in-person meeting. "
         "Use `attendee_person_ids` — NOT raw email addresses — so the system can "
         "verify attendees are on the People roster. "
         "You may use this proactively (e.g. when a goal has stalled and a sync "
-        "would unblock it); proactive bookings still go through approval. "
+        "would unblock it); below Hands-off, proactive bookings go through approval. "
         "Put any agenda or talking points in `description` so attendees see them. "
         "You MUST supply `confidence` (0.0–1.0) reflecting how certain you are "
         "this meeting, at this time, with these people, is the right action."
@@ -83,16 +87,19 @@ CREATE_CALENDAR_EVENT_TOOL: dict[str, Any] = {
             },
             "start": {
                 "type": "string",
-                "description": "Start time in ISO 8601 format with timezone (e.g. 2025-06-15T14:00:00+00:00)",
+                "description": "Start time. " + COMPANY_TIME_HINT,
             },
             "end": {
                 "type": "string",
-                "description": "End time in ISO 8601 format with timezone. Must be after start.",
+                "description": "End time, after the start. " + COMPANY_TIME_HINT,
             },
             "attendee_person_ids": {
                 "type": "array",
                 "items": {"type": "integer"},
-                "description": "Person IDs (from lookup_person) of all attendees. Max 7 plus the organizer.",
+                "description": (
+                    "Person IDs (from lookup_person) of all attendees. Max 7 plus the organizer. "
+                    "For a meeting with the principal alone, pass [] with include_principal true."
+                ),
             },
             "description": {
                 "type": "string",
@@ -205,19 +212,115 @@ CALENDAR_TOOLS: list[dict[str, Any]] = [
 # Maps the calendar tool names to the integration flag checked by the tool filter.
 CALENDAR_TOOL_INTEGRATION = "calendar"
 
+# A connected calendar's own create tool books a meeting at once, with no
+# card. A new meeting with people the model asks for goes through
+# create_calendar_event instead, so the approval settings decide every time
+# (a card, or booked at once), whichever tool the model reached for.
+_RAW_CREATE_TOOLS = frozenset({
+    "google_workspace__manage_event",
+    "microsoft_365__create_calendar_event",
+    "microsoft_365__create_specific_calendar_event",
+})
+RAW_BOOKING_REFUSAL = (
+    "Book a new meeting with people through create_calendar_event (person ids "
+    "from lookup_person), not the calendar's own tool: it follows the approval "
+    "settings and puts up the card when one is needed. Call it now."
+)
+
+
+def _has_attendees(value: Any) -> bool:
+    """Whether ``value`` (a call's arguments) names an attendee anywhere."""
+    if isinstance(value, dict):
+        return any(
+            (str(k).lower().endswith("attendees") and bool(v)) or _has_attendees(v)
+            for k, v in value.items()
+        )
+    if isinstance(value, list):
+        return any(_has_attendees(v) for v in value)
+    return False
+
+
+def raw_booking_refusal(tool_input: Any) -> str | None:
+    """The refusal for a model's raw create-event call that invites people
+    while create_calendar_event is on, else None. Only for a turn that offers
+    create_calendar_event (``typed_booking_only``)."""
+    if not isinstance(tool_input, dict):
+        return None
+    name = str(tool_input.get("name") or "").strip().lower().replace("-", "_")
+    if name not in _RAW_CREATE_TOOLS:
+        return None
+    arguments = tool_input.get("arguments")
+    if not isinstance(arguments, dict) or not _has_attendees(arguments):
+        return None
+    if name == "google_workspace__manage_event" and str(arguments.get("action") or "").strip().lower() != "create":
+        return None
+    try:
+        from openexecutive.config import get_settings
+
+        if not get_settings().calendar_booking_enabled:
+            return None
+    except Exception:
+        return None
+    return json.dumps({"error": RAW_BOOKING_REFUSAL})
+
+
+def calendar_gateway(settings: Any = None) -> Any:
+    """The tool gateway bookings go through, or ``None`` when they can't
+    reach a calendar: booking is off, the gateway is down, or the calendar
+    provider's tools aren't loaded (a Google server started with mail only
+    has no Calendar). Every place that offers or books a meeting asks this,
+    so none offers a calendar that isn't there."""
+    from openexecutive.config import get_settings
+    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+
+    settings = settings or get_settings()
+    if not getattr(settings, "calendar_booking_enabled", False):
+        return None
+    gateway = get_active_gateway()
+    if gateway is None:
+        return None
+    # The servers it started with (a started gateway always names some).
+    named = getattr(gateway, "server_names", None)
+    servers: tuple[str, ...] = tuple(named) if isinstance(named, tuple | list) else ()
+    known = bool(servers)
+    if getattr(settings, "calendar_provider", "google") != "google":
+        return gateway if not known or "microsoft_365" in servers else None
+    if known and "google_workspace" not in servers:
+        return None
+    service_on = getattr(settings, "google_service_on", None)
+    return gateway if not callable(service_on) or service_on("calendar") else None
+
+
+def calendar_connected(settings: Any = None) -> bool:
+    """Whether bookings can reach a calendar (``calendar_gateway``)."""
+    return calendar_gateway(settings) is not None
+
+
+def typed_booking_only(offered: bool, call_tool: Any) -> Any:
+    """Wrap the model's ``call_tool``: on a turn that offers
+    create_calendar_event, a raw booking with people is sent back to it
+    (``raw_booking_refusal``). Elsewhere ``call_tool`` as it is."""
+    if not offered:
+        return call_tool
+
+    async def wrapped(tool_input: dict[str, Any]) -> str:
+        refused = raw_booking_refusal(tool_input)
+        if refused is not None:
+            return refused
+        return await call_tool(tool_input)
+
+    return wrapped
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _parse_iso(raw: str) -> datetime | None:
-    """Parse an ISO 8601 string; return None on failure."""
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return dt.astimezone(UTC)
-    except (ValueError, AttributeError):
-        return None
+    """A time from the Executive in UTC (``company_time``: no offset is the
+    company's time), or None."""
+    dt = workspace_settings.company_time(raw)
+    return dt.astimezone(UTC) if dt is not None else None
 
 
 def is_business_day(day: date) -> bool:
@@ -227,12 +330,15 @@ def is_business_day(day: date) -> bool:
 
 
 def _check_business_hours(dt: datetime, start_hhmm: str, end_hhmm: str) -> bool:
-    """Return True if dt falls within business hours (single-tz, v1 limitation)."""
+    """Return True if dt falls within business hours, read on the clock of
+    the company's time zone (Settings): 2 PM in New York is 2 PM, not 19:00."""
     try:
         sh, sm = (int(x) for x in start_hhmm.split(":"))
         eh, em = (int(x) for x in end_hhmm.split(":"))
     except (ValueError, AttributeError):
         return True  # misconfigured cap → don't block
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(workspace_settings.get_user_timezone())
     if not is_business_day(dt.date()):
         return False
     t_minutes = dt.hour * 60 + dt.minute
@@ -242,13 +348,12 @@ def _check_business_hours(dt: datetime, start_hhmm: str, end_hhmm: str) -> bool:
 def _resolve_attendees(
     attendee_person_ids: list[Any],
     include_principal: bool,
-    max_attendees: int,
 ) -> tuple[list[str], list[int]] | dict[str, str]:
     """Validate attendee person IDs against the roster and resolve their emails.
 
     Returns ``(emails, int_ids)`` in input order on success, or an
     ``{"error": ...}`` dict on the first validation failure. Enforces: non-empty,
-    max-attendees, roster membership, non-archived, present email, and
+    roster membership, non-archived, present email, and
     principal-protection (the principal is only allowed when ``include_principal``
     is set). Shared by both the scheduled and instant booking handlers.
 
@@ -261,15 +366,17 @@ def _resolve_attendees(
     from openexecutive.orchestrator.people_tools import (
         PRIVATE_TURN_REFUSAL,
         contacts_reachable_now,
-        turn_is_private_to_principal,
+        private_turn_holds,
     )
     from openexecutive.people.store import list_people
 
     if not attendee_person_ids:
-        return {"error": "attendee_person_ids must not be empty"}
-    if len(attendee_person_ids) > max_attendees:
-        return {"error": f"too many attendees (max {max_attendees})"}
-
+        # A meeting with the principal alone ("put 30 minutes with me on
+        # Friday") names nobody else: book them, as they asked.
+        principal = _principal_id() if include_principal else None
+        if principal is None:
+            return {"error": "attendee_person_ids must not be empty"}
+        attendee_person_ids = [principal]
     all_people = {
         p.id: p
         for p in list_people(include_contacts=contacts_reachable_now())
@@ -289,7 +396,7 @@ def _resolve_attendees(
             return {"error": f"person {person.full_name!r} (id={person_id}) has no email"}
         if getattr(person, "archived", False):
             return {"error": f"person {person.full_name!r} (id={person_id}) is archived"}
-        if turn_is_private_to_principal() and not person.is_principal:
+        if private_turn_holds() and not person.is_principal:
             return {"error": PRIVATE_TURN_REFUSAL}
         if outside_content.added_this_turn(person_id):
             return json.loads(outside_content.added_person_error(f"person_id {person_id}"))
@@ -321,19 +428,6 @@ def _principal_id() -> int | None:
 
     principal = find_principal_person()
     return principal.id if principal is not None else None
-
-
-def _daily_cap_reached(now: datetime, max_per_day: int) -> bool:
-    """True if today's non-failed meeting_scheduling bookings hit the daily cap."""
-    from openexecutive.memory.decision_ledger import STATUS_FAILED, list_instances
-
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    today_instances = [
-        i for i in list_instances("meeting_scheduling")
-        if i.created_at >= today_start
-        and i.status not in (STATUS_FAILED, "rejected", "auto_no_response")
-    ]
-    return len(today_instances) >= max_per_day
 
 
 def _pick_recap_target(
@@ -520,10 +614,13 @@ def _approval_card_here(session: Any, approver_person_id: int | None, private: b
     """Whether the person in this web chat may approve the booking, so its card
     is shown under the reply. The same rule as ``decisions._resolver``: the
     principal, or the approver it went to unless it is the principal's private
-    booking. Any other surface (Slack, email, a scheduled run) shows no card."""
+    booking. A chat app that shows cards with buttons
+    (``channel_cards.shows_cards``) counts as the web chat; any other surface
+    (Slack, email, a scheduled run) shows no card."""
+    from openexecutive.integrations.channel_cards import card_here
     from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
 
-    if session is None or not getattr(session, "from_web_chat", False):
+    if session is None or not card_here(session):
         return False
     if is_principal_on_verified_surface(session):
         return True
@@ -554,27 +651,32 @@ _NOT_FROM_HERE = (
 )
 
 
-def _solo_meeting_gate(class_mode: str, session: Any) -> GateDecision:
-    """The meeting gate in solo mode. No department is consulted — the
-    install's departments are only the principal's areas, not an
-    organisation with an operations team — so the ``meeting_scheduling``
-    class mode (the principal's own setting, PUT
-    /decisions/classes/meeting_scheduling) decides, and ``auto_execute``
-    books right away only when the principal started this turn on a surface
-    that verified it is them (the roster-write rule,
-    ``people_tools.is_principal_on_verified_surface``). Anything else — an
-    inbound email, a contact's message, an unattended run — is proposed to
-    the principal on the briefing, so text someone else wrote cannot put a
-    meeting on the principal's calendar — or to a teammate who holds the
-    Meetings approval range on People, when there is one."""
+def _meeting_gate(session: Any, *, out_of_hours: bool = False) -> GateDecision:
+    """Whether a booking goes now or waits on a card: Approvals
+    (``orchestrator.levels``), at the level of whoever is asking. Someone on
+    the team asking on a surface that verified who they are books it, and so
+    does anything under Hands-off. Below Hands-off, a time outside business
+    hours waits on the asker's own card. Anything else (an inbound email, a
+    contact's message, an unattended run) is proposed to the principal, or to
+    a teammate who holds the Meetings approval range on People, so text
+    someone else wrote cannot put a meeting on anyone's calendar."""
     from openexecutive.departments.authority import GateDecision
-    from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
+    from openexecutive.orchestrator import levels
+    from openexecutive.orchestrator.people_tools import teammate_on_verified_surface
 
-    if class_mode == "auto_execute" and is_principal_on_verified_surface(session):
-        return GateDecision(
-            allowed=True, action="execute", reason="solo: meeting_scheduling is auto_execute"
-        )
+    asked = _asked_on_a_verified_surface(session)
+    if levels.relaxed() or (asked and not out_of_hours):
+        return GateDecision(allowed=True, action="execute", reason="Approvals lets it run")
     approver_id: int | None = None
+    if asked:
+        teammate = teammate_on_verified_surface(session)
+        approver_id = teammate.id if teammate is not None else _principal_id()
+        return GateDecision(
+            allowed=False,
+            action="propose",
+            assignee_person_id=approver_id,
+            reason="outside business hours, below Hands-off — proposing",
+        )
     try:
         from openexecutive.people.models import AuthorityScope
         from openexecutive.people.store import find_approvers, find_principal_person
@@ -591,38 +693,27 @@ def _solo_meeting_gate(class_mode: str, session: Any) -> GateDecision:
         allowed=False,
         action="propose",
         assignee_person_id=approver_id,
-        reason=(
-            "solo: meeting_scheduling proposes to its approver"
-            if class_mode != "auto_execute"
-            else "solo: auto_execute needs the principal on a verified surface — proposing"
-        ),
+        reason="nobody on the team asked, below Hands-off — proposing",
     )
 
 
 async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
-    """Propose (or auto-execute when promoted) a calendar meeting."""
+    """Book a calendar meeting, or propose it when Approvals holds it."""
     from openexecutive.config import get_settings
-    from openexecutive.departments.authority import gate_action
     from openexecutive.memory.decision_ledger import (
         STATUS_FAILED,
         _idem_key,
         create_decision_instance,
-        get_class_mode,
         get_live_by_idem,
         mark_executed,
         mark_resolved,
     )
-    from openexecutive.memory.workspace_settings import effective_workspace_mode
-    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
     from openexecutive.orchestrator.schedule_tools import current_session
-    from openexecutive.people.models import AuthorityScope
 
     settings = get_settings()
 
     # 1. Gate: calendar must be enabled and MCP must be active.
-    if not settings.calendar_booking_enabled:
-        return json.dumps({"error": "calendar booking isn't turned on for this workspace"})
-    gateway = get_active_gateway()
+    gateway = calendar_gateway(settings)
     if gateway is None:
         return json.dumps({"error": "the calendar isn't connected right now"})
 
@@ -656,45 +747,25 @@ async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
     start = _parse_iso(start_raw)
     end = _parse_iso(end_raw)
     if start is None:
-        return json.dumps({"error": f"start is not valid ISO 8601: {start_raw!r}"})
+        return json.dumps({"error": f"start {start_raw!r} can't be read. {COMPANY_TIME_HINT}"})
     if end is None:
-        return json.dumps({"error": f"end is not valid ISO 8601: {end_raw!r}"})
+        return json.dumps({"error": f"end {end_raw!r} can't be read. {COMPANY_TIME_HINT}"})
     if start <= now:
         return json.dumps({"error": "start must be in the future"})
     if end <= start:
         return json.dumps({"error": "end must be after start"})
 
-    # 4. Cap: horizon.
-    horizon = now + timedelta(days=settings.calendar_horizon_days)
-    if start > horizon:
-        return json.dumps({
-            "error": f"start is more than {settings.calendar_horizon_days} days out",
-        })
-
-    # 5. Cap: business hours / weekday (single-tz v1 — TODO: per-person timezone).
-    if not _check_business_hours(start, settings.calendar_business_hours_start,
-                                 settings.calendar_business_hours_end):
-        return json.dumps({
-            "error": (
-                f"start is outside business hours "
-                f"({settings.calendar_business_hours_start}–"
-                f"{settings.calendar_business_hours_end}) or falls on a weekend"
-            ),
-        })
-
-    # 6-7. Caps: attendee roster gate + principal protection.
-    resolved = _resolve_attendees(
-        attendee_person_ids, include_principal, settings.calendar_max_attendees
+    # 4. Outside business hours or on a weekend (the company's time zone) it
+    # waits on a card below Hands-off rather than booking: the step below.
+    out_of_hours = not _check_business_hours(
+        start, settings.calendar_business_hours_start, settings.calendar_business_hours_end
     )
+
+    # 5. Attendees: on the roster, with an email, principal protection.
+    resolved = _resolve_attendees(attendee_person_ids, include_principal)
     if isinstance(resolved, dict):
         return json.dumps(resolved)
     attendee_emails, attendee_int_ids = resolved
-
-    # 8. Cap: max events per day.
-    if _daily_cap_reached(now, settings.calendar_max_events_per_day):
-        return json.dumps({
-            "error": f"daily calendar booking cap reached (max {settings.calendar_max_events_per_day})",
-        })
 
     # 9. Idempotency: if an identical live proposal exists, return it. No new
     # briefing alert here — the original propose call already created one
@@ -715,35 +786,10 @@ async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
             ),
         })
 
-    # 10. Authority gate.
+    # 7. Approvals decides.
     session = current_session.get()
     session_id = getattr(session, "session_id", None) if session is not None else None
-    class_mode = get_class_mode("meeting_scheduling")
-
-    if effective_workspace_mode(session) == "solo":
-        # Solo: the principal is the only approver and there is no operations
-        # department to consult — the class mode decides.
-        gate_decision = _solo_meeting_gate(class_mode, session)
-    else:
-        gate_decision = gate_action(
-            "operations",
-            "meeting_scheduling",
-            required_scope=AuthorityScope.MEETING_SCHEDULING,
-            now=now,
-        )
-        if gate_decision.action == "execute" and not _asked_on_a_verified_surface(session):
-            # The department's authority covers its people asking, not text
-            # from outside (an inbound email): that waits for an approver.
-            # An execute decision carries no approver: route it as a proposal.
-            from openexecutive.departments.authority import _route_proposal
-
-            gate_decision = _route_proposal(
-                department_slug="operations",
-                action="propose",
-                required_scope=AuthorityScope.MEETING_SCHEDULING,
-                now=now,
-                reason="auto_execute needs someone on the team on a verified surface — proposing",
-            )
+    gate_decision = _meeting_gate(session, out_of_hours=out_of_hours)
     # With a contact on the invite the booking is private to the principal:
     # they approve it (only they may reach a contact at approval time) and
     # nobody else sees the proposal.
@@ -759,6 +805,17 @@ async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
         tool_input, getattr(settings, "calendar_meet_links_enabled", True)
     )
 
+    # Why it waits, in the reader's words, for its card on Home (only when it
+    # waits): someone on the team asked and the department can't book alone,
+    # or nobody on the team asked (an email, a contact, an unattended run).
+    waiting_because = ""
+    if gate_decision.action != "execute":
+        waiting_because = (
+            "It's outside business hours, so it needs an OK before it books."
+            if _asked_on_a_verified_surface(session)
+            else "Nobody on your team asked for it here: it came from an email, a contact or a scheduled run."
+        )
+
     # Build the payload that will be re-used at execute time.
     proposed_payload = {
         "title": title,
@@ -769,6 +826,7 @@ async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
         "description": description,
         "add_video_link": add_video_link,
         **({"private": True} if private else {}),
+        **({"waiting_because": waiting_because} if waiting_because else {}),
     }
 
     # 11. Record in the ledger.
@@ -791,10 +849,9 @@ async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
     # card is booked now: asking them again would only repeat the question.
     approved = _approved_by.get()
     already_approved = approved is not None and approved == approver_person_id
-    if (gate_decision.action == "execute" and class_mode == "auto_execute") or already_approved:
-        # Auto-execute path (Build 3 — only reachable after promotion). The
-        # booking happens now, so there is nothing to approve — deliberately
-        # NO briefing alert here.
+    if gate_decision.action == "execute" or already_approved:
+        # The booking happens now, so there is nothing to approve —
+        # deliberately NO briefing alert here.
         result = await _do_create_event(gateway, proposed_payload)
         if "error" in result:
             # Mark the ledger row failed so it doesn't pollute the
@@ -846,9 +903,8 @@ async def handle_create_instant_meeting(tool_input: dict[str, Any]) -> str:
     """Book an impromptu meeting starting now and return the video-meeting link.
 
     Unlike create_calendar_event this auto-executes immediately (no approval
-    step — the user asked for a call *now*) and skips the horizon and
-    business-hours/weekday caps. It still enforces the roster gate,
-    max-attendees, principal-protection, and the daily booking cap, and records
+    step — the user asked for a call *now*). It still checks the attendees
+    are on the roster and protects the principal, and records
     an executed row in the decision ledger for audit.
     """
     from openexecutive.config import get_settings
@@ -859,14 +915,11 @@ async def handle_create_instant_meeting(tool_input: dict[str, Any]) -> str:
         mark_executed,
         mark_resolved,
     )
-    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
     from openexecutive.orchestrator.schedule_tools import current_session
 
     settings = get_settings()
 
-    if not settings.calendar_booking_enabled:
-        return json.dumps({"error": "calendar booking isn't turned on for this workspace"})
-    gateway = get_active_gateway()
+    gateway = calendar_gateway(settings)
     if gateway is None:
         return json.dumps({"error": "the calendar isn't connected right now"})
     # It books at once, with no approval: only for someone on the team.
@@ -903,22 +956,14 @@ async def handle_create_instant_meeting(tool_input: dict[str, Any]) -> str:
         })
 
     now = datetime.now(UTC)
-    # Start a beat out so the invite lands before the event begins. No horizon
-    # or business-hours caps — an impromptu call is intentionally "now".
+    # Start a beat out so the invite lands before the event begins.
     start = now + _INSTANT_START_LEAD
     end = start + timedelta(minutes=duration_minutes)
 
-    resolved = _resolve_attendees(
-        attendee_person_ids, include_principal, settings.calendar_max_attendees
-    )
+    resolved = _resolve_attendees(attendee_person_ids, include_principal)
     if isinstance(resolved, dict):
         return json.dumps(resolved)
     attendee_emails, attendee_int_ids = resolved
-
-    if _daily_cap_reached(now, settings.calendar_max_events_per_day):
-        return json.dumps({
-            "error": f"daily calendar booking cap reached (max {settings.calendar_max_events_per_day})",
-        })
 
     payload = {
         "title": title,

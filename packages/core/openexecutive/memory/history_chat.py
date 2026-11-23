@@ -99,6 +99,11 @@ def verified_speaker(session: Any, person: Any) -> bool:
             or getattr(session, "private_to_principal", False) is True
             or bool(getattr(session, "email_from", None))
             or isinstance(getattr(session, "delegation_override", None), DelegationOverride)
+            # Another AI app's text, even on a turn allowed to act: never
+            # noted as the person's own words. Nor a host origin's turn,
+            # which a script on that host's page could have written.
+            or getattr(session, "from_mcp_client", False) is True
+            or getattr(session, "from_host", False) is True
         ):
             return False
         if getattr(session, "caller_person_id", None) != person.id:
@@ -116,15 +121,6 @@ def verified_speaker(session: Any, person: Any) -> bool:
     except Exception:
         logger.warning("history: couldn't verify the speaker — not noting", exc_info=True)
         return False
-
-
-def private_chat(session: Any) -> bool:
-    """Whether nobody but the speaker (and the Executive) reads this
-    conversation: the web chat, a Slack or Discord DM, a Telegram chat, or
-    one its adapter marked so (``Session.private_chat``)."""
-    from openexecutive.delegation.settings import private_conversation
-
-    return getattr(session, "private_chat", False) is True or private_conversation(session)
 
 
 def chat_channel(session: Any) -> str:

@@ -19,19 +19,6 @@ export function isContact(person: Pick<Person, "kind">): boolean {
   return person.kind === "contact";
 }
 
-/** The tabs this viewer gets: Contacts is the principal's alone. */
-export function tabsFor(viewerIsPrincipal: boolean): PeopleTab[] {
-  return viewerIsPrincipal ? ["team", "contacts"] : ["team"];
-}
-
-/**
- * Where the page opens: using it just for yourself, the people the principal
- * adds are mostly contacts. Anyone else only ever has the Team tab.
- */
-export function defaultPeopleTab(mode: WorkspaceMode, viewerIsPrincipal = true): PeopleTab {
-  return viewerIsPrincipal && mode === "solo" ? "contacts" : "team";
-}
-
 /**
  * The people a tab lists. In solo mode the Team tab is just the principal:
  * there is no team to show.
@@ -48,9 +35,14 @@ export function hiddenTeamCount(people: KindFields[], mode: WorkspaceMode): numb
   return people.filter((p) => !isContact(p) && !p.is_principal).length;
 }
 
-/** The kind the add form starts on: whatever the open tab lists. */
-export function defaultKindForTab(tab: PeopleTab): PersonKind {
-  return tab === "contacts" ? "contact" : "team";
+/**
+ * "This is me — Primary" is only for the first setup: once someone on the
+ * list is the principal, nobody else can be, so the add form doesn't offer
+ * it (not even to the principal, who is already on the list). Not offered
+ * while the list is still loading either.
+ */
+export function canClaimPrincipal(people: Pick<Person, "is_principal">[], loading: boolean): boolean {
+  return !loading && !people.some((p) => p.is_principal);
 }
 
 /** The principal is always on the team, whatever the form says. */
@@ -60,29 +52,9 @@ export function effectiveKind(kind: PersonKind, isPrincipal: boolean): PersonKin
 
 /**
  * Adding someone to the team while using Open Executive just for yourself
- * means there is a team now: offer to switch the workspace to team mode.
- * Never for the principal's own entry or for a contact.
+ * means there is a team now: the workspace switches to team mode on its own,
+ * without asking. Never for the principal's own entry or for a contact.
  */
-export function shouldOfferTeamMode(mode: WorkspaceMode, kind: PersonKind, isPrincipal: boolean): boolean {
+export function shouldSwitchToTeam(mode: WorkspaceMode, kind: PersonKind, isPrincipal: boolean): boolean {
   return mode === "solo" && effectiveKind(kind, isPrincipal) === "team" && !isPrincipal;
-}
-
-export type CardStatusTone = "ok" | "warn" | "muted";
-
-/**
- * The one status a People card shows. A contact: whether there's an email to
- * reach them on. A team member on leave: until when (an ISO date, compared
- * with `today` as YYYY-MM-DD). Anyone else on the team: how fast they're
- * expected to reply. Their approval scopes are on their own page.
- */
-export function personCardStatus(
-  person: Pick<Person, "kind" | "email" | "on_leave_until" | "response_sla_hours">,
-  today: string,
-): { label: string; tone: CardStatusTone } {
-  if (isContact(person)) {
-    return person.email ? { label: "Email on file", tone: "ok" } : { label: "No email", tone: "muted" };
-  }
-  const leave = person.on_leave_until?.slice(0, 10);
-  if (leave && leave >= today) return { label: `On leave until ${leave}`, tone: "warn" };
-  return { label: `Replies within ${person.response_sla_hours}h`, tone: "ok" };
 }

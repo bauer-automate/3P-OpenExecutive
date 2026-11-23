@@ -42,8 +42,8 @@ GUIDE_SECTIONS: list[GuideSection] = [
     ),
     GuideSection(
         id="pulse",
-        title="Pulse (Memory)",
-        sub="The Executive's running memory — decisions made, initiatives in flight, advice gathered, corrections kept.",
+        title="Memory",
+        sub="What the Executive knows about you and the company, what you taught it, what it worked out, and what it does on its own.",
     ),
     GuideSection(
         id="review",
@@ -57,8 +57,8 @@ GUIDE_SECTIONS: list[GuideSection] = [
     ),
     GuideSection(
         id="artifacts",
-        title="Documents",
-        sub="Your library of finished documents — drafts and workflow outputs in one place.",
+        title="Made for you",
+        sub="What the Executive made for you — documents, drafts and workflow outputs in one place.",
     ),
     GuideSection(
         id="watchlist",
@@ -82,8 +82,8 @@ GUIDE_SECTIONS: list[GuideSection] = [
     ),
     GuideSection(
         id="knowledge",
-        title="Knowledge Base",
-        sub="Upload company documents so the Executive can ground its answers in your context.",
+        title="Knowledge",
+        sub="Your company files, so the Executive can ground its answers in your context.",
     ),
     GuideSection(
         id="skills",
@@ -92,7 +92,7 @@ GUIDE_SECTIONS: list[GuideSection] = [
     ),
     GuideSection(
         id="custom_tools",
-        title="Custom Tools",
+        title="Tools I Built",
         sub="When the Executive lacks a tool, it builds one — and keeps the ones it will need again.",
     ),
     GuideSection(

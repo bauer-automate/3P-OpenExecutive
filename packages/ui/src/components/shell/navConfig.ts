@@ -48,6 +48,13 @@ interface BuildOpts {
    * but the principal).
    */
   roleKind?: RoleKind | null;
+  /**
+   * Whether any department exists. A team's Departments tab shows only then:
+   * goals stand on their own, so a team may never need one (it is reached
+   * from the Goals page's "Add a department"). Defaults to true, so a caller
+   * that doesn't know keeps the tab.
+   */
+  hasDepartments?: boolean;
 }
 
 // What the profile at /company-profile is called. A team's is its company.
@@ -111,19 +118,24 @@ const GOALS_ITEM: NavItem = {
 
 // The Company hub's tabs in a team: who's on it, what you're aiming for,
 // how it's organised, and the profile.
-function companyTabs(isOnboarded: boolean): NavItem[] {
+function companyTabs(isOnboarded: boolean, hasDepartments: boolean): NavItem[] {
   return [
     { href: "/people", label: "People", icon: "users", description: PEOPLE_DESCRIPTION },
     {
       ...GOALS_ITEM,
-      description: "Every department's goals in one place — add, update and close them.",
+      description: "Every goal in one place, by owner, department or status — add, update and close them.",
     },
-    {
-      href: "/departments",
-      label: "Departments",
-      icon: "grid",
-      description: "Your departments, their goals, how much each may decide on its own, and the expert behind each.",
-    },
+    ...(hasDepartments
+      ? [
+          {
+            href: "/departments",
+            label: "Departments",
+            icon: "grid",
+            description:
+              "Your departments, their goals, how much each may decide on its own, and the expert behind each.",
+          } satisfies NavItem,
+        ]
+      : []),
     profileItem("company", isOnboarded),
   ];
 }
@@ -146,6 +158,12 @@ function youTabs(isOnboarded: boolean, roleKind: RoleKind | null): NavItem[] {
 
 const WORK_TABS: NavItem[] = [
   {
+    href: "/tasks",
+    label: "Tasks",
+    icon: "check-circle",
+    description: "What you and your team owe, with who, when and where it came from.",
+  },
+  {
     href: "/jobs",
     label: "Workflows",
     icon: "doc",
@@ -153,9 +171,9 @@ const WORK_TABS: NavItem[] = [
   },
   {
     href: "/artifacts",
-    label: "Documents",
+    label: "Made for you",
     icon: "book",
-    description: "Your library of finished documents — drafts and workflow outputs.",
+    description: "What your Executive made for you — documents, drafts and workflow outputs.",
   },
   {
     href: "/watchlist",
@@ -163,41 +181,23 @@ const WORK_TABS: NavItem[] = [
     icon: "eye",
     description: "External monitors — tickers, feeds, status pages — that raise alerts.",
   },
+  {
+    href: "/schedule",
+    label: "Schedule",
+    icon: "calendar",
+    description: "Everything it does without being asked, soonest first.",
+  },
 ];
 
-// The Delegate hub's tabs: what it may do without asking (one read-only
-// page over all of them), then what the Executive does as you (Act as me,
-// Handle it for me) and on its own (Take the lead). Each of those is a named
-// feature, so its tab shows the brand label.
-const DELEGATE_TABS: NavItem[] = [
-  {
-    href: "/delegate/what-it-may-do",
-    label: "What it may do",
-    icon: "eye",
-    description: "Everything that goes out without asking you, and the setting that allows it.",
-  },
-  {
-    href: "/delegate/act-as-me",
-    label: "Act as me",
-    icon: "mail",
-    feature: "act_as_me",
-    description: "Your mailbox, drafts written as you, and how you write.",
-  },
-  {
-    href: "/delegate/handle-it",
-    label: "Handle it for me",
-    icon: "check-circle",
-    feature: "handle_it",
-    description: "Replies and follow-ups it sends as you on its own.",
-  },
-  {
-    href: "/delegate/take-the-lead",
-    label: "Take the lead",
-    icon: "bolt",
-    feature: "take_the_lead",
-    description: "What it does in its own name without waiting to be asked.",
-  },
-];
+// Delegate: one page (app/delegate/page.tsx) in three blocks: As you (Act
+// as me), As me (Take the lead) and Approvals.
+// The older tabs' addresses land on their block.
+export const DELEGATE_NAV_ITEM: NavItem = {
+  href: "/delegate",
+  label: "Delegate",
+  icon: "check-circle",
+  description: "What your Executive does as you and in its own name, and what waits for your yes.",
+};
 
 /**
  * A hub: one menu entry that holds several pages, shown as a row of tabs at
@@ -205,7 +205,7 @@ const DELEGATE_TABS: NavItem[] = [
  * the first tab.
  */
 export interface Hub {
-  key: "work" | "company" | "you" | "delegate";
+  key: "work" | "company" | "you";
   label: string;
   icon: IconName;
   description: string;
@@ -216,12 +216,13 @@ export function buildHubs({
   isOnboarded = true,
   mode = "team",
   roleKind = null,
+  hasDepartments = true,
 }: BuildOpts = {}): Hub[] {
   const work: Hub = {
     key: "work",
     label: "Work",
     icon: "briefcase",
-    description: "Workflows, finished documents and the watch list.",
+    description: "Tasks, workflows, what it made for you, the watch list and the schedule.",
     tabs: WORK_TABS,
   };
   const people: Hub =
@@ -238,31 +239,27 @@ export function buildHubs({
           label: "Company",
           icon: "building",
           description: "People, goals, departments and the company profile.",
-          tabs: companyTabs(isOnboarded),
+          tabs: companyTabs(isOnboarded, hasDepartments),
         };
-  const delegate: Hub = {
-    key: "delegate",
-    label: "Delegate",
-    icon: "check-circle",
-    description: "What your Executive does as you, and on its own: Act as me, Handle it for me, Take the lead.",
-    tabs: DELEGATE_TABS,
-  };
-  return [work, people, delegate];
+  return [work, people];
 }
 
 // The hub a page belongs to, or null for a page that isn't in one.
 export function hubForPath(pathname: string, opts: BuildOpts = {}): Hub | null {
+  // On the Departments pages the tab shows even before the first department
+  // exists: that is where it gets added.
+  const withTab = isNavActive("/departments", pathname) ? { ...opts, hasDepartments: true } : opts;
   return (
-    buildHubs(opts).find((hub) => hub.tabs.some((tab) => isNavActive(tab.href, pathname))) ?? null
+    buildHubs(withTab).find((hub) => hub.tabs.some((tab) => isNavActive(tab.href, pathname))) ?? null
   );
 }
 
 export const PULSE_NAV_ITEM: NavItem = {
   href: "/memories",
-  label: "Pulse",
+  label: "Memory",
   icon: "activity",
   description:
-    "The Executive's memory and heartbeat — what it knows and the rhythm it runs on.",
+    "What the Executive knows and where it came from, and what it does on its own.",
 };
 
 /** A main-menu entry. A hub's entry is active on any of its tabs. */
@@ -280,8 +277,9 @@ export function buildDestinations({
   reviewBadge = 0,
   mode = "team",
   roleKind = null,
+  hasDepartments = true,
 }: BuildOpts = {}): Destination[] {
-  const hubs = buildHubs({ isOnboarded, mode, roleKind });
+  const hubs = buildHubs({ isOnboarded, mode, roleKind, hasDepartments });
   const hubEntry = (hub: Hub): Destination => ({
     key: hub.key,
     href: hub.tabs[0].href,
@@ -300,6 +298,7 @@ export function buildDestinations({
       description: "Every conversation, searchable — including Slack, Telegram and Discord.",
     },
     ...hubs.map(hubEntry),
+    { key: "delegate", ...DELEGATE_NAV_ITEM },
     {
       key: "knowledge",
       href: "/knowledge",
@@ -307,7 +306,7 @@ export function buildDestinations({
       icon: "book",
       badge: reviewBadge,
       description:
-        "Upload company documents so the Executive can ground its answers in your context, and approve what it relies on.",
+        "Your company files, so the Executive can ground its answers in your context, and approve what it relies on.",
     },
     { key: "pulse", ...PULSE_NAV_ITEM },
   ];
@@ -380,7 +379,7 @@ export const ADVANCED_ITEMS: AdvancedItem[] = [
     icon: "doc-search",
     group: "diagnose",
     description:
-      "A searchable record of everything the Executive did: each chat, each question it passed to an expert, each tool it used and each scheduled job.",
+      "A searchable record of everything the Executive did: each chat, each question it passed to an expert, each tool it used and each thing it did on a schedule.",
   },
   {
     href: "/audit/usage",
@@ -407,11 +406,11 @@ export const ADVANCED_ITEMS: AdvancedItem[] = [
   },
   {
     href: "/settings/tools",
-    label: "Custom tools",
+    label: "Tools I built",
     icon: "bolt",
     group: "configure",
     description:
-      "Tools the Executive built when it didn't have the one it needed: turn each on or off, see its runs, or go back a version.",
+      "Tools I built when I didn't have the one I needed: turn each on or off, see its runs, or go back a version.",
   },
   {
     href: "/demo",
@@ -453,6 +452,7 @@ export type SettingsPageId =
   | "executive"
   | "notifications"
   | "memory"
+  | "browser"
   | "workspace"
   | "advanced"
   | "about";
@@ -508,8 +508,17 @@ export const SETTINGS_PAGES: SettingsPageDef[] = [
     label: "About you",
     href: "/settings/memory",
     icon: "user",
-    description: "What the Executive has learned about you, and the private notes it keeps.",
+    description: "Whether it keeps notes of what you say, what you share with the team, and how long notes last.",
     hashes: ["memory"],
+  },
+  {
+    id: "browser",
+    group: "you",
+    label: "Browser",
+    href: "/settings/browser",
+    icon: "globe",
+    description: "Add the Open Executive extension so your Executive can use websites for you.",
+    hashes: ["browser"],
   },
   {
     id: "workspace",
@@ -567,8 +576,8 @@ export function settingsPageForHash(hash: string): SettingsPageDef | null {
 }
 
 // Old Settings anchors for pages that moved out of Settings, and where they
-// went: Act as me is a tab of Delegate now.
-const MOVED_HASHES: Record<string, string> = { "act-as-me": "/delegate/act-as-me" };
+// went: Act as me is the As you block of Delegate now.
+const MOVED_HASHES: Record<string, string> = { "act-as-me": "/delegate#as-you" };
 
 // Where an old `/settings#<hash>` link should go: its Settings page, or the
 // page it moved to, or null.

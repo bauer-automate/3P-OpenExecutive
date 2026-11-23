@@ -97,6 +97,33 @@ def test_schedule_followup_chip() -> None:
     assert "slack_dm" in chip["summary"]
 
 
+def test_schedule_followup_chip_reads_a_time_without_offset_as_company_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run_at with no offset is the company's time, as the tool stores it:
+    30 minutes ahead in New York is "in 30m", not hours off or "just now"."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from openexecutive.memory import workspace_settings
+
+    zone = ZoneInfo("America/New_York")
+    monkeypatch.setattr(workspace_settings, "get_user_timezone", lambda: zone)
+    soon = (datetime.now(zone) + timedelta(minutes=31)).replace(tzinfo=None)
+    chip = summarize_action(
+        tool_name="schedule_followup",
+        tool_input={
+            "run_at": soon.isoformat(timespec="minutes"),
+            "channel": "slack_dm",
+            "channel_ref": "U123",
+            "intent": "check on Q3",
+        },
+        tool_result=json.dumps({"status": "scheduled", "id": 42}),
+    )
+    assert chip is not None
+    assert "in 30m" in chip["summary"] or "in 29m" in chip["summary"]
+
+
 def test_suggest_workflow_chip() -> None:
     chip = summarize_action(
         tool_name="suggest_workflow",
@@ -175,7 +202,7 @@ def test_run_workflow_chip_with_link() -> None:
         tool_result=json.dumps({"ok": True, "run_id": "run123", "artifact": "# Deck"}),
     )
     assert chip is not None
-    assert chip["summary"] == "Ran board prep workflow"
+    assert chip["summary"] == "Ran Board Prep Deck"
     assert chip["link"] == "/jobs/runs/run123"
 
 
@@ -186,7 +213,7 @@ def test_run_workflow_chip_awaiting_human() -> None:
         tool_result=json.dumps({"status": "awaiting_human", "run_id": "r9", "person_id": 3}),
     )
     assert chip is not None
-    assert chip["summary"] == "Started comp refresh — awaiting sign-off"
+    assert chip["summary"] == "Started Compensation Refresh — awaiting sign-off"
 
 
 def test_run_workflow_chip_suppressed_on_error() -> None:
@@ -201,11 +228,33 @@ def test_run_workflow_chip_suppressed_on_error() -> None:
 def test_create_alert_chip() -> None:
     chip = summarize_action(
         tool_name="create_alert",
-        tool_input={"headline": "Burn trending high", "severity": "high"},
-        tool_result=json.dumps({"alert_id": 9}),
+        tool_input={"subject": "Burn trending high", "body": "Runway under 9 months."},
+        tool_result=json.dumps({"status": "alert_scheduled", "subject": "Burn trending high"}),
     )
     assert chip is not None
-    assert "Burn trending high" in chip["summary"]
+    assert chip["summary"] == "Flagged for review: Burn trending high"
+    assert chip["target"] == "Burn trending high"
+    assert chip["link"] == "/"
+
+
+def test_create_alert_chip_without_subject_still_says_what_it_is() -> None:
+    chip = summarize_action(
+        tool_name="create_alert",
+        tool_input={"body": "Something to look at."},
+        tool_result=json.dumps({"status": "alert_scheduled"}),
+    )
+    assert chip is not None
+    assert chip["summary"] == "Flagged for review"
+
+
+@pytest.mark.parametrize("status", ["ask_in_reply", "sender_has_open_card"])
+def test_create_alert_that_raised_nothing_gets_no_chip(status: str) -> None:
+    chip = summarize_action(
+        tool_name="create_alert",
+        tool_input={"subject": "Which plan?", "body": "Two plans.", "needs": "answer"},
+        tool_result=json.dumps({"status": status, "message": "Nothing was raised."}),
+    )
+    assert chip is None
 
 
 def test_remind_me_chip_shows_what_will_be_sent() -> None:
@@ -269,6 +318,28 @@ def test_call_tool_chip_uses_underlying_name() -> None:
 # Error paths — no chip when the tool failed.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("result", [
+    "Tool error: Error calling tool 'create_doc': An unexpected error occurred in create_doc: "
+    "Google turned off saving in that folder. Tap Allow saving again.",
+    "Error calling tool 'create_drive_file': API error in create_drive_file: <HttpError 403>",
+    "Error: the server is not connected",
+])
+def test_failed_connected_tool_has_no_chip(result: str) -> None:
+    """A connected tool's failure comes back as text: no "Created a doc" over it."""
+    for name in ("google_workspace__create_doc", "google_workspace__create_drive_file"):
+        chip = summarize_action(tool_name="call_tool", tool_input={"name": name, "arguments": {}}, tool_result=result)
+        assert chip is None
+
+
+def test_connected_tool_result_opening_with_errors_still_has_a_chip() -> None:
+    chip = summarize_action(
+        tool_name="call_tool",
+        tool_input={"name": "google_workspace__create_doc", "arguments": {"title": "Errors in Q3"}},
+        tool_result="Errors in Q3 doc created. Link: https://docs.google.com/document/d/abc",
+    )
+    assert chip is not None and chip["summary"] == "Created a doc"
+
+
 def test_failed_send_suppresses_chip() -> None:
     chip = summarize_action(
         tool_name="send_slack_dm",
@@ -300,7 +371,7 @@ def test_failed_schedule_suppresses_chip() -> None:
 def test_non_json_result_still_surfaces() -> None:
     chip = summarize_action(
         tool_name="create_alert",
-        tool_input={"headline": "Hello"},
+        tool_input={"subject": "Hello", "body": "Hi"},
         tool_result="alert created successfully",  # raw text, not JSON
     )
     assert chip is not None
@@ -340,6 +411,8 @@ _KNOWN_READ_ONLY_TOOLS: frozenset[str] = frozenset({
     "search_tools",
     # workflow_run_tools — catalog read (run_workflow is in SIDE_EFFECTING_TOOLS)
     "list_workflows",
+    # workflow_authoring_tools — a draft saves nothing (save_workflow is side-effecting)
+    "draft_workflow",
     # mail_read_tools — reads of the speaker's own mailbox (Act as me)
     "my_calendar",
     "search_my_email",
@@ -347,6 +420,8 @@ _KNOWN_READ_ONLY_TOOLS: frozenset[str] = frozenset({
     "read_my_email_attachment",
     "my_email_awaiting_reply",
     "my_email_read_before",
+    # app_control — a list of what the person may change
+    "find_in_app",
 })
 
 
@@ -356,6 +431,7 @@ def _all_registered_tool_names() -> set[str]:
     Kept here as a helper so both drift tests use the exact same source
     of truth — drift between them would defeat the guard.
     """
+    from openexecutive.orchestrator.app_control import APP_TOOL_HANDLERS
     from openexecutive.orchestrator.artifact_tools import DRAFT_ARTIFACT_TOOL_HANDLERS
     from openexecutive.orchestrator.broadcast_tools import BROADCAST_TOOL_HANDLERS
     from openexecutive.orchestrator.calendar_tools import CALENDAR_TOOL_HANDLERS
@@ -369,6 +445,7 @@ def _all_registered_tool_names() -> set[str]:
     from openexecutive.orchestrator.people_tools import PEOPLE_TOOL_HANDLERS
     from openexecutive.orchestrator.schedule_tools import SCHEDULE_TOOL_HANDLERS
     from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS
+    from openexecutive.orchestrator.workflow_authoring_tools import WORKFLOW_AUTHORING_TOOL_HANDLERS
     from openexecutive.orchestrator.workflow_run_tools import WORKFLOW_RUN_TOOL_HANDLERS
 
     return (
@@ -385,6 +462,8 @@ def _all_registered_tool_names() -> set[str]:
         | set(DRAFT_ARTIFACT_TOOL_HANDLERS)
         | set(MCP_TOOL_NAMES)
         | set(WORKFLOW_RUN_TOOL_HANDLERS)
+        | set(WORKFLOW_AUTHORING_TOOL_HANDLERS)
+        | set(APP_TOOL_HANDLERS)
         # Act as me: its own registry, offered per turn (never _ALL_SKILL_TOOLS).
         | set(DELEGATION_TOOL_HANDLERS)
         # `create_alert` is in chat module rather than a HANDLERS dict.
@@ -456,14 +535,15 @@ def test_a_booked_meeting_says_booked() -> None:
     assert "decision_id" not in chip
 
 
-def test_a_held_send_is_not_a_done_chip() -> None:
+def test_a_held_send_carries_its_card() -> None:
     chip = summarize_action(
         tool_name="send_slack_dm",
         tool_input={"channel_ref": "U1", "text": "hi"},
         tool_result=json.dumps({"status": "waiting_for_approval", "decision_instance_id": 9}),
     )
     assert chip is not None and chip["summary"] == "Waiting for approval"
-    assert "decision_id" not in chip
+    # It carries its card, so the chat shows Approve under the reply.
+    assert chip["decision_id"] == 9 and chip["link"] == "/today"
 
 
 def test_a_cancelled_meeting_says_so() -> None:
@@ -473,3 +553,17 @@ def test_a_cancelled_meeting_says_so() -> None:
         tool_result=json.dumps({"status": "cancelled", "decision_instance_id": 3}),
     )
     assert chip is not None and chip["summary"] == "Cancelled the meeting"
+
+
+def test_a_message_chip_names_the_person_never_their_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from openexecutive.people import store
+
+    monkeypatch.setattr(store, "get_person", lambda pid: SimpleNamespace(full_name="Sam Rivera") if pid == 1 else None)
+    chip = summarize_action(tool_name="message_person", tool_input={"person_id": 1, "text": "hi"},
+                            tool_result=json.dumps({"ok": True}))
+    assert chip is not None and chip["summary"] == "Messaged Sam Rivera" and "#" not in chip["summary"]
+    chip = summarize_action(tool_name="message_person", tool_input={"person_id": 99, "text": "hi"},
+                            tool_result=json.dumps({"ok": True}))
+    assert chip is not None and chip["summary"] == "Messaged a person"

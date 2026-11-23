@@ -1,5 +1,5 @@
 """Tables for Act as me, in the episodic DB (per company: they swap with a
-client slot — see ``clients.slots._BLANK_WIPE_TABLES``).
+client slot — see ``clients.slots._wipe_per_client_tables``).
 
 Kept free of imports so ``memory.episodic.initialize_db`` can create them
 without an import cycle.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 
 SETTINGS_TABLE = "delegation_settings"
 VOICE_TABLE = "delegation_voice"
@@ -25,6 +26,8 @@ DISCLOSURE_TABLE = "delegation_disclosure"
 CALENDAR_TABLE = "delegation_calendar"
 SAVED_FILES_TABLE = "delegation_saved_files"
 SAVED_FOLDER_TABLE = "delegation_saved_folder"
+UPGRADES_TABLE = "delegation_upgrades"
+CARD_FILES_TABLE = "delegation_card_files"
 
 TABLES: tuple[str, ...] = (
     SETTINGS_TABLE,
@@ -43,6 +46,8 @@ TABLES: tuple[str, ...] = (
     CALENDAR_TABLE,
     SAVED_FILES_TABLE,
     SAVED_FOLDER_TABLE,
+    UPGRADES_TABLE,
+    CARD_FILES_TABLE,
 )
 
 _DDL: tuple[str, ...] = (
@@ -81,7 +86,11 @@ _DDL: tuple[str, ...] = (
     ")",
     # Every draft saved in someone's Gmail (delegation.drafts): ids and
     # times only, never an address, a subject or text. gone_at: a chat draft
-    # found missing from their Drafts (sent or deleted there).
+    # found missing from their Drafts (sent or deleted there). session_id:
+    # the conversation a chat draft was written in (``delegation.redrafts``).
+    # replaced_by: the row of the newer chat draft that retired this one.
+    # from_executive: a chat draft switched on its card to go from the
+    # Executive (``delegation.chat_draft_card.switch``), 1, else 0.
     f"CREATE TABLE IF NOT EXISTS {DRAFTS_TABLE} ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  person_id INTEGER NOT NULL,"
@@ -91,7 +100,10 @@ _DDL: tuple[str, ...] = (
     "  message_id TEXT,"
     "  sent_message_id TEXT,"
     "  created_at TEXT NOT NULL,"
-    "  gone_at TEXT"
+    "  gone_at TEXT,"
+    "  session_id TEXT,"
+    "  replaced_by INTEGER,"
+    "  from_executive INTEGER NOT NULL DEFAULT 0"
     ")",
     f"CREATE INDEX IF NOT EXISTS idx_{DRAFTS_TABLE}_person_created "
     f"ON {DRAFTS_TABLE}(person_id, created_at)",
@@ -137,10 +149,8 @@ _DDL: tuple[str, ...] = (
     f"ON {INBOX_MESSAGES_TABLE}(person_id, thread_id)",
     f"CREATE INDEX IF NOT EXISTS idx_{INBOX_MESSAGES_TABLE}_created "
     f"ON {INBOX_MESSAGES_TABLE}(person_id, created_at)",
-    # Handle it for me, one row per person (absent: off). mode is careful |
-    # balanced | bold (delegation.handle_it.MODES; a 'training' row from
-    # before is moved by _move_training_off_the_dial). levels is the per-kind
-    # setting it replaced, kept for older rows (_add_handle_it_mode).
+    # Handle it for me, one row per person (absent: off). mode and levels are
+    # the dial it had before Approvals decided, no longer read.
     f"CREATE TABLE IF NOT EXISTS {HANDLE_IT_TABLE} ("
     "  person_id INTEGER PRIMARY KEY,"
     "  enabled INTEGER NOT NULL DEFAULT 0,"
@@ -246,6 +256,23 @@ _DDL: tuple[str, ...] = (
     "  current INTEGER NOT NULL DEFAULT 1,"
     "  PRIMARY KEY (provider, folder_id)"
     ")",
+    # One-time upgrades of what is stored (``_keep_the_old_opt_in``), by name.
+    f"CREATE TABLE IF NOT EXISTS {UPGRADES_TABLE} ("
+    "  name TEXT PRIMARY KEY,"
+    "  done_at TEXT NOT NULL"
+    ")",
+    # The files a reply card's reply carries (``delegation.card_work``): what
+    # the Executive made or picked while doing what the email asked, attached
+    # when the reply is sent. One row per file, in order.
+    f"CREATE TABLE IF NOT EXISTS {CARD_FILES_TABLE} ("
+    "  decision_id INTEGER NOT NULL,"
+    "  position INTEGER NOT NULL,"
+    "  name TEXT NOT NULL,"
+    "  mime TEXT NOT NULL,"
+    "  data BLOB NOT NULL,"
+    "  created_at TEXT NOT NULL,"
+    "  PRIMARY KEY (decision_id, position)"
+    ")",
 )
 
 
@@ -284,7 +311,7 @@ def _move_training_off_the_dial(conn: sqlite3.Connection) -> None:
     if not rows:
         return
     for (person_id,) in rows:
-        for setting in ("replies", "follow_ups"):
+        for setting in ("replies", "follow_ups", "training"):
             conn.execute(
                 f"INSERT INTO {TRAINING_TABLE} (person_id, setting, enabled, updated_by) "  # noqa: S608
                 "VALUES (?, ?, 1, 'migration') ON CONFLICT(person_id, setting) DO UPDATE SET enabled = 1",
@@ -294,6 +321,42 @@ def _move_training_off_the_dial(conn: sqlite3.Connection) -> None:
             f"UPDATE {HANDLE_IT_TABLE} SET mode = 'balanced' WHERE person_id = ?",  # noqa: S608
             (person_id,),
         )
+    conn.commit()
+
+
+def _keep_the_old_opt_in(conn: sqlite3.Connection) -> None:
+    """Handle it for me was a switch of its own (``enabled`` on
+    ``delegation_handle_it``, off until the person turned it on, and absent
+    was off too); now Approvals alone decides what goes from the inbox
+    replies. Once, on upgrade: everyone who had Act as me or the inbox
+    watcher set up and never turned that switch on is put In training, so
+    everything still waits on a card until they allow it. Turning it off
+    afterwards sticks (the row is only ever added), and anyone who sets up
+    Act as me later gets the new default: Approvals decides."""
+    name = "handle_it_opt_in"
+    if conn.execute(f"SELECT 1 FROM {UPGRADES_TABLE} WHERE name = ?", (name,)).fetchone():  # noqa: S608
+        return
+    opted_in = {
+        row[0] for row in conn.execute(
+            f"SELECT person_id FROM {HANDLE_IT_TABLE} WHERE enabled = 1"  # noqa: S608 — constant table name
+        ).fetchall()
+    }
+    people = {
+        row[0] for row in conn.execute(
+            f"SELECT person_id FROM {SETTINGS_TABLE} UNION SELECT person_id FROM {INBOX_WATCH_TABLE} "  # noqa: S608
+            f"UNION SELECT person_id FROM {HANDLE_IT_TABLE}"
+        ).fetchall()
+    }
+    for person_id in sorted(people - opted_in):
+        conn.execute(
+            f"INSERT INTO {TRAINING_TABLE} (person_id, setting, enabled, updated_by) "  # noqa: S608
+            "VALUES (?, 'training', 1, 'migration') ON CONFLICT(person_id, setting) DO NOTHING",
+            (person_id,),
+        )
+    conn.execute(
+        f"INSERT INTO {UPGRADES_TABLE} (name, done_at) VALUES (?, ?)",  # noqa: S608
+        (name, datetime.now(UTC).isoformat()),
+    )
     conn.commit()
 
 
@@ -314,6 +377,30 @@ def _add_draft_gone_at(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _add_draft_session_id(conn: sqlite3.Connection) -> None:
+    """Give a drafts table made before ``session_id`` existed the column."""
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({DRAFTS_TABLE})")}
+    if "session_id" not in columns:
+        conn.execute(f"ALTER TABLE {DRAFTS_TABLE} ADD COLUMN session_id TEXT")
+        conn.commit()
+
+
+def _add_draft_replaced_by(conn: sqlite3.Connection) -> None:
+    """Give a drafts table made before ``replaced_by`` existed the column."""
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({DRAFTS_TABLE})")}
+    if "replaced_by" not in columns:
+        conn.execute(f"ALTER TABLE {DRAFTS_TABLE} ADD COLUMN replaced_by INTEGER")
+        conn.commit()
+
+
+def _add_draft_from_executive(conn: sqlite3.Connection) -> None:
+    """Give a drafts table made before ``from_executive`` existed the column."""
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({DRAFTS_TABLE})")}
+    if "from_executive" not in columns:
+        conn.execute(f"ALTER TABLE {DRAFTS_TABLE} ADD COLUMN from_executive INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the tables if missing. Idempotent."""
     for statement in _DDL:
@@ -321,4 +408,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _add_handle_it_mode(conn)
     _add_mailbox_drafts(conn)
     _add_draft_gone_at(conn)
+    _add_draft_session_id(conn)
+    _add_draft_replaced_by(conn)
+    _add_draft_from_executive(conn)
     _move_training_off_the_dial(conn)
+    _keep_the_old_opt_in(conn)

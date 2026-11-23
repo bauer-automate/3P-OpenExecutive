@@ -50,7 +50,8 @@ def _patch_session(
     access = "missing" if not exists else ("allowed" if allowed else "forbidden")
     monkeypatch.setattr(sessions_route, "_resolve_caller_person_id", lambda _req: 1)
     monkeypatch.setattr(sessions_route, "_session_access", lambda _req, _sid, _c: access)
-    monkeypatch.setattr(sessions_route, "load_messages", lambda _sid: list(messages))
+    monkeypatch.setattr(sessions_route, "load_messages", lambda _sid, **_k: list(messages))
+    monkeypatch.setattr(sessions_route, "chat_people", lambda _sid: [])
 
 
 def _patch_llm(monkeypatch: pytest.MonkeyPatch, result: str | None) -> dict[str, Any]:
@@ -154,6 +155,22 @@ def test_same_reply_hits_cache_new_reply_misses(monkeypatch: pytest.MonkeyPatch)
     assert calls["n"] == 2
 
 
+def test_sharing_the_chat_misses_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A suggestion made while the chat was solo is not reused once someone
+    # joins, or it could still say "ask Riya" to a chat Riya is now in.
+    _patch_session(monkeypatch, list(_CONVO))
+    calls = _patch_llm(monkeypatch, "Ask Riya for the numbers.")
+
+    with TestClient(_make_app()) as client:
+        client.get("/sessions/s1/followup")
+        monkeypatch.setattr(
+            sessions_route, "chat_people", lambda _sid: [(1, "Alex", True), (2, "Riya", False)]
+        )
+        client.get("/sessions/s1/followup")
+
+    assert calls["n"] == 2
+
+
 def test_transcript_keeps_tail_and_truncates() -> None:
     long = "x" * 5000
     messages = [{"role": "user", "content": f"m{i}"} for i in range(10)]
@@ -229,6 +246,28 @@ async def test_a_formatting_slip_is_a_warning_not_an_error(monkeypatch: pytest.M
     assert calls == ["warning"]
 
 
+class _SlowProvider:
+    async def messages_create(self, **_kwargs: Any) -> _FakeResponse:
+        raise TimeoutError
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_is_a_warning_not_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive import providers
+    from openexecutive.agents import utility_fast
+
+    calls: list[str] = []
+    fake = SimpleNamespace(
+        warning=lambda *a, **k: calls.append("warning"),
+        exception=lambda *a, **k: calls.append("exception"),
+    )
+    monkeypatch.setattr(chat_route, "logger", fake)
+    monkeypatch.setattr(utility_fast, "get_fast_model", lambda: "claude-haiku-test")
+    monkeypatch.setattr(providers, "get_provider", lambda _model: _SlowProvider())
+    assert await chat_route._generate_followup_via_llm("t") is None
+    assert calls == ["warning"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "raw",
@@ -295,3 +334,38 @@ def test_offers_become_requests(offer: str, expected: str) -> None:
 )
 def test_user_voice_is_left_alone(text: str) -> None:
     assert chat_route.as_user_request(text, last_executive_reply="Churn rose 4% last quarter.") == text
+
+
+def test_a_shared_chat_suggests_the_readers_own_next_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Sam (1) owns it and shared it with Jordan (5), who is reading: the
+    # transcript names everyone, says whose message to write, and each
+    # reader gets their own suggestion.
+    convo = [
+        {"role": "user", "content": "Top three things this week?", "sender_person_id": None},
+        {"role": "user", "content": "Add hiring.", "sender_person_id": 5},
+        {"id": 9, "role": "assistant", "content": "Get Jordan to export this month's orders."},
+    ]
+    _patch_session(monkeypatch, convo)
+    monkeypatch.setattr(sessions_route, "_resolve_caller_person_id", lambda _req: 5)
+    monkeypatch.setattr(sessions_route, "_session_access", lambda _req, _sid, _c: "forbidden")
+    monkeypatch.setattr(sessions_route, "_shared_member", lambda _sid, _c: True)
+    monkeypatch.setattr(
+        sessions_route, "chat_people", lambda _sid: [(1, "Sam Rivera", True), (5, "Jordan Lee", False)]
+    )
+    calls = _patch_llm(monkeypatch, "I'll export this month's orders today.")
+    client = TestClient(_make_app())
+
+    r = client.get("/sessions/s-1/followup")
+    assert r.status_code == 200
+    t = calls["transcript"]
+    assert "group chat" in t and "Sam Rivera, Jordan Lee" in t
+    assert "The USER is Jordan Lee" in t
+    assert "Sam Rivera: Top three things this week?" in t
+    assert "Jordan Lee: Add hiring." in t
+    assert ("s-1", 9, 5, (1, 5)) in sessions_route._followup_cache
+
+
+def test_a_chat_of_one_keeps_the_plain_transcript() -> None:
+    t = chat_route._build_followup_transcript(_CONVO)
+    assert t.startswith("USER: Should we raise prices")
+    assert "group chat" not in t
